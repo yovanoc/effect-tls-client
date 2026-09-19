@@ -1120,23 +1120,27 @@ const makeBridge = Effect.gen(function* () {
       }),
     );
     const opened = yield* Effect.onInterrupt(
-      Effect.uninterruptible(
-        Effect.sync(() => pending.set(id, operation)).pipe(
-          Effect.flatMap(() =>
-            writeFrame({
-              kind: FrameKind.wsConnect,
-              id,
-              meta: frameMeta,
-            }).pipe(Effect.tap(() => Effect.sync(() => (requestSent = true)))),
+      Effect.gen(function* () {
+        yield* Effect.uninterruptible(
+          Effect.sync(() => pending.set(id, operation)).pipe(
+            Effect.flatMap(() =>
+              writeFrame({
+                kind: FrameKind.wsConnect,
+                id,
+                meta: frameMeta,
+              }).pipe(
+                Effect.tap(() => Effect.sync(() => (requestSent = true))),
+              ),
+            ),
+            Effect.tapError(() =>
+              Effect.sync(() => {
+                if (pending.get(id) === operation) pending.delete(id);
+              }),
+            ),
           ),
-          Effect.tapError(() =>
-            Effect.sync(() => {
-              if (pending.get(id) === operation) pending.delete(id);
-            }),
-          ),
-          Effect.flatMap(() => Deferred.await(open)),
-        ),
-      ),
+        );
+        return yield* Deferred.await(open);
+      }),
       () => cleanup,
     );
 

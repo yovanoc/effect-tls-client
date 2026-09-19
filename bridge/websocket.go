@@ -99,10 +99,17 @@ func (d *dispatcher) dispatchWebSocket(frame protocol.Frame) (bool, error) {
 		if err := validateHeaderOrder(meta.HeaderOrder); err != nil {
 			return false, writeProtocolError(d.writer, frame.ID, err.Error())
 		}
-		if err := d.start(frame.ID, true, meta.SessionID, func(ctx context.Context, op *operation) {
-			op.ws = &webSocketState{}
-			d.runWebSocket(ctx, op, meta)
-		}); err != nil {
+		if err := d.startWithSetup(
+			frame.ID,
+			true,
+			meta.SessionID,
+			func(_ context.Context, op *operation) {
+				op.ws = &webSocketState{}
+			},
+			func(ctx context.Context, op *operation) {
+				d.runWebSocket(ctx, op, meta)
+			},
+		); err != nil {
 			return false, err
 		}
 		return false, nil
