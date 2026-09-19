@@ -62,6 +62,18 @@ func TestCreditsReserveWholeDoesNotPartiallyReserve(t *testing.T) {
 	}
 }
 
+func TestWebSocketCreditBoundsTinyFrames(t *testing.T) {
+	if got := websocketCredit(64*1024, 0); got != 4 {
+		t.Fatalf("empty frame credit = %d, want 4", got)
+	}
+	if got := websocketCredit(1<<20, 1); got != 64 {
+		t.Fatalf("tiny frame credit = %d, want 64", got)
+	}
+	if got := websocketCredit(1<<20, 128); got != 128 {
+		t.Fatalf("large frame credit = %d, want 128", got)
+	}
+}
+
 func TestWebSocketStateWritesAndCloses(t *testing.T) {
 	state := &webSocketState{}
 	if err := state.writeMessage(websocket.TextMessage, []byte("hello")); err == nil {

@@ -155,7 +155,7 @@ The response `headers` pairs are emitted in deterministic order from the availab
 { sessionId: string; url: string; headers: Pair[]; headerOrder?: string[]
   subprotocols?: string[]; handshakeTimeoutMs?: number; readBufferSize?: number; writeBufferSize?: number }
 ```
-Sequence: `ws.connect` → `ws.open` → `ws.frame`* (credited) interleaved with JS `ws.write`* → terminal `ws.closed` (after JS `ws.close`, remote close, or `session.destroy`) or `error{kind: WsHandshake | WsRead | WsWrite}`. `opcode` 1 = text (UTF-8 bytes), 2 = binary. Ping/pong handled inside Go. The session's dialer must be HTTP/1 for the upgrade; Go uses a dedicated `ForceHttp1` client sharing the session's profile, proxy and Jar.
+Sequence: `ws.connect` → `ws.open` → `ws.frame`* (credited) interleaved with JS `ws.write`* → terminal `ws.closed` (after JS `ws.close`, remote close, or `session.destroy`) or `error{kind: WsHandshake | WsRead | WsWrite}`. `opcode` 1 = text (UTF-8 bytes), 2 = binary. Ping/pong handled inside Go. Each inbound frame consumes `max(bodyBytes, ceil(window / 16384), 1)` credit units; JS sends that same amount in `ack` only after the consumer pulls the frame. This keeps the bounded 16,384-frame receive queue safe even for bursts of tiny or empty messages. The session's dialer must be HTTP/1 for the upgrade; Go uses a dedicated `ForceHttp1` client sharing the session's profile, proxy and Jar.
 
 ## 8. `ErrorMeta`
 

@@ -75,6 +75,10 @@ const STDERR_TAIL_BYTES = 4096;
 const SHUTDOWN_TIMEOUT_MILLIS = 2000;
 const WS_QUEUE_CAPACITY = 16_384;
 
+// Keep the byte-credit window compatible with the bounded frame queue.
+const webSocketCredit = (window: number, bodyBytes: number): number =>
+  Math.max(1, bodyBytes, Math.ceil(window / WS_QUEUE_CAPACITY));
+
 type CallKind =
   | typeof FrameKind.debugPing
   | typeof FrameKind.debugSleep
@@ -1141,7 +1145,9 @@ const makeBridge = Effect.gen(function* () {
         writeFrame({
           kind: FrameKind.ack,
           id,
-          meta: encodeMeta(AckMeta, { bytes: frame.body.byteLength }),
+          meta: encodeMeta(AckMeta, {
+            bytes: webSocketCredit(state.window, frame.body.byteLength),
+          }),
         }).pipe(Effect.as(frame)),
       ),
     );

@@ -511,15 +511,15 @@ describeReal("Real Bridge WebSockets", () => {
             const reader = yield* socket.reader.pipe(
               Effect.timeout(Duration.seconds(5)),
             );
-            server.sendBurst(10_000);
+            server.sendBurst(40_000);
             let received = 0;
-            while (received < 10_000) {
+            while (received < 40_000) {
               const next = yield* reader.pull.pipe(
                 Effect.timeout(Duration.seconds(5)),
               );
               received += next.length;
             }
-            expect(received).toBe(10_000);
+            expect(received).toBe(40_000);
           }).pipe(
             Effect.provide(
               TlsClient.layer.pipe(

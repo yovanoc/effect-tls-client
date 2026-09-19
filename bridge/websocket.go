@@ -14,7 +14,24 @@ import (
 	"github.com/yovanoc/effect-tls-client/bridge/protocol"
 )
 
-const websocketWriteWait = time.Second
+const (
+	websocketWriteWait     = time.Second
+	websocketQueueCapacity = 16_384
+)
+
+func websocketCredit(window, bodyBytes uint64) uint64 {
+	minimum := window / websocketQueueCapacity
+	if window%websocketQueueCapacity != 0 {
+		minimum++
+	}
+	if minimum == 0 {
+		minimum = 1
+	}
+	if bodyBytes < minimum {
+		return minimum
+	}
+	return bodyBytes
+}
 
 type webSocketState struct {
 	mu   sync.Mutex
@@ -32,6 +49,9 @@ func (s *webSocketState) writeMessage(opcode int, body []byte) error {
 	defer s.mu.Unlock()
 	if s.conn == nil {
 		return errors.New("websocket connection is closed")
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(websocketWriteWait)); err != nil {
+		return err
 	}
 	return s.conn.WriteMessage(opcode, body)
 }
@@ -269,15 +289,13 @@ func (d *dispatcher) runWebSocket(ctx context.Context, op *operation, meta proto
 			_ = d.finishError(op, protocol.ErrorKindWsRead, "WebSocket message exceeds the credit window")
 			return
 		}
-		if len(body) > 0 {
-			if !op.credits.reserveWhole(ctx, uint64(len(body))) {
-				if op.cancelled.Load() {
-					_ = d.finishCancelled(op)
-				} else {
-					_ = d.finishWebSocketClosed(op, websocket.CloseNormalClosure, "", "local")
-				}
-				return
+		if !op.credits.reserveWhole(ctx, websocketCredit(d.settings.window, uint64(len(body)))) {
+			if op.cancelled.Load() {
+				_ = d.finishCancelled(op)
+			} else {
+				_ = d.finishWebSocketClosed(op, websocket.CloseNormalClosure, "", "local")
 			}
+			return
 		}
 		if !d.isCurrent(op) {
 			return
