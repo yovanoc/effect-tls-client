@@ -7,7 +7,7 @@ require (
 	github.com/bogdanfinn/tls-client v1.16.0
 	github.com/bogdanfinn/utls v1.7.8-barnius
 	github.com/bogdanfinn/websocket v1.5.6-barnius
-	golang.org/x/net v0.54.0
+	golang.org/x/net v0.55.0
 )
 
 require (
