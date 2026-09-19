@@ -115,7 +115,7 @@ func (d *dispatcher) start(id uint32, credited bool, sessionID string, run func(
 	return d.startWithSetup(id, credited, sessionID, nil, run)
 }
 
-func (d *dispatcher) startWithSetup(id uint32, credited bool, sessionID string, setup func(context.Context, *operation) error, run func(context.Context, *operation)) error {
+func (d *dispatcher) startWithSetup(id uint32, credited bool, sessionID string, setup func(context.Context, *operation), run func(context.Context, *operation)) error {
 	if id == 0 {
 		return fmt.Errorf("operation id 0 is reserved")
 	}
@@ -136,14 +136,7 @@ func (d *dispatcher) startWithSetup(id uint32, credited bool, sessionID string, 
 	d.mu.Unlock()
 
 	if setup != nil {
-		if err := setup(ctx, op); err != nil {
-			d.mu.Lock()
-			delete(d.operations, id)
-			d.mu.Unlock()
-			cancel()
-			d.waitGroup.Done()
-			return err
-		}
+		setup(ctx, op)
 	}
 
 	go func() {
@@ -540,13 +533,11 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		if (meta.SessionID == "") == (meta.Config == nil) {
 			return false, writeProtocolError(d.writer, frame.ID, "exactly one of sessionId or config is required")
 		}
-		setup := func(ctx context.Context, op *operation) error {
+		setup := func(ctx context.Context, op *operation) {
 			if !meta.HasBody {
-				return nil
+				return
 			}
-			upload := newRequestUpload(ctx, d.writer, op.id, d.settings.window, d.settings.chunkSize)
-			op.upload = upload
-			return nil
+			op.upload = newRequestUpload(ctx, d.writer, op.id, d.settings.window, d.settings.chunkSize)
 		}
 		if err := d.startWithSetup(frame.ID, true, meta.SessionID, setup, func(ctx context.Context, op *operation) {
 			d.runRequest(ctx, op, meta)

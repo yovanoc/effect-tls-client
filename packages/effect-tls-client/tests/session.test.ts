@@ -18,8 +18,12 @@ import { makeTlsClientLayer } from "../src/TlsClient.js";
 const fixturePath = fileURLToPath(
   new URL("./fixtures/bridge-fixture.mjs", import.meta.url),
 );
+const bodyErrorFixturePath = fileURLToPath(
+  new URL("./fixtures/bridge-body-error-fixture.mjs", import.meta.url),
+);
 
-const withClient = <A, E>(
+const withClientAt = <A, E>(
+  path: string,
   effect: Effect.Effect<A, E, TlsClient | Scope.Scope>,
 ) =>
   Effect.scoped(
@@ -30,9 +34,7 @@ const withClient = <A, E>(
             Layer.mergeAll(
               NodeServices.layer,
               ConfigProvider.layer(
-                ConfigProvider.fromUnknown({
-                  TLS_CLIENT_BRIDGE_PATH: fixturePath,
-                }),
+                ConfigProvider.fromUnknown({ TLS_CLIENT_BRIDGE_PATH: path }),
               ),
             ),
           ),
@@ -40,6 +42,10 @@ const withClient = <A, E>(
       ),
     ),
   );
+
+const withClient = <A, E>(
+  effect: Effect.Effect<A, E, TlsClient | Scope.Scope>,
+) => withClientAt(fixturePath, effect);
 
 describe("TlsClient sessions", () => {
   it.effect("creates a session and exposes a streamed cached response", () =>
@@ -142,6 +148,34 @@ describe("TlsClient sessions", () => {
           expect(error.message).toBe("fixture internal failure");
         }
       }),
+    ),
+  );
+
+  it.effect("preserves a failing upload stream as a Body error", () =>
+    Effect.flip(
+      withClientAt(
+        bodyErrorFixturePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({ profile: "chrome_146" });
+          return yield* session.request("https://fixture.test/upload", {
+            method: "POST",
+            body: Stream.fromIterable([new Uint8Array([1])]).pipe(
+              Stream.concat(Stream.fail("body source failed")),
+            ),
+          });
+        }),
+      ),
+    ).pipe(
+      Effect.tap((error) =>
+        Effect.sync(() => {
+          expect(error).toBeInstanceOf(TlsRequestError);
+          if (error._tag === "TlsRequestError") {
+            expect(error.kind).toBe("Body");
+            expect(error.message).toBe("body source failed");
+          }
+        }),
+      ),
     ),
   );
 

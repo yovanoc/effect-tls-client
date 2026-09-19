@@ -225,6 +225,44 @@ func TestRequestUploadStreamsThroughPipeAndAcksConsumedBytes(t *testing.T) {
 	assertNoTestFrame(t, writer.frames)
 }
 
+func TestRequestUploadAcceptsManySmallChunksWithinByteWindow(t *testing.T) {
+	dispatcher, _ := newTestDispatcher()
+	defer dispatcher.stop()
+
+	const (
+		chunkCount = 100
+		chunkSize  = 1024
+	)
+	upload := newRequestUpload(context.Background(), dispatcher.writer, 8, chunkCount*chunkSize, 64*1024)
+	defer upload.close()
+	for index := 0; index < chunkCount; index++ {
+		if err := upload.accept(make([]byte, chunkSize)); err != nil {
+			t.Fatalf("small upload chunk %d: %v", index, err)
+		}
+	}
+}
+
+func TestRequestUploadCloseWakesIdlePump(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dispatcher, _ := newTestDispatcher()
+	defer dispatcher.stop()
+
+	upload := newRequestUpload(ctx, dispatcher.writer, 9, 12, 4)
+	closed := make(chan struct{})
+	go func() {
+		upload.close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		cancel()
+		<-closed
+		t.Fatal("upload.close did not wake an idle pump")
+	}
+}
+
 func TestRequestUploadRejectsBytesBeyondWindow(t *testing.T) {
 	dispatcher, _ := newTestDispatcher()
 	defer dispatcher.stop()
@@ -237,6 +275,90 @@ func TestRequestUploadRejectsBytesBeyondWindow(t *testing.T) {
 		t.Fatalf("second upload chunk error = %v, want protocol violation", err)
 	}
 	upload.close()
+}
+
+func TestRequestUploadAbortClosesPipeWithExplicitError(t *testing.T) {
+	dispatcher, _ := newTestDispatcher()
+	defer dispatcher.stop()
+
+	upload := newRequestUpload(context.Background(), dispatcher.writer, 10, 12, 4)
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(upload.reader)
+		readErr <- err
+	}()
+	upload.abortIfIncomplete(errUploadResponse)
+	upload.wait()
+	if err := <-readErr; !errors.Is(err, errUploadResponse) {
+		t.Fatalf("upload read error = %v, want %v", err, errUploadResponse)
+	}
+}
+
+func TestRequestFailureClosesIdleUploadAndEmitsTerminal(t *testing.T) {
+	dispatcher, writer := newTestDispatcher()
+	defer dispatcher.stop()
+
+	meta, err := protocol.EncodeMeta(protocol.RequestMeta{
+		SessionID: "missing",
+		URL:       "http://example.test/",
+		Method:    "POST",
+		HasBody:   true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dispatcher.dispatch(protocol.Frame{
+		Kind: protocol.KindRequest,
+		ID:   11,
+		Meta: meta,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	terminal := nextTestFrame(t, writer.frames)
+	if terminal.Kind != protocol.KindError || terminal.ID != 11 {
+		t.Fatalf("terminal = %+v", terminal)
+	}
+	var errorMeta protocol.ErrorMeta
+	if err := protocol.DecodeObject(terminal.Meta, &errorMeta); err != nil {
+		t.Fatal(err)
+	}
+	if errorMeta.Kind != protocol.ErrorKindSessionNotFound {
+		t.Fatalf("error kind = %q, want %q", errorMeta.Kind, protocol.ErrorKindSessionNotFound)
+	}
+}
+
+func TestIntegrationSessionlessRequestDoesNotRetainSession(t *testing.T) {
+	if os.Getenv("TLS_CLIENT_INTEGRATION") != "1" {
+		t.Skip("set TLS_CLIENT_INTEGRATION=1 to run local tls-client integration tests")
+	}
+	server := httptest.NewServer(nethttp.HandlerFunc(func(writer nethttp.ResponseWriter, request *nethttp.Request) {
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	dispatcher, writer := newTestDispatcher()
+	defer dispatcher.stop()
+	profile := "chrome_146"
+	meta, err := protocol.EncodeMeta(protocol.RequestMeta{
+		Config:  &protocol.SessionConfigMeta{Profile: &profile, ForceHTTP1: true},
+		URL:     server.URL,
+		Method:  "GET",
+		HasBody: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dispatcher.dispatch(protocol.Frame{Kind: protocol.KindRequest, ID: 12, Meta: meta}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if frame := nextTestFrame(t, writer.frames); frame.Kind == protocol.KindEnd {
+			break
+		}
+	}
+	if _, retained := dispatcher.sessions.sessions["request-12"]; retained {
+		t.Fatal("sessionless request retained its ephemeral session")
+	}
 }
 
 func TestIntegrationLocalHTTP1(t *testing.T) {

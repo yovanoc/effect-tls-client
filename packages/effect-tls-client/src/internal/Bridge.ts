@@ -104,6 +104,7 @@ interface UploadState {
   acked: number;
   stopped: boolean;
   bodyEndSent: boolean;
+  failure: TlsRequestError | undefined;
 }
 
 export type RequestBody = Stream.Stream<Uint8Array, unknown, never>;
@@ -383,7 +384,14 @@ const makeBridge = Effect.gen(function* () {
     }
     try {
       const meta = decodeMeta(ErrorMeta, frame.meta);
-      const error = errorFromMeta(meta);
+      let error = errorFromMeta(meta);
+      if (
+        operation._tag === "stream" &&
+        !operation.headersSeen &&
+        operation.upload?.failure !== undefined
+      ) {
+        error = operation.upload.failure;
+      }
       if (operation._tag === "stream") {
         completeStream(frame.id, error);
       } else {
@@ -895,7 +903,7 @@ const makeBridge = Effect.gen(function* () {
     const headers = Deferred.makeUnsafe<ResponseHeadersMeta, BridgeError>();
     const end = Deferred.makeUnsafe<EndMeta, BridgeError>();
     const id = allocateId();
-    const upload = requestMeta.hasBody
+    const upload: UploadState | undefined = requestMeta.hasBody
       ? {
           body: body ?? Stream.empty,
           stop: Deferred.makeUnsafe<void>(),
@@ -905,6 +913,7 @@ const makeBridge = Effect.gen(function* () {
           acked: 0,
           stopped: false,
           bodyEndSent: false,
+          failure: undefined,
         }
       : undefined;
     const operation: PendingStream = {
@@ -1004,13 +1013,25 @@ const makeBridge = Effect.gen(function* () {
             );
             yield* Effect.raceFirst(pump, Deferred.await(upload.stop)).pipe(
               Effect.catchTag("UploadStopped", () => Effect.void),
-              Effect.catchCause(() =>
-                Effect.sync(() => (upload.stopped = true)).pipe(
+              Effect.catchCause((cause) =>
+                Effect.sync(() => {
+                  const failure = Cause.findErrorOption(cause);
+                  if (
+                    failure._tag === "Some" &&
+                    failure.value._tag === "TlsRequestError" &&
+                    failure.value.kind === "Body"
+                  ) {
+                    upload.failure = failure.value;
+                  }
+                  stopUpload(operation);
+                }).pipe(
                   Effect.flatMap(() => sendCancel(id).pipe(Effect.ignore)),
                 ),
               ),
             );
-            yield* sendUploadEnd().pipe(Effect.ignore);
+            if (!upload.stopped && upload.failure === undefined) {
+              yield* sendUploadEnd().pipe(Effect.ignore);
+            }
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => Deferred.doneUnsafe(upload!.done, Effect.void)),

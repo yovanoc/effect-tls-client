@@ -46,7 +46,7 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 
 ## D6 — Streamed uploads and Go-side cancellation
 
-**Decision:** Request bodies stream: `request` frame (metadata + headers) → N `body-chunk` frames → `body-end`; Go feeds an `io.Pipe` into `Do`. `HttpBody.Stream` maps 1:1; bytes/FormData are a single chunk. Every in-flight op (connect, headers, body, upload, WS read) is cancellable by a `cancel` frame → Go `context.CancelFunc`. **Go always sends the terminal frame** (`end` | `error{kind:"cancelled"|...}`); JS only closes a pending entry itself on `BridgeExited`.
+**Decision:** Request bodies stream: `request` frame (metadata + headers) → N `body-chunk` frames → `body-end`; Go feeds an `io.Pipe` into `Do`. `HttpBody.Stream` maps 1:1; bytes/FormData are a single chunk. Every in-flight op (connect, headers, body, upload, WS read) is cancellable by a `cancel` frame → Go `context.CancelFunc`. **Go always sends the terminal frame** (`end` | `error{kind:"cancelled"|...}`); JS only closes a pending entry itself on `BridgeExited`. If response headers arrive before `body-end`, Go aborts the upload pipe explicitly and the JS pump does not synthesize `body-end`; the accepted response may still complete normally.
 
 **Why:** target workloads are not only slicethepie — game clients with many requests and long-lived WS connections. Symmetric streaming keeps one wire model; JS-only cancel could not interrupt a hung WS read or slow server.
 

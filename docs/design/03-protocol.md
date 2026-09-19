@@ -133,7 +133,9 @@ Go validates strictly: exactly one of `profile`/`customProfile`, unknown profile
   cookies?: Cookie[]                      // added to the Jar for this URL before sending
 }
 ```
-Sequence: `request` → (`body.chunk`* → `body.end` if `hasBody`) … Go: `headers` → `chunk`* → `end`. Go may send `headers` before the upload completes (server early response); Go may send `error` at any point (upload is discarded; Go still acks nothing further).
+Sequence: `request` → (`body.chunk`* → `body.end` if `hasBody`) … Go: `headers` → `chunk`* → `end`. `body.end` is sent only after the body producer completes; it is never inferred from response completion. If Go receives response headers before `body.end`, it closes the upload pipe with an explicit `request upload aborted after response headers` error, and the TS pump stops without sending `body.end`. The accepted response is still delivered and may finish with `end`; that response terminal frame does not claim that the upload completed. An upload producer failure before response headers sends `cancel` for Go cleanup, but the pending request reports the original `error{kind:"Body"}`.
+
+`contentLength` is the normalized request length. TS derives it for bytes, strings, and `FormData`, and validates any explicit `Content-Length` header against it; Go validates the value, sets the request's `ContentLength`, and removes the header before handing the request to the transport. Unknown-length streams omit it unless the caller supplies a valid matching header. `cookies` are inserted into the target session's Go Jar for this URL immediately before the request; they therefore persist in a named session and are scoped to the one ephemeral client for sessionless requests. They are not a replacement for an explicit `Cookie` header.
 
 `ResponseHeadersMeta`:
 ```ts

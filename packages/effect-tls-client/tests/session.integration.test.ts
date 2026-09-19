@@ -99,6 +99,7 @@ interface LocalHttp1Server {
     readonly body: Uint8Array;
     readonly headers: Readonly<Record<string, string | string[] | undefined>>;
   }>;
+  readonly uploadEnded: Promise<boolean>;
   readonly firstChunk: Promise<void>;
   readonly disconnected: Promise<void>;
   readonly close: () => Promise<void>;
@@ -113,6 +114,7 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
     readonly body: Uint8Array;
     readonly headers: Readonly<Record<string, string | string[] | undefined>>;
   }) => void = () => {};
+  let resolveUploadEnded: (value: boolean) => void = () => {};
   let resolveDisconnected: () => void = () => {};
   const requestHeaders = new Promise<ReadonlyArray<readonly [string, string]>>(
     (resolve) => {
@@ -128,11 +130,20 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
   }>((resolve) => {
     resolveUpload = resolve;
   });
+  const uploadEnded = new Promise<boolean>((resolve) => {
+    resolveUploadEnded = resolve;
+  });
   const disconnected = new Promise<void>((resolve) => {
     resolveDisconnected = resolve;
   });
   let disconnectReported = false;
+  let uploadEndedReported = false;
   let cancelTimer: ReturnType<typeof setInterval> | undefined;
+  const reportUploadEnded = (ended: boolean) => {
+    if (uploadEndedReported) return;
+    uploadEndedReported = true;
+    resolveUploadEnded(ended);
+  };
   const reportDisconnect = () => {
     if (disconnectReported) return;
     disconnectReported = true;
@@ -184,8 +195,15 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
         resolveFirstChunk();
         response.end("early");
       });
-      request.once("aborted", reportDisconnect);
-      response.once("close", reportDisconnect);
+      request.once("end", () => reportUploadEnded(true));
+      request.once("aborted", () => {
+        reportUploadEnded(false);
+        reportDisconnect();
+      });
+      response.once("close", () => {
+        reportUploadEnded(false);
+        reportDisconnect();
+      });
       return;
     }
     if (path === "/upload-wait") {
@@ -274,6 +292,7 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
     url: `http://127.0.0.1:${port}`,
     requestHeaders,
     upload,
+    uploadEnded,
     firstChunk,
     disconnected,
     close: () => close(server),
@@ -431,6 +450,7 @@ describeRealIntegration("real Bridge session requests", () => {
             },
           );
           expect(yield* response.text).toBe("early");
+          expect(yield* Effect.promise(() => server.uploadEnded)).toBe(false);
           expect(pulls).toBeLessThan(100);
         }),
       ).pipe(Effect.ensuring(Effect.promise(server.close)));
@@ -467,6 +487,36 @@ describeRealIntegration("real Bridge session requests", () => {
           expect(upload.headers["content-length"]).toBe(
             String(upload.body.byteLength),
           );
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("accepts many small upload chunks within the byte window", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          const chunkCount = 100;
+          const chunkSize = 1024;
+          const body = Stream.unfold(0, (index) =>
+            Effect.succeed(
+              index >= chunkCount
+                ? undefined
+                : ([new Uint8Array(chunkSize), index + 1] as const),
+            ),
+          );
+          const response = yield* session.request(`${server.url}/count`, {
+            method: "POST",
+            body,
+          });
+          expect(yield* response.text).toBe(String(chunkCount * chunkSize));
         }),
       ).pipe(Effect.ensuring(Effect.promise(server.close)));
     }),

@@ -65,39 +65,42 @@ func (c *uploadCredits) ack(size uint64) {
 	c.acked += size
 }
 
+var errUploadResponse = errors.New("request upload aborted after response headers")
+
 type requestUpload struct {
 	ctx       context.Context
 	id        uint32
 	reader    *io.PipeReader
 	writer    *io.PipeWriter
-	chunks    chan []byte
 	credits   *uploadCredits
 	chunkSize uint64
+	window    uint64
 	output    *protocol.Writer
 	done      chan struct{}
-	closeOnce sync.Once
-	stateMu   sync.Mutex
-	ended     bool
+
+	queueMu    sync.Mutex
+	queueCond  *sync.Cond
+	chunks     [][]byte
+	queuedSize uint64
+	closed     bool
+	closeErr   error
+	ended      bool
 }
 
 func newRequestUpload(ctx context.Context, output *protocol.Writer, id uint32, window, chunkSize uint64) *requestUpload {
-	const maxQueueCapacity = uint64(4096)
-	capacity := maxQueueCapacity
-	if chunkSize != 0 && window/chunkSize < maxQueueCapacity-2 {
-		capacity = window/chunkSize + 2
-	}
 	reader, writer := io.Pipe()
 	upload := &requestUpload{
 		ctx:       ctx,
 		id:        id,
 		reader:    reader,
 		writer:    writer,
-		chunks:    make(chan []byte, int(capacity)),
 		credits:   &uploadCredits{window: window},
 		chunkSize: chunkSize,
+		window:    window,
 		output:    output,
 		done:      make(chan struct{}),
 	}
+	upload.queueCond = sync.NewCond(&upload.queueMu)
 	go upload.watchContext()
 	go upload.run()
 	return upload
@@ -106,39 +109,63 @@ func newRequestUpload(ctx context.Context, output *protocol.Writer, id uint32, w
 func (u *requestUpload) watchContext() {
 	select {
 	case <-u.ctx.Done():
-		_ = u.writer.CloseWithError(u.ctx.Err())
+		u.abort(u.ctx.Err())
 	case <-u.done:
 	}
+}
+
+func (u *requestUpload) next() ([]byte, error) {
+	u.queueMu.Lock()
+	defer u.queueMu.Unlock()
+	for len(u.chunks) == 0 && !u.closed {
+		u.queueCond.Wait()
+	}
+	if u.closed {
+		return nil, u.closeErr
+	}
+	chunk := u.chunks[0]
+	u.chunks[0] = nil
+	u.chunks = u.chunks[1:]
+	if chunk != nil {
+		u.queuedSize -= uint64(len(chunk))
+	}
+	u.queueCond.Broadcast()
+	return chunk, nil
 }
 
 func (u *requestUpload) run() {
 	defer close(u.done)
 	for {
-		select {
-		case <-u.ctx.Done():
-			_ = u.writer.CloseWithError(u.ctx.Err())
+		chunk, err := u.next()
+		if err != nil {
+			_ = u.writer.CloseWithError(err)
 			return
-		case chunk := <-u.chunks:
-			if chunk == nil {
-				_ = u.writer.Close()
-				return
-			}
-			written, err := u.writer.Write(chunk)
-			if err != nil {
-				return
-			}
-			if written == 0 {
-				continue
-			}
-			u.credits.ack(uint64(written))
-			meta, metaErr := protocol.EncodeMeta(protocol.AckMeta{Bytes: uint64(written)})
-			if metaErr != nil || u.output.Write(protocol.Frame{
-				Kind: protocol.KindBodyAck,
-				ID:   u.id,
-				Meta: meta,
-			}) != nil {
-				return
-			}
+		}
+		if chunk == nil {
+			_ = u.writer.Close()
+			return
+		}
+		written, err := u.writer.Write(chunk)
+		if err != nil {
+			u.abort(err)
+			return
+		}
+		if written == 0 {
+			continue
+		}
+		u.credits.ack(uint64(written))
+		meta, metaErr := protocol.EncodeMeta(protocol.AckMeta{Bytes: uint64(written)})
+		if metaErr != nil {
+			u.abort(metaErr)
+			return
+		}
+		if err := u.output.Write(protocol.Frame{
+			Kind: protocol.KindBodyAck,
+			ID:   u.id,
+			Meta: meta,
+		}); err != nil {
+			u.abort(err)
+			return
 		}
 	}
 }
@@ -153,50 +180,96 @@ func (u *requestUpload) accept(chunk []byte) error {
 	if u.ctx.Err() != nil {
 		return nil
 	}
-	u.stateMu.Lock()
+	chunkBytes := uint64(len(chunk))
+	u.queueMu.Lock()
+	closed := u.closed
 	ended := u.ended
-	u.stateMu.Unlock()
+	u.queueMu.Unlock()
+	if closed {
+		return nil
+	}
 	if ended {
 		return fmt.Errorf("%w: body.chunk received after body.end", protocol.ErrProtocol)
 	}
-	if !u.credits.reserve(uint64(len(chunk))) {
+	if !u.credits.reserve(chunkBytes) {
 		return fmt.Errorf("%w: upload credit window exceeded", protocol.ErrProtocol)
 	}
-	select {
-	case u.chunks <- chunk:
-		return nil
-	case <-u.ctx.Done():
-		return nil
-	default:
-		return fmt.Errorf("%w: upload queue is full", protocol.ErrProtocol)
+
+	u.queueMu.Lock()
+	defer u.queueMu.Unlock()
+	for !u.closed && (u.queuedSize > u.window || chunkBytes > u.window-u.queuedSize) {
+		u.queueCond.Wait()
 	}
+	if u.closed || u.ctx.Err() != nil {
+		return nil
+	}
+	if u.ended {
+		return fmt.Errorf("%w: body.chunk received after body.end", protocol.ErrProtocol)
+	}
+	u.chunks = append(u.chunks, chunk)
+	u.queuedSize += chunkBytes
+	u.queueCond.Signal()
+	return nil
 }
 
 func (u *requestUpload) end() error {
 	if u.ctx.Err() != nil {
 		return nil
 	}
-	u.stateMu.Lock()
+	u.queueMu.Lock()
+	defer u.queueMu.Unlock()
+	if u.closed {
+		return nil
+	}
 	if u.ended {
-		u.stateMu.Unlock()
 		return fmt.Errorf("%w: duplicate body.end", protocol.ErrProtocol)
 	}
 	u.ended = true
-	u.stateMu.Unlock()
-	select {
-	case u.chunks <- nil:
-		return nil
-	case <-u.ctx.Done():
-		return nil
-	default:
-		return fmt.Errorf("%w: upload queue is full", protocol.ErrProtocol)
+	u.chunks = append(u.chunks, nil)
+	u.queueCond.Signal()
+	return nil
+}
+
+func (u *requestUpload) abort(err error) {
+	if err == nil {
+		err = io.ErrClosedPipe
 	}
+	u.queueMu.Lock()
+	if !u.closed {
+		u.closed = true
+		u.closeErr = err
+		u.chunks = nil
+		u.queuedSize = 0
+		u.queueCond.Broadcast()
+	}
+	u.queueMu.Unlock()
+	_ = u.writer.CloseWithError(err)
+}
+
+func (u *requestUpload) abortIfIncomplete(err error) {
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	u.queueMu.Lock()
+	if u.closed || u.ended {
+		u.queueMu.Unlock()
+		return
+	}
+	u.closed = true
+	u.closeErr = err
+	u.chunks = nil
+	u.queuedSize = 0
+	u.queueCond.Broadcast()
+	u.queueMu.Unlock()
+	_ = u.writer.CloseWithError(err)
 }
 
 func (u *requestUpload) close() {
-	u.closeOnce.Do(func() {
-		_ = u.writer.CloseWithError(io.ErrClosedPipe)
-	})
+	u.abort(io.ErrClosedPipe)
+	<-u.done
+}
+
+func (u *requestUpload) wait() {
 	<-u.done
 }
 
@@ -870,6 +943,12 @@ func closeRequestUpload(op *operation) {
 	}
 }
 
+func waitRequestUpload(op *operation) {
+	if op.upload != nil {
+		op.upload.wait()
+	}
+}
+
 func requestCookie(cookie protocol.CookieMeta) (*http.Cookie, error) {
 	if cookie.Name == "" {
 		return nil, errors.New("cookie name is required")
@@ -1066,6 +1145,9 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		fail(protocol.ErrorKindInternal, err.Error())
 		return
 	}
+	if op.upload != nil {
+		op.upload.abortIfIncomplete(errUploadResponse)
+	}
 	if !d.isCurrent(op) {
 		closeRequestUpload(op)
 		return
@@ -1124,7 +1206,7 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		}
 	}
 
-	closeRequestUpload(op)
+	waitRequestUpload(op)
 	bandwidthAfter := snapshotBandwidth(client)
 	endMeta, err := protocol.EncodeMeta(protocol.EndMeta{
 		Protocol:     protocolName,
