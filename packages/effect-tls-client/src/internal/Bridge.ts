@@ -45,6 +45,7 @@ import {
   HelloAckMeta,
   HelloMeta,
   RequestMeta,
+  isRequestErrorKind,
   ResponseHeadersMeta,
   SessionConfigWire,
   SessionIdMeta,
@@ -316,6 +317,11 @@ const makeBridge = Effect.gen(function* () {
       return new SessionNotFound({
         message: meta.message,
         sessionId,
+      });
+    }
+    if (!isRequestErrorKind(meta.kind)) {
+      return new BridgeProtocolError({
+        message: `unsupported request error kind: ${meta.kind}`,
       });
     }
     const detail = meta.detail === undefined ? {} : { detail: meta.detail };

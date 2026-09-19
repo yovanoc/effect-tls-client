@@ -109,7 +109,7 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 
 ## D15 — Telemetry: per-request bandwidth on the wire, Effect Metrics, span attributes
 
-**Decision:** `end` frame carries `{ protocol, bytesRead, bytesWritten }` (Go tracker delta per request). `TlsResponse.protocol`; `TlsSession.bandwidth`/`resetBandwidth` pull totals. Library publishes `Metric`s: counters `tls_client.bytes.read|written`, `tls_client.requests` (labels `profile`, `protocol`, `error_kind`), gauges `tls_client.sessions.active`, `tls_client.ws.connections.active`. Never label by sessionId. Transport annotates the existing `HttpClient.make` span with `tls_client.protocol|profile|session`.
+**Decision:** `end` frame carries `{ protocol, bytesRead, bytesWritten }` (the Go tracker delta per request). The pinned tls-client v1.16.0 exposes only client-wide atomic totals, not per-request or per-connection counters, so the Bridge serializes requests sharing a client from `Do` through body EOF while taking the snapshots. Connection pooling is retained, but those requests trade wire concurrency for exact TLS-level attribution; requests using the other redirect-policy client may still run concurrently. `TlsResponse.protocol`; `TlsSession.bandwidth`/`resetBandwidth` pull totals. Library publishes `Metric`s: counters `tls_client.bytes.read|written`, `tls_client.requests` (labels `profile`, `protocol`, `error_kind`), gauges `tls_client.sessions.active`, `tls_client.ws.connections.active`. Never label by sessionId. Transport annotates the existing `HttpClient.make` span with `tls_client.protocol|profile|session`.
 
 **Why:** exact per-request bandwidth without polling; metrics derive from frames already observed; low-cardinality labels only.
 

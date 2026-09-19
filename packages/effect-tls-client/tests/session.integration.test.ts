@@ -93,19 +93,23 @@ const tryPromise = <A>(thunk: () => Promise<A>) => Effect.promise(thunk);
 
 interface LocalHttp1Server {
   readonly url: string;
-  readonly headerOrder: Promise<ReadonlyArray<string>>;
+  readonly requestHeaders: Promise<ReadonlyArray<readonly [string, string]>>;
   readonly firstChunk: Promise<void>;
   readonly disconnected: Promise<void>;
   readonly close: () => Promise<void>;
 }
 
 const startHttp1Server = async (): Promise<LocalHttp1Server> => {
-  let resolveHeaderOrder: (value: ReadonlyArray<string>) => void = () => {};
+  let resolveRequestHeaders: (
+    value: ReadonlyArray<readonly [string, string]>,
+  ) => void = () => {};
   let resolveFirstChunk: () => void = () => {};
   let resolveDisconnected: () => void = () => {};
-  const headerOrder = new Promise<ReadonlyArray<string>>((resolve) => {
-    resolveHeaderOrder = resolve;
-  });
+  const requestHeaders = new Promise<ReadonlyArray<readonly [string, string]>>(
+    (resolve) => {
+      resolveRequestHeaders = resolve;
+    },
+  );
   const firstChunk = new Promise<void>((resolve) => {
     resolveFirstChunk = resolve;
   });
@@ -124,12 +128,27 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
   const server = createServer((request, response) => {
     const path = new URL(request.url ?? "/", "http://local").pathname;
     if (path === "/headers") {
-      resolveHeaderOrder(
-        request.rawHeaders.filter((_, index) => index % 2 === 0),
-      );
+      const names = new Set(["x-first", "x-second", "x-identity", "x-replace"]);
+      const pairs: Array<readonly [string, string]> = [];
+      for (let index = 0; index < request.rawHeaders.length; index += 2) {
+        const name = request.rawHeaders[index];
+        const value = request.rawHeaders[index + 1];
+        if (
+          name !== undefined &&
+          value !== undefined &&
+          names.has(name.toLowerCase())
+        ) {
+          pairs.push([name, value]);
+        }
+      }
+      resolveRequestHeaders(pairs);
       response.setHeader("Content-Type", "text/plain");
       response.setHeader("X-Transport", "http1");
       response.end("http/1.1");
+      return;
+    }
+    if (path === "/slow") {
+      setTimeout(() => response.end("slow"), 50);
       return;
     }
     if (path === "/large") {
@@ -178,7 +197,7 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
   const port = await listen(server);
   return {
     url: `http://127.0.0.1:${port}`,
-    headerOrder,
+    requestHeaders,
     firstChunk,
     disconnected,
     close: () => close(server),
@@ -229,27 +248,55 @@ describeRealIntegration("real Bridge session requests", () => {
           const session = yield* client.session({
             profile: "chrome_146",
             forceHttp1: true,
+            identity: {
+              headers: [
+                ["X-Identity", "identity"],
+                ["X-Replace", "identity"],
+              ],
+            },
           });
           const response = yield* session.request(`${server.url}/headers`, {
             headers: [
               ["X-First", "one"],
               ["X-Second", "two"],
+              ["X-Replace", "request"],
             ],
-            headerOrder: ["x-first", "x-second"],
+            headerOrder: ["x-second", "x-first", "x-replace", "x-identity"],
           });
           expect(response.status).toBe(200);
           expect(response.protocol).toBe("HTTP/1.1");
           expect(response.headers).toContainEqual(["X-Transport", "http1"]);
           expect(yield* response.text).toBe("http/1.1");
-          const names = yield* Effect.promise(() => server.headerOrder);
-          const first = names.findIndex(
-            (name) => name.toLowerCase() === "x-first",
-          );
-          const second = names.findIndex(
-            (name) => name.toLowerCase() === "x-second",
-          );
-          expect(first).toBeGreaterThanOrEqual(0);
-          expect(second).toBeGreaterThan(first);
+          const headers = yield* Effect.promise(() => server.requestHeaders);
+          expect(
+            headers.map(([name, value]) => [name.toLowerCase(), value]),
+          ).toEqual([
+            ["x-second", "two"],
+            ["x-first", "one"],
+            ["x-replace", "request"],
+            ["x-identity", "identity"],
+          ]);
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("treats request timeoutMs 0 as an unlimited override", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+            timeoutMs: 5,
+          });
+          const response = yield* session.request(`${server.url}/slow`, {
+            timeoutMs: 0,
+          });
+          expect(yield* response.text).toBe("slow");
         }),
       ).pipe(Effect.ensuring(Effect.promise(server.close)));
     }),

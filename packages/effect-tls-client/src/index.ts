@@ -16,7 +16,7 @@ export {
   TlsRequestError,
   isTransientRequestKind,
 } from "./internal/Errors.js";
-export type { BridgeError } from "./internal/Errors.js";
+export type { BridgeError, RequestErrorKind } from "./internal/Errors.js";
 export type { BridgeVersion } from "./internal/Bridge.js";
 
 /** The library's own release version, used in the Bridge handshake. */

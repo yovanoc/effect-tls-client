@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -136,6 +137,47 @@ func TestBuildSessionWithKnownProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	session.closeIdleConnections()
+}
+
+func TestTrackedRequestsSerializeSnapshotsPerClient(t *testing.T) {
+	session, err := buildSession(protocol.SessionConfigMeta{
+		SessionID: "bandwidth-gate",
+		Profile:   stringPointer("chrome_146"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+
+	_, _, releaseFirst, err := session.beginTrackedRequest(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, releaseSecond, secondErr := session.beginTrackedRequest(context.Background(), nil)
+		if secondErr == nil {
+			close(acquired)
+			releaseSecond()
+		}
+		secondDone <- secondErr
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("second request acquired the same bandwidth tracker before the first ended")
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseFirst()
+	select {
+	case secondErr := <-secondDone:
+		if secondErr != nil {
+			t.Fatal(secondErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second request did not acquire the bandwidth tracker")
+	}
 }
 
 func TestIntegrationLocalHTTP1(t *testing.T) {

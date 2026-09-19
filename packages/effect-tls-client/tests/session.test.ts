@@ -1,9 +1,18 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Effect, Layer, Stream } from "effect";
+import { ConfigProvider, Deferred, Effect, Fiber, Layer, Stream } from "effect";
 import type { Scope } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import { fileURLToPath } from "node:url";
-import { SessionConfig, SessionConfigError, TlsClient } from "../src/index.js";
+import {
+  SessionConfig,
+  SessionConfigError,
+  TlsClient,
+  TlsRequestError,
+  isTransientRequestKind,
+} from "../src/index.js";
+import { Bridge } from "../src/internal/Bridge.js";
+import { FrameKind } from "../src/internal/Frame.js";
+import { makeTlsClientLayer } from "../src/TlsClient.js";
 
 const fixturePath = fileURLToPath(
   new URL("./fixtures/bridge-fixture.mjs", import.meta.url),
@@ -100,5 +109,91 @@ describe("TlsClient sessions", () => {
         expect(error._tag).toBe("SessionNotFound");
       }),
     ),
+  );
+
+  it.effect("classifies a Connect request error as transient", () =>
+    withClient(
+      Effect.gen(function* () {
+        const client = yield* TlsClient;
+        const session = yield* client.session({ profile: "chrome_146" });
+        const error = yield* Effect.flip(
+          session.request("https://fixture.test/connect-error"),
+        );
+        expect(error).toBeInstanceOf(TlsRequestError);
+        if (error._tag === "TlsRequestError") {
+          expect(error.kind).toBe("Connect");
+          expect(error.isTransient).toBe(true);
+        }
+      }),
+    ),
+  );
+
+  it("marks every transient request kind", () => {
+    for (const kind of ["Dns", "Connect", "Timeout", "Proxy"] as const) {
+      const error = new TlsRequestError({
+        kind,
+        message: "fixture",
+        isTransient: isTransientRequestKind(kind),
+      });
+      expect(error.isTransient).toBe(true);
+    }
+  });
+
+  it.effect(
+    "destroys a remotely-created session if creation is interrupted",
+    () =>
+      Effect.gen(function* () {
+        const creationStarted = Deferred.makeUnsafe<void>();
+        let destroyCalls = 0;
+        const ok = {
+          kind: FrameKind.ok,
+          id: 1,
+          meta: new Uint8Array(0),
+          body: new Uint8Array(0),
+        };
+        const fakeBridge = Bridge.of({
+          call: (kind) => {
+            if (kind === FrameKind.sessionCreate) {
+              return Effect.gen(function* () {
+                yield* Deferred.succeed(creationStarted, undefined);
+                return yield* Effect.never;
+              });
+            }
+            if (kind === FrameKind.sessionDestroy) {
+              return Effect.sync(() => {
+                destroyCalls += 1;
+              }).pipe(Effect.as(ok));
+            }
+            return Effect.succeed(ok);
+          },
+          stream: () => Stream.empty,
+          request: () => Effect.die("unused in session lifecycle test"),
+          version: Effect.succeed({
+            packageVersion: "fixture",
+            bridgeVersion: "fixture",
+            protocolVersion: 1,
+            tlsClientVersion: "fixture",
+            goVersion: "fixture",
+          }),
+        });
+
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const client = yield* TlsClient;
+            const fiber = yield* client
+              .session({ profile: "chrome_146" })
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(creationStarted);
+            yield* Fiber.interrupt(fiber);
+            expect(destroyCalls).toBe(1);
+          }).pipe(
+            Effect.provide(
+              makeTlsClientLayer.pipe(
+                Layer.provide(Layer.succeed(Bridge, fakeBridge)),
+              ),
+            ),
+          ),
+        );
+      }),
   );
 });

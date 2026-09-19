@@ -276,6 +276,37 @@ export const ErrorKind = Schema.Literals([
 ]);
 export type ErrorKind = Schema.Schema.Type<typeof ErrorKind>;
 
+/** Request error kinds produced by the current GET-only request path. */
+export const RequestErrorKind = Schema.Literals([
+  "InvalidConfig",
+  "InvalidUrl",
+  "Dns",
+  "Connect",
+  "Tls",
+  "Proxy",
+  "Timeout",
+  "Cancelled",
+  "Http",
+  "Body",
+  "Pinning",
+  "Unknown",
+]);
+export type RequestErrorKind = Schema.Schema.Type<typeof RequestErrorKind>;
+
+export const isRequestErrorKind = (kind: ErrorKind): kind is RequestErrorKind =>
+  kind === "InvalidConfig" ||
+  kind === "InvalidUrl" ||
+  kind === "Dns" ||
+  kind === "Connect" ||
+  kind === "Tls" ||
+  kind === "Proxy" ||
+  kind === "Timeout" ||
+  kind === "Cancelled" ||
+  kind === "Http" ||
+  kind === "Body" ||
+  kind === "Pinning" ||
+  kind === "Unknown";
+
 export const ErrorMeta = Schema.Struct({
   kind: ErrorKind,
   message: Schema.String,

@@ -58,7 +58,12 @@ process.stdin.on("data", (chunk) => {
       writeFrame(0x81, id, {});
     } else if (kind === 0x20) {
       const metadata = JSON.parse(frame.subarray(9).toString("utf8"));
-      if (!sessions.has(metadata.sessionId)) {
+      if (metadata.url.endsWith("/connect-error")) {
+        writeFrame(0x82, id, {
+          kind: "Connect",
+          message: "fixture connect failure",
+        });
+      } else if (!sessions.has(metadata.sessionId)) {
         writeFrame(0x82, id, {
           kind: "SessionNotFound",
           message: "session not found",

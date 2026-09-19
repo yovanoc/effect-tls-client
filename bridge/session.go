@@ -26,11 +26,14 @@ import (
 )
 
 type tlsSession struct {
-	id              string
-	client          tlsClient.HttpClient
-	redirectClient  tlsClient.HttpClient
-	followRedirects bool
-	identity        protocol.IdentityMeta
+	id                    string
+	client                tlsClient.HttpClient
+	redirectClient        tlsClient.HttpClient
+	followRedirects       bool
+	timeoutMs             int64
+	identity              protocol.IdentityMeta
+	clientBandwidthGate   chan struct{}
+	redirectBandwidthGate chan struct{}
 }
 
 type bandwidthSnapshot struct {
@@ -61,6 +64,31 @@ func (s *tlsSession) do(request *http.Request, followRedirects *bool) (*http.Res
 	before := snapshotBandwidth(client)
 	response, err := client.Do(request)
 	return response, client, before, err
+}
+
+// The pinned upstream tracker counts bytes for the whole client, so this gate
+// spans Do through body EOF to keep each end delta attributable to one request.
+// ponytail: same-client request bodies serialize; use upstream per-request counters when available.
+func (s *tlsSession) beginTrackedRequest(ctx context.Context, followRedirects *bool) (tlsClient.HttpClient, bandwidthSnapshot, func(), error) {
+	client := s.client
+	gate := s.clientBandwidthGate
+	if followRedirects != nil && *followRedirects != s.followRedirects {
+		client = s.redirectClient
+		gate = s.redirectBandwidthGate
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, bandwidthSnapshot{}, func() {}, err
+	}
+	select {
+	case gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-gate
+			return nil, bandwidthSnapshot{}, func() {}, err
+		}
+		return client, snapshotBandwidth(client), func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, bandwidthSnapshot{}, func() {}, ctx.Err()
+	}
 }
 
 func (s *tlsSession) closeIdleConnections() {
@@ -264,7 +292,8 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 	}
 	clientOptions := []tlsClient.HttpClientOption{
 		tlsClient.WithClientProfile(clientProfile),
-		tlsClient.WithTimeoutMilliseconds(int(timeoutMs)),
+		// Request contexts below own the deadline so timeoutMs: 0 can remove the session default.
+		tlsClient.WithTimeoutMilliseconds(0),
 		tlsClient.WithBandwidthTracker(),
 	}
 	if config.ProxyURL != "" {
@@ -351,11 +380,14 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 		identity = *config.Identity
 	}
 	return &tlsSession{
-		id:              config.SessionID,
-		client:          client,
-		redirectClient:  redirectClient,
-		followRedirects: followRedirects,
-		identity:        identity,
+		id:                    config.SessionID,
+		client:                client,
+		redirectClient:        redirectClient,
+		followRedirects:       followRedirects,
+		timeoutMs:             timeoutMs,
+		identity:              identity,
+		clientBandwidthGate:   make(chan struct{}, 1),
+		redirectBandwidthGate: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -685,7 +717,7 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		return
 	}
 	if meta.Method != "GET" && meta.Method != "" {
-		_ = d.finishError(op, protocol.ErrorKindInvalidConfig, "issue #5 only supports GET requests")
+		_ = d.finishError(op, protocol.ErrorKindInvalidConfig, "this capability supports GET requests only")
 		return
 	}
 	if meta.HasBody {
@@ -701,14 +733,18 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		return
 	}
 
+	timeoutMs := session.timeoutMs
+	if meta.TimeoutMs != nil {
+		timeoutMs = *meta.TimeoutMs
+	}
 	requestContext := ctx
 	cancel := func() {}
-	if meta.TimeoutMs != nil && *meta.TimeoutMs > 0 {
-		if *meta.TimeoutMs > math.MaxInt64/int64(time.Millisecond) {
+	if timeoutMs > 0 {
+		if timeoutMs > math.MaxInt64/int64(time.Millisecond) {
 			_ = d.finishError(op, protocol.ErrorKindInvalidConfig, "timeoutMs is outside the supported range")
 			return
 		}
-		requestContext, cancel = context.WithTimeout(ctx, time.Duration(*meta.TimeoutMs)*time.Millisecond)
+		requestContext, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	}
 	defer cancel()
 
@@ -735,7 +771,13 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 	if meta.HostOverride != "" {
 		req.Host = meta.HostOverride
 	}
-	response, client, bandwidthBefore, err := session.do(req, meta.FollowRedirects)
+	client, bandwidthBefore, releaseBandwidth, acquireErr := session.beginTrackedRequest(requestContext, meta.FollowRedirects)
+	if acquireErr != nil {
+		_ = d.finishError(op, classifyRequestError(acquireErr), acquireErr.Error())
+		return
+	}
+	defer releaseBandwidth()
+	response, err := client.Do(req)
 	if err != nil {
 		kind := classifyRequestError(err)
 		if requestContext.Err() != nil {

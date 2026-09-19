@@ -1,5 +1,5 @@
 import { Cookies } from "effect/unstable/http";
-import { Context, Effect, Layer, Schema, Stream } from "effect";
+import { Context, Effect, Exit, Layer, Schema, Stream } from "effect";
 import type { Scope } from "effect";
 import {
   Bridge,
@@ -148,11 +148,9 @@ const normalizeConfig = (
     ),
   );
 
-export class TlsClient extends Context.Service<TlsClient, TlsClientService>()(
-  "effect-tls-client/TlsClient",
-) {
-  static readonly layer = Layer.effect(
-    TlsClient,
+const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
+  Layer.effect(
+    service,
     Effect.gen(function* () {
       const bridge = yield* Bridge;
       const activeSessionIds = new Set<string>();
@@ -175,23 +173,40 @@ export class TlsClient extends Context.Service<TlsClient, TlsClientService>()(
       ) {
         const config = yield* normalizeConfig(input);
         const sessionId = globalThis.crypto.randomUUID();
-        yield* bridge
-          .call(FrameKind.sessionCreate, {
-            sessionId,
-            ...config,
-          })
-          .pipe(Effect.asVoid);
-        activeSessionIds.add(sessionId);
-        return yield* Effect.acquireRelease(
-          Effect.succeed(makeSession(bridge, sessionId)),
-          () =>
-            Effect.sync(() => activeSessionIds.delete(sessionId)).pipe(
-              Effect.flatMap(() =>
+        let destroySent = false;
+        const destroySession = Effect.suspend(() => {
+          if (destroySent) return Effect.void;
+          destroySent = true;
+          activeSessionIds.delete(sessionId);
+          return bridge
+            .call(FrameKind.sessionDestroy, { sessionId })
+            .pipe(Effect.ignore);
+        });
+        const acquire = Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const created = yield* Effect.exit(
+              restore(
                 bridge
-                  .call(FrameKind.sessionDestroy, { sessionId })
-                  .pipe(Effect.ignore),
+                  .call(FrameKind.sessionCreate, {
+                    sessionId,
+                    ...config,
+                  })
+                  .pipe(Effect.asVoid),
               ),
-            ),
+            );
+            if (Exit.isFailure(created)) {
+              yield* destroySession;
+              return yield* Effect.failCause(created.cause);
+            }
+            activeSessionIds.add(sessionId);
+            return yield* Effect.acquireRelease(
+              Effect.succeed(makeSession(bridge, sessionId)),
+              () => destroySession,
+            );
+          }),
+        );
+        return yield* Effect.onInterrupt(acquire, () =>
+          destroySession.pipe(Effect.uninterruptible),
         );
       });
       return TlsClient.of({
@@ -199,8 +214,18 @@ export class TlsClient extends Context.Service<TlsClient, TlsClientService>()(
         session,
       });
     }),
-  ).pipe(Layer.provide(Bridge.layer));
+  );
+
+export class TlsClient extends Context.Service<TlsClient, TlsClientService>()(
+  "effect-tls-client/TlsClient",
+) {
+  static readonly layer = makeTlsClientLayerInternal(TlsClient).pipe(
+    Layer.provide(Bridge.layer),
+  );
 }
+
+/** Layer for deterministic tests with a supplied Bridge service. */
+export const makeTlsClientLayer = makeTlsClientLayerInternal(TlsClient);
 
 const makeSession = (
   bridge: Bridge["Service"],
