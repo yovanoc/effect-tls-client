@@ -1,8 +1,13 @@
-/**
- * effect-tls-client — Effect-native access to bogdanfinn/tls-client via a Go
- * Bridge sidecar. Stage 0 scaffold: no protocol/transport code yet, see
- * `docs/design/02-implementation-plan.md`.
- */
+export { TlsClient } from "./TlsClient.js";
+export type { TlsClientService } from "./TlsClient.js";
+export {
+  BridgeExited,
+  BridgeProtocolError,
+  BridgeSpawnError,
+  BridgeVersionMismatch,
+} from "./internal/Errors.js";
+export type { BridgeError } from "./internal/Errors.js";
+export type { BridgeVersion } from "./internal/Bridge.js";
 
-/** The library's own version, for diagnostics only (matches package.json). */
+/** The library's own release version, used in the Bridge handshake. */
 export const version = "0.0.0";
