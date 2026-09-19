@@ -31,10 +31,24 @@ func TestGoldenGoToTS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cancelled, err := json.Marshal(ErrorMeta{
+		Kind:    ErrorKindCancelled,
+		Message: "operation cancelled",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	end, err := EncodeMeta(EndMeta{BytesRead: 3, BytesWritten: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
 	frames := []Frame{
 		{Kind: KindHelloAck, ID: 0, Meta: helloAck},
 		{Kind: KindOk, ID: 7, Meta: empty},
 		{Kind: KindError, ID: 9, Meta: errorMeta},
+		{Kind: KindError, ID: 10, Meta: cancelled},
+		{Kind: KindChunk, ID: 11, Meta: empty, Body: []byte{1, 2, 3}},
+		{Kind: KindEnd, ID: 11, Meta: end},
 		{Kind: KindOk, ID: ^uint32(0), Body: []byte{0, 0xff}},
 	}
 	goldens := readGolden(t, "../testdata/protocol/go-to-ts.hex")

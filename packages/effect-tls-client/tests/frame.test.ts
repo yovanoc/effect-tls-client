@@ -11,6 +11,10 @@ import {
 } from "../src/internal/Frame.js";
 import {
   EmptyMeta,
+  AckMeta,
+  CancelMeta,
+  ChunkMeta,
+  EndMeta,
   ErrorMeta,
   HelloAckMeta,
   HelloMeta,
@@ -71,6 +75,18 @@ describe("protocol v1 frame codec", () => {
       decodeFrame(required(golden("go-to-ts.hex")[2])[1]).meta,
     );
     expect(error.kind).toBe("Protocol");
+    const chunk = decodeFrame(required(golden("go-to-ts.hex")[4])[1]);
+    expect(decodeMeta(ChunkMeta, chunk.meta)).toEqual({});
+    expectBytes(chunk.body, new Uint8Array([1, 2, 3]));
+    expect(
+      decodeMeta(
+        EndMeta,
+        decodeFrame(required(golden("go-to-ts.hex")[5])[1]).meta,
+      ),
+    ).toEqual({
+      bytesRead: 3,
+      bytesWritten: 0,
+    });
   });
 
   it("encodes TS golden frames byte-identically", () => {
@@ -96,6 +112,16 @@ describe("protocol v1 frame codec", () => {
         id: 7,
         meta: encodeMeta(EmptyMeta, {}),
       }),
+      encodeFrame({
+        kind: FrameKind.cancel,
+        id: 8,
+        meta: encodeMeta(CancelMeta, {}),
+      }),
+      encodeFrame({
+        kind: FrameKind.ack,
+        id: 8,
+        meta: encodeMeta(AckMeta, { bytes: 3 }),
+      }),
     ];
     expect(actual).toHaveLength(expected.length);
     for (let index = 0; index < actual.length; index += 1) {
@@ -108,7 +134,7 @@ describe("protocol v1 frame codec", () => {
   });
 
   it("handles arbitrary stream chunk boundaries and edge bodies", () => {
-    const bytes = required(golden("go-to-ts.hex")[3])[1];
+    const bytes = required(golden("go-to-ts.hex")[6])[1];
     const decoder = new FrameDecoder();
     const frames = [];
     for (let index = 0; index < bytes.byteLength; index += 1) {

@@ -7,6 +7,11 @@ import (
 	"unicode/utf8"
 )
 
+const (
+	DefaultWindow    uint64 = 1024 * 1024
+	DefaultChunkSize uint64 = 64 * 1024
+)
+
 // Plain structs with json tags intentionally use encoding/json's default
 // unknown-field behavior: additive metadata is forward-compatible (D18).
 
@@ -14,8 +19,8 @@ import (
 type HelloMeta struct {
 	ProtocolVersion int    `json:"protocolVersion"`
 	ClientVersion   string `json:"clientVersion"`
-	Window          int    `json:"window,omitempty"`
-	ChunkSize       int    `json:"chunkSize,omitempty"`
+	Window          uint64 `json:"window,omitempty"`
+	ChunkSize       uint64 `json:"chunkSize,omitempty"`
 }
 
 // HelloAckMeta is the meta of a Go -> JS helloAck frame.
@@ -24,10 +29,40 @@ type HelloAckMeta struct {
 	BridgeVersion    string `json:"bridgeVersion"`
 	TlsClientVersion string `json:"tlsClientVersion"`
 	GoVersion        string `json:"goVersion"`
+	Window           uint64 `json:"window,omitempty"`
+	ChunkSize        uint64 `json:"chunkSize,omitempty"`
 }
 
 // EmptyMeta is the metadata of frames with no payload.
 type EmptyMeta struct{}
+
+// CancelMeta is the metadata of a JS -> Go cancel frame.
+type CancelMeta struct{}
+
+// AckMeta is the metadata of a JS -> Go credit acknowledgement.
+type AckMeta struct {
+	Bytes uint64 `json:"bytes"`
+}
+
+// DebugSleepMeta is the metadata of the cancellable debug.sleep operation.
+type DebugSleepMeta struct {
+	Ms uint64 `json:"ms"`
+}
+
+// DebugStreamMeta is the metadata of the credited debug.stream operation.
+type DebugStreamMeta struct {
+	Chunks uint64 `json:"chunks"`
+	Size   uint64 `json:"size"`
+}
+
+// ChunkMeta is the metadata of a raw Go -> JS chunk frame.
+type ChunkMeta struct{}
+
+// EndMeta is the terminal metadata for a streamed operation.
+type EndMeta struct {
+	BytesRead    uint64 `json:"bytesRead"`
+	BytesWritten uint64 `json:"bytesWritten"`
+}
 
 // ErrorKind is the closed set of error classifications from protocol v1.
 type ErrorKind string

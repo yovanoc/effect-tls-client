@@ -2,8 +2,8 @@
 // docs/design/03-protocol.md: a hand-rolled, big-endian, length-prefixed
 // binary frame format multiplexed on stdio.
 //
-// Issue #3 only uses the handshake, shutdown, debug.ping, ok, and error
-// frames. Later operations deliberately do not live in this package yet.
+// Issue #4 adds cancellation and credit flow to the debug operations while
+// keeping the rest of protocol v1 reserved for later stages.
 package protocol
 
 import (
@@ -26,14 +26,20 @@ type Kind uint8
 
 const (
 	// JS -> Go.
-	KindHello     Kind = 0x01
-	KindShutdown  Kind = 0x02
-	KindDebugPing Kind = 0xF0
+	KindHello       Kind = 0x01
+	KindShutdown    Kind = 0x02
+	KindCancel      Kind = 0x40
+	KindAck         Kind = 0x41
+	KindDebugPing   Kind = 0xF0
+	KindDebugSleep  Kind = 0xF1
+	KindDebugStream Kind = 0xF2
 
 	// Go -> JS.
 	KindHelloAck Kind = 0x80
 	KindOk       Kind = 0x81
 	KindError    Kind = 0x82
+	KindChunk    Kind = 0x91
+	KindEnd      Kind = 0x92
 )
 
 // ErrProtocol is the sentinel wrapped by frame-level protocol violations.
@@ -47,10 +53,12 @@ type Frame struct {
 	Body []byte // raw bytes, may be empty
 }
 
-// IsKnownKind reports whether kind is part of protocol v1's issue #3 surface.
+// IsKnownKind reports whether kind is implemented by this protocol-v1 Bridge.
 func IsKnownKind(kind Kind) bool {
 	switch kind {
-	case KindHello, KindShutdown, KindDebugPing, KindHelloAck, KindOk, KindError:
+	case KindHello, KindShutdown, KindCancel, KindAck,
+		KindDebugPing, KindDebugSleep, KindDebugStream,
+		KindHelloAck, KindOk, KindError, KindChunk, KindEnd:
 		return true
 	default:
 		return false

@@ -45,16 +45,22 @@ JS → Go
 | 0xF1 | `debug.sleep` | `{ ms }` | – | `ok {}` (cancellable) |
 | 0xF2 | `debug.stream` | `{ chunks, size }` | – | `chunk`×n, `end` (honours credits) |
 
+`debug.stream` is the protocol-only credit test: it requests `chunks` logical chunks of
+`size` bytes. A logical chunk larger than `chunkSize` is split into multiple raw
+`chunk` frames. The emitted bytes are the increasing byte sequence starting at `0`
+(modulo 256), so order and total length are observable. Its `end` has
+`bytesRead = chunks * size` and `bytesWritten = 0`.
+
 Go → JS
 
 | kind | name | meta | body | role |
 |---|---|---|---|---|
-| 0x80 | `helloAck` | `{ protocolVersion, bridgeVersion, tlsClientVersion, goVersion }` | – | terminal for `hello` |
+| 0x80 | `helloAck` | `{ protocolVersion, bridgeVersion, tlsClientVersion, goVersion, window?, chunkSize? }` | – | terminal for `hello` |
 | 0x81 | `ok` | result JSON | – | terminal |
 | 0x82 | `error` | `ErrorMeta` (§8) | – | terminal |
 | 0x90 | `headers` | `ResponseHeadersMeta` (§6) | – | – |
 | 0x91 | `chunk` | `{}` | ✔ | credited |
-| 0x92 | `end` | `{ bytesRead, bytesWritten }` | – | terminal for `request` |
+| 0x92 | `end` | `{ bytesRead, bytesWritten }` | – | terminal for `request` / `debug.stream` |
 | 0xA0 | `ws.open` | `{ status, headers: Pair[] }` | – | – |
 | 0xA1 | `ws.frame` | `{ opcode: 1 \| 2 }` | ✔ | credited |
 | 0xA2 | `ws.closed` | `{ code, reason, initiator: "local" \| "remote" }` | – | terminal for `ws.connect` |
@@ -66,8 +72,8 @@ Go → JS
 2. After the terminal frame Go sends nothing more for that id; frames for unknown/finished ids are dropped by both sides (late `cancel`/`ack` are no-ops).
 3. `cancel` on a live op → Go cancels its `context`, cleans up, sends `error{kind:"Cancelled"}`. If the op already completed, nothing happens.
 4. Frame order within an id is significant; across ids there is no ordering guarantee.
-5. **Credits.** `window` (from `hello`, default 1 MiB) is the per-id budget for credited kinds (`chunk`, `ws.frame` Go→JS; `body.chunk` JS→Go). The producer stops when `sent − acked ≥ window` and resumes on `ack{bytes}`. A consumer acks bytes it has handed to its consumer, not bytes received. Credit is per id, never shared.
-6. Body chunks are ≤ `chunkSize` (from `hello`, default 64 KiB); the last chunk may be smaller; zero-length chunks are not sent.
+5. **Credits.** `window` (from `hello`, default 1 MiB) is the per-id budget for credited kinds (`chunk`, `ws.frame` Go→JS; `body.chunk` JS→Go). `helloAck` repeats the negotiated positive `window` and `chunkSize`; older peers may omit those additive fields, in which case the hello values (or defaults) remain in force. The producer stops when `sent − acked ≥ window` and resumes on `ack{bytes}`. A consumer acks bytes it has handed to its consumer, not bytes received. Credit is per id, never shared; an acknowledgement cannot create more credit than the id has sent.
+6. All body chunks are ≤ `chunkSize` (from `hello`, default 64 KiB); the last chunk may be smaller; zero-length chunks are not sent.
 7. Bodies are raw bytes end to end. No base64 anywhere.
 8. Go exits when stdin reaches EOF (after best-effort session/socket cleanup). JS scope close = `shutdown` → wait ≤ 2 s for `ok`/exit → `kill`.
 9. JS fails the handshake with `BridgeVersionMismatch` unless `bridgeVersion === clientVersion` and `protocolVersion === 1`.
@@ -161,4 +167,4 @@ Classification happens in Go via `errors.As`/`errors.Is` (`net.OpError`, `*net.D
 
 ## 10. Versioning
 
-`protocolVersion` is an integer in `hello`/`helloAck`; any incompatible change bumps it. Package and Bridge versions are always equal (lockstep publish), so in practice compatibility = same version. Additive fields in meta are allowed without a bump; unknown meta fields are ignored by both sides.
+`protocolVersion` is an integer in `hello`/`helloAck`; any incompatible change bumps it. Package and Bridge versions are always equal (lockstep publish), so in practice compatibility = same version. Additive fields in meta are allowed without a bump; unknown meta fields are ignored by both sides. In particular, `helloAck.window` and `helloAck.chunkSize` are optional for compatibility with an issue #3 Bridge.

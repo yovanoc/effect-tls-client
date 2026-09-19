@@ -14,6 +14,10 @@ func TestWriteReadRoundTrip(t *testing.T) {
 		{Kind: KindDebugPing, ID: 7, Meta: []byte{}, Body: nil},
 		{Kind: KindOk, ID: 5, Meta: []byte(`{}`)},
 		{Kind: KindError, ID: 9, Meta: []byte(`{"kind":"Internal","message":"boom"}`)},
+		{Kind: KindCancel, ID: 10, Meta: []byte(`{}`)},
+		{Kind: KindAck, ID: 11, Meta: []byte(`{"bytes":3}`)},
+		{Kind: KindChunk, ID: 12, Meta: []byte(`{}`), Body: []byte{1, 2, 3}},
+		{Kind: KindEnd, ID: 12, Meta: []byte(`{"bytesRead":3,"bytesWritten":0}`)},
 	}
 	for _, c := range cases {
 		var buf bytes.Buffer

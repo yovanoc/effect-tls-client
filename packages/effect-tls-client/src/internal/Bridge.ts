@@ -1,5 +1,15 @@
 import packageJson from "../../package.json" with { type: "json" };
-import { Context, Deferred, Duration, Effect, Layer, Stream } from "effect";
+import {
+  Cause,
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  Layer,
+  Queue,
+  Schema,
+  Stream,
+} from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { resolveBridgeBinary } from "./BridgeBinary.js";
 import {
@@ -17,7 +27,15 @@ import {
   type FrameInput,
 } from "./Frame.js";
 import {
+  AckMeta,
+  CancelMeta,
+  ChunkMeta,
+  DEFAULT_CHUNK_SIZE,
+  DEFAULT_WINDOW,
+  DebugSleepMeta,
+  DebugStreamMeta,
   EmptyMeta,
+  EndMeta,
   ErrorMeta,
   HelloAckMeta,
   HelloMeta,
@@ -32,32 +50,50 @@ export const PACKAGE_VERSION = packageJson.version;
 const STDERR_TAIL_BYTES = 4096;
 const SHUTDOWN_TIMEOUT_MILLIS = 2000;
 
+type CallKind = typeof FrameKind.debugPing | typeof FrameKind.debugSleep;
+
 export interface BridgeVersion {
   readonly packageVersion: string;
   readonly bridgeVersion: string;
   readonly protocolVersion: number;
   readonly tlsClientVersion: string;
   readonly goVersion: string;
+  readonly window?: number;
+  readonly chunkSize?: number;
 }
 
-interface Pending {
+interface PendingDeferred {
+  readonly _tag: "deferred";
   readonly deferred: Deferred.Deferred<Frame, BridgeError>;
   readonly expected: "hello" | "call" | "shutdown";
 }
+
+interface PendingStream {
+  readonly _tag: "stream";
+  readonly queue: Queue.Queue<Uint8Array, BridgeError | Cause.Done>;
+  readonly done: Deferred.Deferred<void>;
+}
+
+type Pending = PendingDeferred | PendingStream;
 
 interface State {
   dead: BridgeError | undefined;
   closing: boolean;
   nextId: number;
   stderrTail: Uint8Array;
+  chunkSize: number;
 }
 
 export interface BridgeService {
   readonly call: (
-    kind: typeof FrameKind.debugPing,
+    kind: CallKind,
     meta?: unknown,
     body?: Uint8Array,
   ) => Effect.Effect<Frame, BridgeError>;
+  readonly stream: (
+    kind: typeof FrameKind.debugStream,
+    meta?: unknown,
+  ) => Stream.Stream<Uint8Array, BridgeError>;
   readonly version: Effect.Effect<BridgeVersion, BridgeError>;
 }
 
@@ -138,6 +174,7 @@ const makeBridge = Effect.gen(function* () {
     closing: false,
     nextId: 1,
     stderrTail: new Uint8Array(0),
+    chunkSize: DEFAULT_CHUNK_SIZE,
   };
   const decoder = new FrameDecoder();
   const getDead = (): BridgeError | undefined => state.dead;
@@ -148,7 +185,12 @@ const makeBridge = Effect.gen(function* () {
     const operations = Array.from(pending.values());
     pending.clear();
     for (const operation of operations) {
-      Deferred.doneUnsafe(operation.deferred, Effect.fail(error));
+      if (operation._tag === "stream") {
+        Queue.failCauseUnsafe(operation.queue, Cause.fail(error));
+        Deferred.doneUnsafe(operation.done, Effect.void);
+      } else {
+        Deferred.doneUnsafe(operation.deferred, Effect.fail(error));
+      }
     }
   };
 
@@ -200,9 +242,96 @@ const makeBridge = Effect.gen(function* () {
     effect: Effect.Effect<Frame, BridgeError>,
   ): void => {
     const operation = pending.get(id);
-    if (operation === undefined) return;
+    if (operation === undefined || operation._tag !== "deferred") return;
     pending.delete(id);
     Deferred.doneUnsafe(operation.deferred, effect);
+  };
+
+  const completeStream = (id: number, result: "end" | BridgeError): void => {
+    const operation = pending.get(id);
+    if (operation === undefined || operation._tag !== "stream") return;
+    pending.delete(id);
+    if (result === "end") {
+      Queue.endUnsafe(operation.queue);
+    } else {
+      Queue.failCauseUnsafe(operation.queue, Cause.fail(result));
+    }
+    Deferred.doneUnsafe(operation.done, Effect.void);
+  };
+
+  const errorFromMeta = (meta: SchemaErrorMeta): BridgeProtocolError =>
+    new BridgeProtocolError({
+      message:
+        meta.kind === "Protocol"
+          ? meta.message
+          : `${meta.kind}: ${meta.message}`,
+    });
+
+  const handleErrorFrame = (
+    frame: Frame,
+    operation: Pending,
+  ): BridgeProtocolError | undefined => {
+    if (frame.body.byteLength !== 0) {
+      const error = failProtocol("error frame cannot contain a body");
+      markDead(error);
+      return error;
+    }
+    try {
+      const meta = decodeMeta(ErrorMeta, frame.meta);
+      const error = errorFromMeta(meta);
+      if (operation._tag === "stream") {
+        completeStream(frame.id, error);
+      } else {
+        completePending(frame.id, Effect.fail(error));
+      }
+      return undefined;
+    } catch (cause) {
+      const error = failProtocol("invalid error metadata", cause);
+      markDead(error);
+      return error;
+    }
+  };
+
+  const handleStreamFrame = (
+    frame: Frame,
+    operation: PendingStream,
+  ): BridgeProtocolError | undefined => {
+    if (frame.kind === FrameKind.error) {
+      return handleErrorFrame(frame, operation);
+    }
+    try {
+      if (frame.kind === FrameKind.chunk) {
+        if (frame.body.byteLength === 0) {
+          throw failProtocol("chunk frame cannot be empty");
+        }
+        decodeMeta(ChunkMeta, frame.meta);
+        if (frame.body.byteLength > state.chunkSize) {
+          throw failProtocol(
+            `chunk length ${frame.body.byteLength} exceeds negotiated chunkSize ${state.chunkSize}`,
+          );
+        }
+        if (!Queue.offerUnsafe(operation.queue, frame.body)) {
+          throw failProtocol("stream chunk queue is closed");
+        }
+        return undefined;
+      }
+      if (frame.kind === FrameKind.end) {
+        if (frame.body.byteLength !== 0) {
+          throw failProtocol("end frame cannot contain a body");
+        }
+        decodeMeta(EndMeta, frame.meta);
+        completeStream(frame.id, "end");
+        return undefined;
+      }
+      throw failProtocol("expected chunk, end, or error for Bridge stream");
+    } catch (cause) {
+      const error =
+        cause instanceof BridgeProtocolError
+          ? cause
+          : failProtocol("invalid stream response metadata", cause);
+      markDead(error);
+      return error;
+    }
   };
 
   const handleFrame = (frame: Frame): BridgeProtocolError | undefined => {
@@ -217,24 +346,11 @@ const makeBridge = Effect.gen(function* () {
     const operation = pending.get(frame.id);
     if (operation === undefined) return undefined;
 
+    if (operation._tag === "stream") {
+      return handleStreamFrame(frame, operation);
+    }
     if (frame.kind === FrameKind.error) {
-      if (frame.body.byteLength !== 0) {
-        const error = failProtocol("error frame cannot contain a body");
-        markDead(error);
-        return error;
-      }
-      try {
-        const meta = decodeMeta(ErrorMeta, frame.meta);
-        completePending(
-          frame.id,
-          Effect.fail(new BridgeProtocolError({ message: meta.message })),
-        );
-      } catch (cause) {
-        const error = failProtocol("invalid error metadata", cause);
-        markDead(error);
-        return error;
-      }
-      return undefined;
+      return handleErrorFrame(frame, operation);
     }
 
     try {
@@ -327,7 +443,7 @@ const makeBridge = Effect.gen(function* () {
       return;
     }
     const deferred = Deferred.makeUnsafe<Frame, BridgeError>();
-    pending.set(0, { deferred, expected: "shutdown" });
+    pending.set(0, { _tag: "deferred", deferred, expected: "shutdown" });
     yield* writeFrame({
       kind: FrameKind.shutdown,
       id: 0,
@@ -349,15 +465,19 @@ const makeBridge = Effect.gen(function* () {
   yield* observeExit.pipe(Effect.forkScoped);
 
   const helloDeferred = Deferred.makeUnsafe<Frame, BridgeError>();
-  pending.set(0, { deferred: helloDeferred, expected: "hello" });
+  pending.set(0, {
+    _tag: "deferred",
+    deferred: helloDeferred,
+    expected: "hello",
+  });
   yield* writeFrame({
     kind: FrameKind.hello,
     id: 0,
     meta: encodeMeta(HelloMeta, {
       protocolVersion: PROTOCOL_VERSION,
       clientVersion: PACKAGE_VERSION,
-      window: 1024 * 1024,
-      chunkSize: 64 * 1024,
+      window: DEFAULT_WINDOW,
+      chunkSize: DEFAULT_CHUNK_SIZE,
     }),
   });
 
@@ -395,6 +515,10 @@ const makeBridge = Effect.gen(function* () {
     yield* handle.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore);
     return yield* error;
   }
+  state.chunkSize =
+    hello.chunkSize === undefined || hello.chunkSize === 0
+      ? DEFAULT_CHUNK_SIZE
+      : hello.chunkSize;
 
   const allocateId = (): number => {
     for (;;) {
@@ -404,20 +528,40 @@ const makeBridge = Effect.gen(function* () {
     }
   };
 
+  const encodeCallMeta = (kind: CallKind, meta: unknown): Uint8Array => {
+    if (kind === FrameKind.debugPing) return encodeEmptyMeta(meta);
+    return encodeMeta(
+      DebugSleepMeta,
+      Schema.decodeUnknownSync(DebugSleepMeta)(meta ?? {}),
+    );
+  };
+
+  const sendCancel = (id: number): Effect.Effect<void, BridgeError> =>
+    Effect.suspend(() => {
+      if (state.dead !== undefined || !pending.has(id)) {
+        return Effect.void;
+      }
+      return writeFrame({
+        kind: FrameKind.cancel,
+        id,
+        meta: encodeMeta(CancelMeta, {}),
+      });
+    });
+
   const call = Effect.fnUntraced(function* (
-    kind: typeof FrameKind.debugPing,
+    kind: CallKind,
     meta?: unknown,
     body?: Uint8Array,
   ) {
     const initialDead = getDead();
     if (initialDead !== undefined) return yield* initialDead;
-    if (kind !== FrameKind.debugPing) {
+    if (kind === FrameKind.debugSleep && body !== undefined) {
       return yield* new BridgeProtocolError({
-        message: "only debug.ping is available in protocol v1",
+        message: "debug.sleep does not accept a body",
       });
     }
     const frameMeta = yield* Effect.try({
-      try: () => encodeEmptyMeta(meta),
+      try: () => encodeCallMeta(kind, meta),
       catch: (cause) =>
         new BridgeProtocolError({
           message: "invalid request metadata",
@@ -426,19 +570,107 @@ const makeBridge = Effect.gen(function* () {
     });
     const id = allocateId();
     const deferred = Deferred.makeUnsafe<Frame, BridgeError>();
-    pending.set(id, { deferred, expected: "call" });
+    const operation: PendingDeferred = {
+      _tag: "deferred",
+      deferred,
+      expected: "call",
+    };
+    pending.set(id, operation);
     const dead = getDead();
     if (dead !== undefined) {
       pending.delete(id);
       return yield* dead;
     }
-    yield* writeFrame(
+    const input: FrameInput =
       body === undefined
         ? { kind, id, meta: frameMeta }
-        : { kind, id, meta: frameMeta, body },
-    ).pipe(Effect.tapError(() => Effect.sync(() => pending.delete(id))));
-    return yield* Deferred.await(deferred);
+        : { kind, id, meta: frameMeta, body };
+    return yield* Effect.onInterrupt(
+      Effect.gen(function* () {
+        yield* Effect.uninterruptible(
+          writeFrame(input).pipe(
+            Effect.tapError(() => Effect.sync(() => pending.delete(id))),
+          ),
+        );
+        return yield* Deferred.await(deferred);
+      }),
+      () =>
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            yield* sendCancel(id).pipe(Effect.ignore);
+            if (pending.get(id) === operation) {
+              yield* Deferred.await(deferred).pipe(Effect.ignore);
+            }
+          }),
+        ),
+    );
   });
+
+  const encodeStreamMeta = (meta: unknown): Uint8Array =>
+    encodeMeta(
+      DebugStreamMeta,
+      Schema.decodeUnknownSync(DebugStreamMeta)(meta ?? {}),
+    );
+
+  const stream = (
+    kind: typeof FrameKind.debugStream,
+    meta?: unknown,
+  ): Stream.Stream<Uint8Array, BridgeError> =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const initialDead = getDead();
+        if (initialDead !== undefined) return yield* initialDead;
+        const frameMeta = yield* Effect.try({
+          try: () => {
+            if (kind !== FrameKind.debugStream) {
+              throw new Error("only debug.stream is available in protocol v1");
+            }
+            return encodeStreamMeta(meta);
+          },
+          catch: (cause) =>
+            new BridgeProtocolError({
+              message: "invalid stream metadata",
+              cause,
+            }),
+        });
+        const queue = yield* Queue.unbounded<
+          Uint8Array,
+          BridgeError | Cause.Done
+        >();
+        const done = Deferred.makeUnsafe<void>();
+        const id = allocateId();
+        const operation: PendingStream = { _tag: "stream", queue, done };
+        pending.set(id, operation);
+        yield* Effect.uninterruptible(
+          writeFrame({ kind, id, meta: frameMeta }).pipe(
+            Effect.tapError(() =>
+              Effect.sync(() => {
+                if (pending.get(id) === operation) pending.delete(id);
+              }),
+            ),
+          ),
+        );
+        return Stream.fromQueue(queue).pipe(
+          Stream.mapEffect((bytes) =>
+            writeFrame({
+              kind: FrameKind.ack,
+              id,
+              meta: encodeMeta(AckMeta, { bytes: bytes.byteLength }),
+            }).pipe(Effect.as(bytes)),
+          ),
+          Stream.ensuring(
+            Effect.uninterruptible(
+              Effect.gen(function* () {
+                yield* sendCancel(id).pipe(Effect.ignore);
+                if (pending.get(id) === operation) {
+                  yield* Deferred.await(done);
+                }
+              }),
+            ),
+          ),
+        );
+      }),
+    );
 
   const bridgeVersion: BridgeVersion = {
     packageVersion: PACKAGE_VERSION,
@@ -446,10 +678,13 @@ const makeBridge = Effect.gen(function* () {
     protocolVersion: hello.protocolVersion,
     tlsClientVersion: hello.tlsClientVersion,
     goVersion: hello.goVersion,
+    ...(hello.window !== undefined ? { window: hello.window } : {}),
+    ...(hello.chunkSize !== undefined ? { chunkSize: hello.chunkSize } : {}),
   };
 
   return Bridge.of({
     call,
+    stream,
     version: Effect.suspend(() =>
       state.dead === undefined
         ? Effect.succeed(bridgeVersion)
@@ -457,6 +692,11 @@ const makeBridge = Effect.gen(function* () {
     ),
   });
 });
+
+interface SchemaErrorMeta {
+  readonly kind: string;
+  readonly message: string;
+}
 
 export class Bridge extends Context.Service<Bridge, BridgeService>()(
   "effect-tls-client/internal/Bridge",

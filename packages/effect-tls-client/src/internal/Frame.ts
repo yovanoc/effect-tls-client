@@ -7,10 +7,16 @@ const LENGTH_PREFIX = 4;
 export const FrameKind = {
   hello: 0x01,
   shutdown: 0x02,
+  cancel: 0x40,
+  ack: 0x41,
   debugPing: 0xf0,
+  debugSleep: 0xf1,
+  debugStream: 0xf2,
   helloAck: 0x80,
   ok: 0x81,
   error: 0x82,
+  chunk: 0x91,
+  end: 0x92,
 } as const;
 
 export type FrameKind = (typeof FrameKind)[keyof typeof FrameKind];

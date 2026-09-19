@@ -2,12 +2,16 @@ import { Schema } from "effect";
 import { decodeUtf8 } from "./Frame.js";
 
 export const PROTOCOL_VERSION = 1;
+export const DEFAULT_WINDOW = 1024 * 1024;
+export const DEFAULT_CHUNK_SIZE = 64 * 1024;
+
+const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 
 export const HelloMeta = Schema.Struct({
   protocolVersion: Schema.Int,
   clientVersion: Schema.String,
-  window: Schema.optionalKey(Schema.Int),
-  chunkSize: Schema.optionalKey(Schema.Int),
+  window: Schema.optionalKey(NonNegativeInt),
+  chunkSize: Schema.optionalKey(NonNegativeInt),
 });
 export interface HelloMeta extends Schema.Schema.Type<typeof HelloMeta> {}
 
@@ -16,11 +20,45 @@ export const HelloAckMeta = Schema.Struct({
   bridgeVersion: Schema.String,
   tlsClientVersion: Schema.String,
   goVersion: Schema.String,
+  window: Schema.optionalKey(NonNegativeInt),
+  chunkSize: Schema.optionalKey(NonNegativeInt),
 });
 export interface HelloAckMeta extends Schema.Schema.Type<typeof HelloAckMeta> {}
 
 export const EmptyMeta = Schema.Struct({});
 export interface EmptyMeta extends Schema.Schema.Type<typeof EmptyMeta> {}
+
+export const CancelMeta = Schema.Struct({});
+export interface CancelMeta extends Schema.Schema.Type<typeof CancelMeta> {}
+
+export const AckMeta = Schema.Struct({
+  bytes: NonNegativeInt,
+});
+export interface AckMeta extends Schema.Schema.Type<typeof AckMeta> {}
+
+export const DebugSleepMeta = Schema.Struct({
+  ms: NonNegativeInt,
+});
+export interface DebugSleepMeta extends Schema.Schema.Type<
+  typeof DebugSleepMeta
+> {}
+
+export const DebugStreamMeta = Schema.Struct({
+  chunks: NonNegativeInt,
+  size: NonNegativeInt,
+});
+export interface DebugStreamMeta extends Schema.Schema.Type<
+  typeof DebugStreamMeta
+> {}
+
+export const ChunkMeta = Schema.Struct({});
+export interface ChunkMeta extends Schema.Schema.Type<typeof ChunkMeta> {}
+
+export const EndMeta = Schema.Struct({
+  bytesRead: NonNegativeInt,
+  bytesWritten: NonNegativeInt,
+});
+export interface EndMeta extends Schema.Schema.Type<typeof EndMeta> {}
 
 export const ErrorKind = Schema.Literals([
   "InvalidConfig",

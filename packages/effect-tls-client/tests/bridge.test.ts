@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Duration, Effect, Layer } from "effect";
+import { ConfigProvider, Duration, Effect, Fiber, Layer, Stream } from "effect";
 import { NodeServices } from "@effect/platform-node";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/internal/Bridge.js";
 import { FrameKind } from "../src/internal/Frame.js";
@@ -16,6 +17,14 @@ const delayedStderrFixturePath = fileURLToPath(
 const silentFixturePath = fileURLToPath(
   new URL("./fixtures/bridge-silent-fixture.mjs", import.meta.url),
 );
+const realBridgePath =
+  process.env["TLS_CLIENT_BRIDGE_TEST_PATH"] ??
+  fileURLToPath(
+    new URL(
+      "../../../packages/bridge-darwin-arm64/bin/bridge",
+      import.meta.url,
+    ),
+  );
 
 const withClientAt = <A, E>(
   path: string,
@@ -197,6 +206,63 @@ describe("Bridge lifecycle", () => {
           }
         }),
       ),
+    ),
+  );
+});
+
+const describeRealBridge = existsSync(realBridgePath)
+  ? describe
+  : describe.skip;
+
+describeRealBridge("Real Bridge debug operations", () => {
+  it.live("cancels sleep and keeps the Bridge usable", () =>
+    withBridgeAt(
+      realBridgePath,
+      Effect.gen(function* () {
+        const bridge = yield* Bridge;
+        const fiber = yield* bridge
+          .call(FrameKind.debugSleep, { ms: 10_000 })
+          .pipe(Effect.forkChild);
+        yield* Effect.sleep(Duration.millis(10));
+        yield* Fiber.interrupt(fiber);
+        const ping = yield* bridge.call(FrameKind.debugPing);
+        expect(ping.kind).toBe(FrameKind.ok);
+      }),
+    ),
+  );
+
+  it.live("streams all bytes in order while acknowledging each chunk", () =>
+    withBridgeAt(
+      realBridgePath,
+      Effect.gen(function* () {
+        const bridge = yield* Bridge;
+        const chunks = yield* bridge
+          .stream(FrameKind.debugStream, { chunks: 4, size: 7 })
+          .pipe(Stream.runCollect);
+        expect(
+          Array.from(chunks).flatMap((chunk) => Array.from(chunk)),
+        ).toEqual(Array.from({ length: 28 }, (_, index) => index));
+      }),
+    ),
+  );
+
+  it.live("resolves 1,000 concurrent operations by their own ids", () =>
+    withBridgeAt(
+      realBridgePath,
+      Effect.gen(function* () {
+        const bridge = yield* Bridge;
+        const frames = yield* Effect.all(
+          Array.from({ length: 1000 }, (_, index) =>
+            bridge.call(
+              index % 2 === 0 ? FrameKind.debugPing : FrameKind.debugSleep,
+              index % 2 === 0 ? undefined : { ms: 0 },
+            ),
+          ),
+          { concurrency: "unbounded" },
+        );
+        expect(new Set(frames.map((frame) => frame.id)).size).toBe(1000);
+        expect(frames.every((frame) => frame.kind === FrameKind.ok)).toBe(true);
+      }),
     ),
   );
 });
