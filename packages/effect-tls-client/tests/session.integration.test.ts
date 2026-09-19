@@ -244,12 +244,27 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
       response.end(request.headers.cookie ?? "");
       return;
     }
+    if (path === "/explicit-set-cookie") {
+      response.setHeader("Set-Cookie", "explicit=one; Path=/");
+      response.end(request.headers.cookie ?? "");
+      return;
+    }
     if (path === "/set-cookie") {
       response.setHeader(
         "Set-Cookie",
         "jar=one; Path=/; Expires=Wed, 01 Jan 2030 00:00:00 GMT; HttpOnly; SameSite=Strict",
       );
       response.end("set-cookie");
+      return;
+    }
+    if (path === "/max-age-cookie") {
+      response.setHeader("Set-Cookie", "max-age=one; Max-Age=60; Path=/");
+      response.end("max-age-cookie");
+      return;
+    }
+    if (path === "/expire-cookie") {
+      response.setHeader("Set-Cookie", "max-age=; Max-Age=0; Path=/");
+      response.end("expire-cookie");
       return;
     }
     if (path === "/redirect-cookie-start") {
@@ -643,6 +658,20 @@ describeRealIntegration("real Bridge session requests", () => {
             profile: "chrome_146",
             forceHttp1: true,
           });
+          expect(yield* session.exportCookies).toBe("[]");
+          const emptyCookies = yield* session.cookies(`${server.url}/cookie`);
+          expect(Object.keys(emptyCookies.cookies)).toHaveLength(0);
+
+          const noJar = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+            cookieJar: "none",
+          });
+          expect(yield* noJar.exportCookies).toBe("[]");
+          const noJarResponse = yield* noJar.request(`${server.url}/cookie`);
+          expect(yield* noJarResponse.text).toBe("");
+          expect(yield* noJar.exportCookies).toBe("[]");
+
           const setResponse = yield* session.request(
             `${server.url}/set-cookie`,
           );
@@ -660,6 +689,44 @@ describeRealIntegration("real Bridge session requests", () => {
 
           const sent = yield* session.request(`${server.url}/cookie`);
           expect(yield* sent.text).toContain("jar=one");
+
+          const maxAgeResponse = yield* session.request(
+            `${server.url}/max-age-cookie`,
+          );
+          expect(yield* maxAgeResponse.text).toBe("max-age-cookie");
+          const maxAgeCookies = yield* session.cookies(`${server.url}/cookie`);
+          const maxAge = maxAgeCookies.cookies["max-age"];
+          expect(maxAge?.options?.expires).toBeDefined();
+          expect(maxAge?.options?.expires?.getTime()).toBeGreaterThan(
+            Date.now() + 50_000,
+          );
+          const maxAgeExportJson = yield* session.exportCookies;
+          const maxAgeExport = JSON.parse(maxAgeExportJson) as ReadonlyArray<{
+            readonly name: string;
+            readonly expires: number | null;
+          }>;
+          expect(
+            maxAgeExport.find((cookie) => cookie.name === "max-age")?.expires,
+          ).toBeGreaterThan(Math.floor(Date.now() / 1000) + 50);
+          const maxAgeFresh = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          yield* maxAgeFresh.importCookies(maxAgeExportJson);
+          expect(
+            (yield* maxAgeFresh.cookies(`${server.url}/cookie`)).cookies[
+              "max-age"
+            ]?.options?.expires?.getTime(),
+          ).toBeGreaterThan(Date.now() + 50_000);
+
+          const expiredResponse = yield* session.request(
+            `${server.url}/expire-cookie`,
+          );
+          expect(yield* expiredResponse.text).toBe("expire-cookie");
+          expect(
+            (yield* session.cookies(`${server.url}/cookie`)).cookies["max-age"],
+          ).toBeUndefined();
+
           const redirect = yield* session.request(
             `${server.url}/redirect-cookie-start`,
             { followRedirects: true },
@@ -670,13 +737,14 @@ describeRealIntegration("real Bridge session requests", () => {
             `${server.url}/cookie`,
             Cookies.fromSetCookie("api=two; Path=/; HttpOnly; SameSite=Lax"),
           );
-          const explicit = yield* session.request(`${server.url}/cookie`, {
-            headers: [["Cookie", "manual=one"]],
-          });
-          expect(yield* explicit.text).toContain("manual=one");
-          expect(
-            yield* (yield* session.request(`${server.url}/cookie`)).text,
-          ).toContain("api=two");
+          const explicit = yield* session.request(
+            `${server.url}/explicit-set-cookie`,
+            { headers: [["Cookie", "manual=one"]] },
+          );
+          expect(yield* explicit.text).toBe("manual=one");
+          const afterExplicit = yield* session.request(`${server.url}/cookie`);
+          expect(yield* afterExplicit.text).toContain("api=two");
+          expect(yield* afterExplicit.text).toContain("explicit=one");
 
           const malformed = yield* session
             .importCookies("not-json")
@@ -702,6 +770,7 @@ describeRealIntegration("real Bridge session requests", () => {
           }> = JSON.parse(exported);
           expect(exportedCookies.map((cookie) => cookie.name)).toEqual([
             "api",
+            "explicit",
             "jar",
             "redirect",
           ]);

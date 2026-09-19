@@ -26,10 +26,13 @@ yield * session.setProxy("http://127.0.0.1:8080");
 yield * session.setProxy(null); // direct routing again
 ```
 
-`Cookie` request headers are passed through unchanged, but are discouraged: use `setCookies` so domain,
-path, expiry, security, and redirect behavior stay in the Go Jar. `exportCookies`/`importCookies` persist
-all cookie fields without creating a JavaScript-side Jar. Live proxy URLs support `http`, `https`, `socks4`,
-and `socks5`; proxy failures are typed as `TlsRequestError` with `kind: "Proxy"`.
+`Cookie` request headers replace automatic Jar injection for that request and are passed through unchanged,
+but are discouraged: use `setCookies` so domain, path, expiry, security, and redirect behavior stay in the
+Go Jar. `exportCookies`/`importCookies` persist only cookies accepted by the RFC Jar; `cookieJar: "strict"`
+also rejects empty values, while `cookieJar: "none"` has no Jar. Proxy URLs accept `http`, `https`, `socks4`,
+and `socks5` through the pinned tls-client dialers; local integration covers HTTP CONNECT and SOCKS5, while
+HTTPS/SOCKS4 require an environment-specific proxy fixture. Proxy failures are typed as `TlsRequestError`
+with `kind: "Proxy"`.
 
 ## Running checks
 

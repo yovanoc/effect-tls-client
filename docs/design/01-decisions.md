@@ -76,7 +76,7 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 
 ## D10 — Cookies: Go jar is the single source of truth, exchanged as `Cookies.Cookies`
 
-**Decision:** `TlsSession.cookies(url)` / `setCookies(url, Cookies.Cookies)` read/write the Go jar using Effect's `Cookies` type. `TlsResponse.cookies` = that response's `Set-Cookie` headers only (matches Effect responses). `exportCookies`/`importCookies` (Schema JSON) for cross-process persistence. No JS jar, no `withCookiesRef`. User-supplied `Cookie` headers pass through (upstream merges), documented as discouraged.
+**Decision:** `TlsSession.cookies(url)` / `setCookies(url, Cookies.Cookies)` read/write the Go jar using Effect's `Cookies` type. `TlsResponse.cookies` = that response's `Set-Cookie` headers only (matches Effect responses). `exportCookies`/`importCookies` (Schema JSON) for cross-process persistence. No JS jar, no `withCookiesRef`. User-supplied `Cookie` headers pass through unchanged and replace automatic Jar injection for that request; response `Set-Cookie` handling remains enabled. Explicit headers are documented as discouraged.
 
 **Why:** requests, in-Go redirects and WS handshakes must share one jar; two jars fighting is a known DataDome failure mode. Rejected: mirrored JS jar (tough-cookie); JS-only jar without domain/path semantics.
 

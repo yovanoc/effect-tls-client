@@ -711,6 +711,95 @@ func proxyConnections(left, right net.Conn) {
 	<-copyDone
 }
 
+func TestSessionCookieJarUsesRFCStateForExportAndExpiry(t *testing.T) {
+	jar, err := newSessionCookieJar(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookieURL, err := url.Parse("https://sub.example.com/account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(cookieURL, []*http.Cookie{
+		{Name: "host", Value: "one", Path: "/"},
+		{Name: "cross", Value: "bad", Domain: "other.example", Path: "/"},
+		{Name: "public", Value: "bad", Domain: "com", Path: "/"},
+		{Name: "invalid", Value: "bad", Domain: ".", Path: "/"},
+	})
+
+	exported := jar.GetAllCookies()
+	entries := exported["sub.example.com"]
+	if len(entries) != 1 || entries[0].Name != "host" || entries[0].Domain != "" {
+		t.Fatalf("exported cookies = %#v", exported)
+	}
+	if len(exported["other.example"]) != 0 {
+		t.Fatalf("cross-domain cookie was exported: %#v", exported)
+	}
+
+	jar.SetCookies(cookieURL, []*http.Cookie{{
+		Name: "max-age", Value: "one", Path: "/", MaxAge: 60,
+	}})
+	selected := jar.Cookies(cookieURL)
+	var maxAgeCookie *http.Cookie
+	for _, cookie := range selected {
+		if cookie.Name == "max-age" {
+			maxAgeCookie = cookie
+		}
+	}
+	if maxAgeCookie == nil {
+		t.Fatal("Max-Age cookie was not selected")
+	}
+	if maxAgeCookie.MaxAge != 0 || maxAgeCookie.Expires.Before(time.Now().Add(50*time.Second)) {
+		t.Fatalf("Max-Age cookie = %#v, want absolute expiry", maxAgeCookie)
+	}
+
+	jar.SetCookies(cookieURL, []*http.Cookie{{
+		Name: "expired", Value: "gone", Path: "/", MaxAge: 1,
+	}})
+	time.Sleep(1100 * time.Millisecond)
+	for _, cookie := range jar.Cookies(cookieURL) {
+		if cookie.Name == "expired" {
+			t.Fatalf("expired cookie was selected: %#v", cookie)
+		}
+	}
+	for _, entries := range jar.GetAllCookies() {
+		for _, cookie := range entries {
+			if cookie.Name == "expired" {
+				t.Fatalf("expired cookie was exported: %#v", cookie)
+			}
+		}
+	}
+}
+
+func TestSessionProxyWaitIsCancellable(t *testing.T) {
+	profile := "chrome_146"
+	session, err := buildSession(protocol.SessionConfigMeta{SessionID: "proxy-cancel", Profile: &profile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+
+	release, err := session.proxyGate.acquireRead(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	proxyDone := make(chan error, 1)
+	go func() {
+		proxyDone <- session.setProxy(ctx, "http://127.0.0.1:1")
+	}()
+	cancel()
+	select {
+	case proxyErr := <-proxyDone:
+		if !errors.Is(proxyErr, context.Canceled) {
+			t.Fatalf("setProxy() error = %v, want context.Canceled", proxyErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("setProxy() did not observe cancellation while waiting for a request")
+	}
+	release()
+}
+
 func TestValidateProxyURL(t *testing.T) {
 	for _, scheme := range []string{"http", "https", "socks4", "socks5"} {
 		if err := validateProxyURL(scheme + "://127.0.0.1:8080"); err != nil {
@@ -858,7 +947,7 @@ func TestIntegrationLiveProxySwitchPreservesJar(t *testing.T) {
 
 	for _, scheme := range []string{"http", "socks5"} {
 		proxy := startLocalProxy(t, scheme)
-		if err := session.setProxy(proxy.URL()); err != nil {
+		if err := session.setProxy(context.Background(), proxy.URL()); err != nil {
 			t.Fatalf("set %s proxy: %v", scheme, err)
 		}
 		request, _ = http.NewRequest("GET", server.URL+"/echo", nil)
@@ -877,10 +966,10 @@ func TestIntegrationLiveProxySwitchPreservesJar(t *testing.T) {
 			t.Fatalf("%s proxy did not receive a connection", scheme)
 		}
 	}
-	if err := session.setProxy("ftp://127.0.0.1:1"); err == nil {
+	if err := session.setProxy(context.Background(), "ftp://127.0.0.1:1"); err == nil {
 		t.Fatal("invalid proxy was accepted")
 	}
-	if err := session.setProxy(""); err != nil {
+	if err := session.setProxy(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 }
