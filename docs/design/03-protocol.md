@@ -138,6 +138,8 @@ Sequence: `request` → (`body.chunk`* → `body.end` if `hasBody`) … Go: `hea
 ```ts
 { status: number; url: string /* final, hash stripped */; headers: Pair[]; protocol: "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0" }
 ```
+The response `headers` pairs are emitted in deterministic order from the available fhttp response representation; this does not guarantee wire order.
+
 `end` meta: `{ protocol?: ResponseProtocol, bytesRead, bytesWritten }` — the bandwidth-tracker delta for this request (TLS-level bytes); `protocol` repeats the response protocol and is omitted for protocol-only streams. The pinned tls-client tracker exposes session-client totals rather than per-request counters, so the Bridge serializes requests sharing a client from `Do` through body EOF while taking this delta. Connection pooling is retained; requests using the same client are consequently serialized for accounting.
 
 ## 7. WebSocket

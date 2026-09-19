@@ -63,6 +63,11 @@ process.stdin.on("data", (chunk) => {
           kind: "Connect",
           message: "fixture connect failure",
         });
+      } else if (metadata.url.endsWith("/internal-error")) {
+        writeFrame(0x82, id, {
+          kind: "Internal",
+          message: "fixture internal failure",
+        });
       } else if (!sessions.has(metadata.sessionId)) {
         writeFrame(0x82, id, {
           kind: "SessionNotFound",

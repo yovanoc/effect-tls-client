@@ -4,6 +4,7 @@ import type { Scope } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import { fileURLToPath } from "node:url";
 import {
+  BridgeProtocolError,
   SessionConfig,
   SessionConfigError,
   TlsClient,
@@ -123,6 +124,22 @@ describe("TlsClient sessions", () => {
         if (error._tag === "TlsRequestError") {
           expect(error.kind).toBe("Connect");
           expect(error.isTransient).toBe(true);
+        }
+      }),
+    ),
+  );
+
+  it.effect("preserves an Internal Bridge diagnostic", () =>
+    withClient(
+      Effect.gen(function* () {
+        const client = yield* TlsClient;
+        const session = yield* client.session({ profile: "chrome_146" });
+        const error = yield* Effect.flip(
+          session.request("https://fixture.test/internal-error"),
+        );
+        expect(error).toBeInstanceOf(BridgeProtocolError);
+        if (error._tag === "BridgeProtocolError") {
+          expect(error.message).toBe("fixture internal failure");
         }
       }),
     ),

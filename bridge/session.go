@@ -56,16 +56,6 @@ func bandwidthDelta(before, after int64) uint64 {
 	return uint64(after - before)
 }
 
-func (s *tlsSession) do(request *http.Request, followRedirects *bool) (*http.Response, tlsClient.HttpClient, bandwidthSnapshot, error) {
-	client := s.client
-	if followRedirects != nil && *followRedirects != s.followRedirects {
-		client = s.redirectClient
-	}
-	before := snapshotBandwidth(client)
-	response, err := client.Do(request)
-	return response, client, before, err
-}
-
 // The pinned upstream tracker counts bytes for the whole client, so this gate
 // spans Do through body EOF to keep each end delta attributable to one request.
 // ponytail: same-client request bodies serialize; use upstream per-request counters when available.
@@ -808,13 +798,14 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 	}
 
 	for {
-		if requestContext.Err() != nil {
-			_ = d.finishError(op, protocol.ErrorKindCancelled, "operation cancelled")
+		if requestErr := requestContext.Err(); requestErr != nil {
+			_ = d.finishError(op, classifyRequestError(requestErr), requestErr.Error())
 			return
 		}
 		requested, allowed := op.credits.reserve(requestContext, d.settings.chunkSize)
 		if !allowed {
-			_ = d.finishError(op, protocol.ErrorKindCancelled, "operation cancelled")
+			requestErr := requestContext.Err()
+			_ = d.finishError(op, classifyRequestError(requestErr), requestErr.Error())
 			return
 		}
 		buffer := make([]byte, requested)

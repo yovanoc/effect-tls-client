@@ -190,6 +190,14 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
       response.once("close", reportDisconnect);
       return;
     }
+    if (path === "/timeout") {
+      response.writeHead(200, { "Content-Type": "application/octet-stream" });
+      response.write(Buffer.alloc(64 * 1024, 7));
+      resolveFirstChunk();
+      request.once("aborted", reportDisconnect);
+      response.once("close", reportDisconnect);
+      return;
+    }
     response.statusCode = 404;
     response.end();
   });
@@ -363,6 +371,38 @@ describeRealIntegration("real Bridge session requests", () => {
           expect(total).toBe(50 * 1024 * 1024);
           expect(chunks).toBeGreaterThan(100);
           expect(largestChunk).toBeLessThanOrEqual(64 * 1024);
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("classifies a mid-body timeout as Timeout", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          const response = yield* session.request(`${server.url}/timeout`, {
+            timeoutMs: 100,
+          });
+          yield* Effect.promise(() => server.firstChunk);
+          const result = yield* response.stream.pipe(
+            Stream.runDrain,
+            Effect.result,
+          );
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure._tag).toBe("TlsRequestError");
+            if (result.failure._tag === "TlsRequestError") {
+              expect(result.failure.kind).toBe("Timeout");
+            }
+          }
+          yield* Effect.promise(() => server.disconnected);
         }),
       ).pipe(Effect.ensuring(Effect.promise(server.close)));
     }),

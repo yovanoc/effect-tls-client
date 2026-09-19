@@ -109,12 +109,11 @@ func TestRequestHeadersKeepRepeatedRequestValues(t *testing.T) {
 	}
 }
 
-func TestResponseHeadersKeepWireOrder(t *testing.T) {
+func TestResponseHeadersUseDeterministicRepresentationOrder(t *testing.T) {
 	response := &http.Response{Header: http.Header{
-		http.HeaderOrderKey: {"set-cookie", "x-first"},
-		"Set-Cookie":        {"a=1"},
-		"X-First":           {"one"},
-		"X-Last":            {"last"},
+		"Set-Cookie": {"a=1"},
+		"X-First":    {"one"},
+		"X-Last":     {"last"},
 	}}
 	got := responseHeaders(response)
 	want := []protocol.HeaderPair{{"Set-Cookie", "a=1"}, {"X-First", "one"}, {"X-Last", "last"}}
@@ -309,9 +308,22 @@ func TestIntegrationRedirectOverridesDoNotSerializeRequests(t *testing.T) {
 	slowDone := make(chan error, 1)
 	go func() {
 		follow := true
-		response, _, _, requestErr := session.do(slowRequest, &follow)
+		client, _, release, requestErr := session.beginTrackedRequest(context.Background(), &follow)
+		if requestErr != nil {
+			slowDone <- requestErr
+			return
+		}
+		defer release()
+		response, requestErr := client.Do(slowRequest)
 		if response != nil {
-			_ = response.Body.Close()
+			_, bodyErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if requestErr == nil {
+				requestErr = bodyErr
+			}
+			if requestErr == nil {
+				requestErr = closeErr
+			}
 		}
 		slowDone <- requestErr
 	}()
@@ -324,9 +336,22 @@ func TestIntegrationRedirectOverridesDoNotSerializeRequests(t *testing.T) {
 	fastDone := make(chan error, 1)
 	go func() {
 		follow := false
-		response, _, _, requestErr := session.do(fastRequest, &follow)
+		client, _, release, requestErr := session.beginTrackedRequest(context.Background(), &follow)
+		if requestErr != nil {
+			fastDone <- requestErr
+			return
+		}
+		defer release()
+		response, requestErr := client.Do(fastRequest)
 		if response != nil {
-			_ = response.Body.Close()
+			_, bodyErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if requestErr == nil {
+				requestErr = bodyErr
+			}
+			if requestErr == nil {
+				requestErr = closeErr
+			}
 		}
 		fastDone <- requestErr
 	}()

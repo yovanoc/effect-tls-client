@@ -319,6 +319,9 @@ const makeBridge = Effect.gen(function* () {
         sessionId,
       });
     }
+    if (meta.kind === "Internal") {
+      return new BridgeProtocolError({ message: meta.message });
+    }
     if (!isRequestErrorKind(meta.kind)) {
       return new BridgeProtocolError({
         message: `unsupported request error kind: ${meta.kind}`,
