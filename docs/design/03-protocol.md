@@ -1,0 +1,164 @@
+# Bridge protocol v1
+
+Contract between the TS library and the Go Bridge executable. Both sides implement exactly this; changes bump `protocolVersion`. Binary, framed, multiplexed on one stdio pair (JS→Go on Bridge stdin, Go→JS on Bridge stdout). stderr is free-form logs; JS keeps the last 4 KiB for `BridgeExited.stderrTail`.
+
+## 1. Frame
+
+```text
+┌─────────┬──────┬────────┬──────────┬──────────────┬──────────────┐
+│ u32 len │ u8   │ u32 id │ u32 mlen │ meta (mlen)  │ body (rest)  │
+│         │ kind │        │          │ UTF-8 JSON   │ raw bytes    │
+└─────────┴──────┴────────┴──────────┴──────────────┴──────────────┘
+```
+
+- Big-endian. `len` = bytes after the length field (kind + id + mlen + meta + body). Max `len` = 16 MiB; larger → receiver fails the connection with `Protocol`.
+- `meta` may be empty (`mlen = 0`). `body` present only for kinds marked *body* below.
+- `id`: **allocated by JS** (u32, monotonic, skips 0; wraps). One id = one *op*. Long-lived ops (request, ws) keep their id for their whole life. `id = 0` is reserved for `hello`/`shutdown`.
+- Go writes frames from a single writer goroutine; JS writes through one `Sink`. Frame boundaries are the only atomicity guarantee.
+
+## 2. Kinds
+
+JS → Go
+
+| kind | name | meta | body | terminal reply |
+|---|---|---|---|---|
+| 0x01 | `hello` | `{ protocolVersion: 1, clientVersion, window, chunkSize }` | – | `helloAck` |
+| 0x02 | `shutdown` | `{}` | – | `ok`, then process exit 0 |
+| 0x10 | `session.create` | `SessionConfig` (§5) | – | `ok {}` |
+| 0x11 | `session.destroy` | `{ sessionId }` | – | `ok {}` |
+| 0x12 | `session.proxy` | `{ sessionId, proxyUrl: string \| null }` | – | `ok {}` |
+| 0x13 | `cookies.get` | `{ sessionId, url }` | – | `ok { cookies: Cookie[] }` |
+| 0x14 | `cookies.set` | `{ sessionId, url, cookies: Cookie[] }` | – | `ok {}` |
+| 0x15 | `cookies.export` | `{ sessionId }` | – | `ok { cookies: Cookie[] }` (all, with domain/path) |
+| 0x16 | `cookies.import` | `{ sessionId, cookies: Cookie[] }` | – | `ok {}` |
+| 0x17 | `bandwidth.get` | `{ sessionId? }` (absent = process total) | – | `ok { read, written }` |
+| 0x18 | `bandwidth.reset` | `{ sessionId? }` | – | `ok {}` |
+| 0x20 | `request` | `RequestMeta` (§6) | – | `end` \| `error` |
+| 0x21 | `body.chunk` | `{}` | ✔ | – (part of the `request` op) |
+| 0x22 | `body.end` | `{}` | – | – |
+| 0x30 | `ws.connect` | `WsConnectMeta` (§7) | – | `ws.closed` \| `error` |
+| 0x31 | `ws.write` | `{ opcode: 1 \| 2 }` | ✔ | – |
+| 0x32 | `ws.close` | `{ code?, reason? }` | – | – (→ `ws.closed`) |
+| 0x40 | `cancel` | `{}` | – | – (target op emits `error{Cancelled}`) |
+| 0x41 | `ack` | `{ bytes }` | – | – |
+| 0xF0 | `debug.ping` | `{}` | – | `ok {}` |
+| 0xF1 | `debug.sleep` | `{ ms }` | – | `ok {}` (cancellable) |
+| 0xF2 | `debug.stream` | `{ chunks, size }` | – | `chunk`×n, `end` (honours credits) |
+
+Go → JS
+
+| kind | name | meta | body | role |
+|---|---|---|---|---|
+| 0x80 | `helloAck` | `{ protocolVersion, bridgeVersion, tlsClientVersion, goVersion }` | – | terminal for `hello` |
+| 0x81 | `ok` | result JSON | – | terminal |
+| 0x82 | `error` | `ErrorMeta` (§8) | – | terminal |
+| 0x90 | `headers` | `ResponseHeadersMeta` (§6) | – | – |
+| 0x91 | `chunk` | `{}` | ✔ | credited |
+| 0x92 | `end` | `{ bytesRead, bytesWritten }` | – | terminal for `request` |
+| 0xA0 | `ws.open` | `{ status, headers: Pair[] }` | – | – |
+| 0xA1 | `ws.frame` | `{ opcode: 1 \| 2 }` | ✔ | credited |
+| 0xA2 | `ws.closed` | `{ code, reason, initiator: "local" \| "remote" }` | – | terminal for `ws.connect` |
+| 0xC1 | `ack` | `{ bytes }` | – | credits for JS→Go body chunks |
+
+## 3. Invariants
+
+1. **Every op ends with exactly one terminal frame, always sent by Go** (`ok`, `error`, `end`, `ws.closed`, `helloAck`). JS never closes a pending op itself except when the process exits (`BridgeExited`).
+2. After the terminal frame Go sends nothing more for that id; frames for unknown/finished ids are dropped by both sides (late `cancel`/`ack` are no-ops).
+3. `cancel` on a live op → Go cancels its `context`, cleans up, sends `error{kind:"Cancelled"}`. If the op already completed, nothing happens.
+4. Frame order within an id is significant; across ids there is no ordering guarantee.
+5. **Credits.** `window` (from `hello`, default 1 MiB) is the per-id budget for credited kinds (`chunk`, `ws.frame` Go→JS; `body.chunk` JS→Go). The producer stops when `sent − acked ≥ window` and resumes on `ack{bytes}`. A consumer acks bytes it has handed to its consumer, not bytes received. Credit is per id, never shared.
+6. Body chunks are ≤ `chunkSize` (from `hello`, default 64 KiB); the last chunk may be smaller; zero-length chunks are not sent.
+7. Bodies are raw bytes end to end. No base64 anywhere.
+8. Go exits when stdin reaches EOF (after best-effort session/socket cleanup). JS scope close = `shutdown` → wait ≤ 2 s for `ok`/exit → `kill`.
+9. JS fails the handshake with `BridgeVersionMismatch` unless `bridgeVersion === clientVersion` and `protocolVersion === 1`.
+
+## 4. Common types
+
+```ts
+type Pair = [name: string, value: string]          // ordered; repeated names allowed
+type Cookie = {
+  name: string; value: string; domain: string; path: string
+  expires: number | null   // unix seconds; null = session cookie
+  secure: boolean; httpOnly: boolean
+  sameSite?: "Strict" | "Lax" | "None"
+}
+```
+
+## 5. `SessionConfig` (meta of `session.create`)
+
+```ts
+{
+  sessionId: string                       // chosen by JS (uuid)
+  profile?: string                        // must exist in MappedTLSClients → else SessionConfig error
+  customProfile?: CustomProfile           // generated schema; mutually exclusive with profile
+  identity?: { headers: Pair[]; headerOrder?: string[] }   // defaults merged under request headers, used by ws handshakes
+  timeoutMs?: number                      // default 30000; 0 = no timeout
+  followRedirects?: boolean               // default false
+  proxyUrl?: string
+  insecureSkipVerify?, randomTlsExtensionOrder?, disableSessionTickets?,
+  forceHttp1?, disableHttp3?, protocolRacing?, disableIpv4?, disableIpv6?: boolean
+  localAddress?: string; serverName?: string
+  certificatePins?: Record<string, string[]>
+  cookieJar?: "default" | "strict" | "none"   // strict = tls_client.NewCookieJar semantics
+  transport?: { idleConnTimeoutMs?, maxIdleConns?, maxIdleConnsPerHost?, maxConnsPerHost?,
+                maxResponseHeaderBytes?, writeBufferSize?, readBufferSize?, disableKeepAlives?, disableCompression? }
+}
+```
+Go validates strictly: unknown profile, unknown H2/H3 setting names, `profile`+`customProfile`, ipv4+ipv6 both disabled, pins+skipVerify, racing+forceHttp1/disableHttp3 → `error{kind:"SessionConfig"}`. Sessions are immutable except `session.proxy`.
+
+## 6. Request / response
+
+`RequestMeta`:
+```ts
+{
+  sessionId?: string                      // absent → ephemeral client built from `config`
+  config?: SessionConfig                  // only when sessionId absent (sessionId field ignored)
+  url: string; method: string
+  headers: Pair[]                         // merged over identity.headers; order = array order
+  headerOrder?: string[]                  // overrides identity.headerOrder
+  hasBody: boolean                        // true → Go waits for body.chunk* + body.end (io.Pipe into Do)
+  timeoutMs?: number                      // per-request override
+  followRedirects?: boolean               // per-request override
+  hostOverride?: string
+  cookies?: Cookie[]                      // added to the Jar for this URL before sending
+}
+```
+Sequence: `request` → (`body.chunk`* → `body.end` if `hasBody`) … Go: `headers` → `chunk`* → `end`. Go may send `headers` before the upload completes (server early response); Go may send `error` at any point (upload is discarded; Go still acks nothing further).
+
+`ResponseHeadersMeta`:
+```ts
+{ status: number; url: string /* final, hash stripped */; headers: Pair[]; protocol: "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0" }
+```
+`end` meta: `{ bytesRead, bytesWritten }` — bandwidth tracker delta for this request (TLS-level bytes).
+
+## 7. WebSocket
+
+`WsConnectMeta`:
+```ts
+{ sessionId: string; url: string; headers: Pair[]; headerOrder?: string[]
+  subprotocols?: string[]; handshakeTimeoutMs?: number; readBufferSize?: number; writeBufferSize?: number }
+```
+Sequence: `ws.connect` → `ws.open` → `ws.frame`* (credited) interleaved with JS `ws.write`* → terminal `ws.closed` (after JS `ws.close`, remote close, or `session.destroy`) or `error{kind: WsHandshake | WsRead | WsWrite}`. `opcode` 1 = text (UTF-8 bytes), 2 = binary. Ping/pong handled inside Go. The session's dialer must be HTTP/1 for the upgrade; Go uses a dedicated `ForceHttp1` client sharing the session's profile, proxy and Jar.
+
+## 8. `ErrorMeta`
+
+```ts
+{
+  kind: "InvalidConfig" | "InvalidUrl" | "Dns" | "Connect" | "Tls" | "Proxy" | "Timeout" | "Cancelled"
+      | "Http" | "Body" | "Pinning" | "SessionNotFound" | "SessionConfig"
+      | "WsHandshake" | "WsRead" | "WsWrite" | "Protocol" | "Internal"
+  message: string                          // Go error text, for humans
+  detail?: Record<string, unknown>         // kind-specific (e.g. Pinning: { host, pins })
+}
+```
+Classification happens in Go via `errors.As`/`errors.Is` (`net.OpError`, `*net.DNSError`, `tls.RecordHeaderError`/`x509.*`, `context.DeadlineExceeded`, `context.Canceled`, proxy dialer errors, tls-client pin errors). JS derives `isTransient` (`Dns | Connect | Timeout | Proxy`).
+
+## 9. Handshake and shutdown
+
+1. JS spawns Bridge, sends `hello` (id 0). Go replies `helloAck` (id 0). Nothing else is accepted before `helloAck`; Go exits 2 on a bad first frame.
+2. Normal end: JS sends `shutdown` (id 0); Go closes all sockets, destroys all sessions, replies `ok`, exits 0. JS waits ≤ 2 s, then `kill`.
+3. Abnormal: stdout EOF or process exit → JS fails all pending ops with `BridgeExited{exitCode, signal, stderrTail}`; the Bridge service is dead.
+
+## 10. Versioning
+
+`protocolVersion` is an integer in `hello`/`helloAck`; any incompatible change bumps it. Package and Bridge versions are always equal (lockstep publish), so in practice compatibility = same version. Additive fields in meta are allowed without a bump; unknown meta fields are ignored by both sides.
