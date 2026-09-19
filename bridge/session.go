@@ -202,12 +202,9 @@ func (j *sessionCookieJar) acceptedCookieLocked(u *url.URL, candidate *http.Cook
 	return nil, false
 }
 
-func (j *sessionCookieJar) Cookies(u *url.URL) []*http.Cookie {
+func (j *sessionCookieJar) cookiesFor(u *url.URL) []*http.Cookie {
 	if u == nil {
 		return nil
-	}
-	if j.skipsAutomaticCookies() {
-		return []*http.Cookie{}
 	}
 	j.state.mu.Lock()
 	defer j.state.mu.Unlock()
@@ -222,6 +219,16 @@ func (j *sessionCookieJar) Cookies(u *url.URL) []*http.Cookie {
 		}
 	}
 	return result
+}
+
+func (j *sessionCookieJar) Cookies(u *url.URL) []*http.Cookie {
+	if u == nil {
+		return nil
+	}
+	if j.skipsAutomaticCookies() {
+		return []*http.Cookie{}
+	}
+	return j.cookiesFor(u)
 }
 
 func (j *sessionCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
@@ -954,7 +961,13 @@ func (d *dispatcher) runCookiesGet(ctx context.Context, op *operation, meta prot
 		_ = d.finishCancelled(op)
 		return
 	}
-	cookies := cookieMetas(session.client.GetCookies(parsed))
+	var selected []*http.Cookie
+	if jar, ok := session.client.GetCookieJar().(*sessionCookieJar); ok {
+		selected = jar.cookiesFor(parsed)
+	} else {
+		selected = session.client.GetCookies(parsed)
+	}
+	cookies := cookieMetas(selected)
 	releaseProxy()
 	_ = d.finishResult(op, protocol.CookiesResultMeta{Cookies: cookies})
 }

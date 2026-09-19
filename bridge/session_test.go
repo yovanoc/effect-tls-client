@@ -711,6 +711,53 @@ func proxyConnections(left, right net.Conn) {
 	<-copyDone
 }
 
+func TestRunCookiesGetBypassesAutomaticCookieSuppression(t *testing.T) {
+	profile := "chrome_146"
+	session, err := buildSession(protocol.SessionConfigMeta{SessionID: "cookies-get", Profile: &profile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+
+	dispatcher, writer := newTestDispatcher()
+	defer dispatcher.stop()
+	if err := dispatcher.sessions.add(session); err != nil {
+		t.Fatal(err)
+	}
+	cookieURL, err := url.Parse("https://example.com/account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.client.SetCookies(cookieURL, []*http.Cookie{{Name: "session", Value: "one", Path: "/"}})
+	jar, ok := session.client.GetCookieJar().(*sessionCookieJar)
+	if !ok {
+		t.Fatal("session does not use a session cookie jar")
+	}
+	jar.skipAutomaticCookies()
+	defer jar.clearAutomaticCookieSkip()
+	if got := jar.Cookies(cookieURL); len(got) != 0 {
+		t.Fatalf("automatic cookies = %#v, want suppressed cookies", got)
+	}
+
+	meta := protocol.CookiesGetMeta{SessionID: session.id, URL: cookieURL.String()}
+	if err := dispatcher.start(1, false, session.id, func(ctx context.Context, op *operation) {
+		dispatcher.runCookiesGet(ctx, op, meta)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	frame := nextTestFrame(t, writer.frames)
+	if frame.Kind != protocol.KindOk || frame.ID != 1 {
+		t.Fatalf("cookies.get result = %+v", frame)
+	}
+	var result protocol.CookiesResultMeta
+	if err := protocol.DecodeObject(frame.Meta, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Cookies) != 1 || result.Cookies[0].Name != "session" || result.Cookies[0].Value != "one" {
+		t.Fatalf("cookies.get result = %#v, want session=one", result.Cookies)
+	}
+}
+
 func TestSessionCookieJarUsesRFCStateForExportAndExpiry(t *testing.T) {
 	jar, err := newSessionCookieJar(false)
 	if err != nil {
