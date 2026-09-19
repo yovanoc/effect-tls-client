@@ -1,7 +1,11 @@
 import { Cookies } from "effect/unstable/http";
 import { Context, Effect, Layer, Schema, Stream } from "effect";
 import type { Scope } from "effect";
-import { Bridge, type BridgeVersion } from "./internal/Bridge.js";
+import {
+  Bridge,
+  type BridgeResponse,
+  type BridgeVersion,
+} from "./internal/Bridge.js";
 import {
   SessionConfigError,
   TlsRequestError,
@@ -52,6 +56,7 @@ export interface TlsResponse {
   readonly bytes: Effect.Effect<Uint8Array, TlsOperationError>;
   readonly text: Effect.Effect<string, TlsOperationError>;
   readonly json: Effect.Effect<unknown, TlsOperationError>;
+  readonly close: Effect.Effect<void>;
 }
 
 export interface TlsSession {
@@ -59,7 +64,7 @@ export interface TlsSession {
   readonly request: (
     url: string | RequestInput,
     options?: RequestOptions,
-  ) => Effect.Effect<TlsResponse, TlsOperationError>;
+  ) => Effect.Effect<TlsResponse, TlsOperationError, Scope.Scope>;
 }
 
 export interface TlsClientService {
@@ -92,17 +97,11 @@ const requestError = (message: string, cause?: unknown): TlsRequestError =>
   });
 
 const responseFrom = (
-  headers: {
-    readonly status: number;
-    readonly url: string;
-    readonly headers: ReadonlyArray<Pair>;
-    readonly protocol: "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0";
-  },
-  stream: Stream.Stream<Uint8Array, TlsOperationError>,
+  response: BridgeResponse,
 ): Effect.Effect<TlsResponse, TlsOperationError> =>
   Effect.gen(function* () {
     const bytes = yield* Effect.cached(
-      Stream.runCollect(stream).pipe(Effect.map(concatenate)),
+      Stream.runCollect(response.stream).pipe(Effect.map(concatenate)),
     );
     const text = yield* Effect.cached(
       bytes.pipe(Effect.map((value) => new TextDecoder().decode(value))),
@@ -120,19 +119,20 @@ const responseFrom = (
         ),
       ),
     );
-    const setCookies = headers.headers
+    const setCookies = response.headers.headers
       .filter(([name]) => name.toLowerCase() === "set-cookie")
       .map(([, value]) => value);
     return {
-      status: headers.status,
-      url: headers.url,
-      headers: headers.headers,
-      protocol: headers.protocol,
+      status: response.headers.status,
+      url: response.headers.url,
+      headers: response.headers.headers,
+      protocol: response.headers.protocol,
       cookies: Cookies.fromSetCookie(setCookies),
-      stream,
+      stream: response.stream,
       bytes,
       text,
       json,
+      close: response.close,
     };
   });
 
@@ -256,7 +256,8 @@ const makeSession = (
           : { hostOverride: parsed.hostOverride }),
       };
       const response = yield* bridge.request(requestMeta);
-      return yield* responseFrom(response.headers, response.stream);
+      yield* Effect.addFinalizer(() => response.close);
+      return yield* responseFrom(response);
     });
   return {
     id: sessionId,

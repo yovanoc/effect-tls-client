@@ -38,6 +38,7 @@ jobs:
       - name: Run Turbo checks with the built Bridge
         env:
           TLS_CLIENT_BRIDGE_PATH: ${{ runner.temp }}/effect-tls-client-bridge
+          TLS_CLIENT_INTEGRATION: "1"
         run: bunx turbo run build test lint format --force
 
       - name: Test real Bridge with Bun

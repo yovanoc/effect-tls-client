@@ -86,7 +86,7 @@ interface PendingStream {
   readonly queue: Queue.Queue<Uint8Array, BridgeError | Cause.Done>;
   readonly done: Deferred.Deferred<void>;
   readonly headers: Deferred.Deferred<ResponseHeadersMeta, BridgeError>;
-  readonly end: Deferred.Deferred<unknown, BridgeError>;
+  readonly end: Deferred.Deferred<EndMeta, BridgeError>;
   readonly expectsHeaders: boolean;
   headersSeen: boolean;
 }
@@ -96,6 +96,8 @@ type Pending = PendingDeferred | PendingStream;
 export interface BridgeResponse {
   readonly headers: ResponseHeadersMeta;
   readonly stream: Stream.Stream<Uint8Array, BridgeError>;
+  readonly end: Effect.Effect<EndMeta, BridgeError>;
+  readonly close: Effect.Effect<void>;
 }
 
 interface State {
@@ -194,7 +196,6 @@ const makeBridge = Effect.gen(function* () {
     );
 
   const pending = new Map<number, Pending>();
-  const activeSessions = new Set<string>();
   const writeSemaphore = yield* Semaphore.make(1);
   const state: State = {
     dead: undefined,
@@ -284,17 +285,17 @@ const makeBridge = Effect.gen(function* () {
     Deferred.doneUnsafe(operation.deferred, effect);
   };
 
-  const completeStream = (id: number, result: "end" | BridgeError): void => {
+  const completeStream = (id: number, result: EndMeta | BridgeError): void => {
     const operation = pending.get(id);
     if (operation === undefined || operation._tag !== "stream") return;
     pending.delete(id);
-    if (result === "end") {
-      Queue.endUnsafe(operation.queue);
-      Deferred.doneUnsafe(operation.end, Effect.void);
-    } else {
+    if ("_tag" in result) {
       Queue.failCauseUnsafe(operation.queue, Cause.fail(result));
       Deferred.doneUnsafe(operation.headers, Effect.fail(result));
       Deferred.doneUnsafe(operation.end, Effect.fail(result));
+    } else {
+      Queue.endUnsafe(operation.queue);
+      Deferred.doneUnsafe(operation.end, Effect.succeed(result));
     }
     Deferred.doneUnsafe(operation.done, Effect.void);
   };
@@ -390,8 +391,8 @@ const makeBridge = Effect.gen(function* () {
         if (frame.body.byteLength !== 0) {
           throw failProtocol("end frame cannot contain a body");
         }
-        decodeMeta(EndMeta, frame.meta);
-        completeStream(frame.id, "end");
+        const end = decodeMeta(EndMeta, frame.meta);
+        completeStream(frame.id, end);
         return undefined;
       }
       throw failProtocol(
@@ -515,14 +516,6 @@ const makeBridge = Effect.gen(function* () {
       yield* handle.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore);
       return;
     }
-    for (const sessionId of activeSessions) {
-      yield* writeFrame({
-        kind: FrameKind.sessionDestroy,
-        id: allocateId(),
-        meta: encodeMeta(SessionIdMeta, { sessionId }),
-      }).pipe(Effect.ignore);
-    }
-    activeSessions.clear();
     const deferred = Deferred.makeUnsafe<Frame, BridgeError>();
     pending.set(0, { _tag: "deferred", deferred, expected: "shutdown" });
     yield* writeFrame({
@@ -703,17 +696,6 @@ const makeBridge = Effect.gen(function* () {
           }),
         ),
     );
-    if (
-      frame.kind === FrameKind.ok &&
-      typeof meta === "object" &&
-      meta !== null
-    ) {
-      const sessionId = (meta as { readonly sessionId?: unknown }).sessionId;
-      if (typeof sessionId === "string") {
-        if (kind === FrameKind.sessionCreate) activeSessions.add(sessionId);
-        if (kind === FrameKind.sessionDestroy) activeSessions.delete(sessionId);
-      }
-    }
     return frame;
   });
 
@@ -750,7 +732,7 @@ const makeBridge = Effect.gen(function* () {
         >();
         const done = Deferred.makeUnsafe<void>();
         const headers = Deferred.makeUnsafe<ResponseHeadersMeta, BridgeError>();
-        const end = Deferred.makeUnsafe<unknown, BridgeError>();
+        const end = Deferred.makeUnsafe<EndMeta, BridgeError>();
         const id = allocateId();
         const operation: PendingStream = {
           _tag: "stream",
@@ -834,7 +816,7 @@ const makeBridge = Effect.gen(function* () {
     >();
     const done = Deferred.makeUnsafe<void>();
     const headers = Deferred.makeUnsafe<ResponseHeadersMeta, BridgeError>();
-    const end = Deferred.makeUnsafe<unknown, BridgeError>();
+    const end = Deferred.makeUnsafe<EndMeta, BridgeError>();
     const id = allocateId();
     const operation: PendingStream = {
       _tag: "stream",
@@ -893,7 +875,12 @@ const makeBridge = Effect.gen(function* () {
       ),
       Stream.ensuring(cleanup()),
     );
-    return { headers: responseHeaders, stream: responseStream };
+    return {
+      headers: responseHeaders,
+      stream: responseStream,
+      end: Deferred.await(end),
+      close: cleanup(),
+    };
   });
 
   const bridgeVersion: BridgeVersion = {

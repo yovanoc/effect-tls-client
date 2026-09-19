@@ -144,7 +144,21 @@ export interface SessionConfig extends Schema.Schema.Type<
 export const SessionConfigWire = Schema.Struct({
   sessionId: Schema.String,
   ...SessionConfigBase.fields,
-});
+}).check(
+  Schema.makeFilter(
+    (value) => {
+      const hasProfile = value.profile !== undefined;
+      const hasCustomProfile = value.customProfile !== undefined;
+      return hasProfile !== hasCustomProfile
+        ? undefined
+        : {
+            path: [],
+            issue: "exactly one of profile or customProfile is required",
+          };
+    },
+    { expected: "exactly one of profile or customProfile" },
+  ),
+);
 export interface SessionConfigWire extends Schema.Schema.Type<
   typeof SessionConfigWire
 > {}

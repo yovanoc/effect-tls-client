@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	http "github.com/bogdanfinn/fhttp"
 	"github.com/yovanoc/effect-tls-client/bridge/protocol"
@@ -75,6 +77,22 @@ func TestClassifyProxyErrors(t *testing.T) {
 	if got := classifyRequestError(err); got != protocol.ErrorKindProxy {
 		t.Fatalf("classifyRequestError() = %q, want %q", got, protocol.ErrorKindProxy)
 	}
+
+	socksErr := &net.OpError{Op: "socks connect", Err: errors.New("connection refused")}
+	if got := classifyRequestError(socksErr); got != protocol.ErrorKindProxy {
+		t.Fatalf("classifyRequestError() = %q, want %q", got, protocol.ErrorKindProxy)
+	}
+}
+
+func TestClassifyErrorMessageDoesNotImplyProxy(t *testing.T) {
+	if got := classifyRequestError(errors.New("proxy connection refused")); got != protocol.ErrorKindUnknown {
+		t.Fatalf("classifyRequestError() = %q, want %q", got, protocol.ErrorKindUnknown)
+	}
+
+	dialErr := &net.OpError{Op: "dial", Err: errors.New("SOCKS server refused the connection")}
+	if got := classifyRequestError(dialErr); got != protocol.ErrorKindConnect {
+		t.Fatalf("classifyRequestError() = %q, want %q", got, protocol.ErrorKindConnect)
+	}
 }
 
 func TestRequestHeadersKeepRepeatedRequestValues(t *testing.T) {
@@ -117,7 +135,7 @@ func TestBuildSessionWithKnownProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session.client.CloseIdleConnections()
+	session.closeIdleConnections()
 }
 
 func TestIntegrationLocalHTTP1(t *testing.T) {
@@ -138,7 +156,7 @@ func TestIntegrationLocalHTTP1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.client.CloseIdleConnections()
+	defer session.closeIdleConnections()
 	request, err := http.NewRequest("GET", server.URL, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -177,11 +195,12 @@ func TestIntegrationLocalTLSHTTP2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.client.CloseIdleConnections()
+	defer session.closeIdleConnections()
 	request, err := http.NewRequest("GET", server.URL, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	bandwidthBefore := snapshotBandwidth(session.client)
 	response, err := session.client.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -194,6 +213,99 @@ func TestIntegrationLocalTLSHTTP2(t *testing.T) {
 	if string(body) != "https/2" || response.Proto != "HTTP/2.0" {
 		t.Fatalf("response = %q over %s", body, response.Proto)
 	}
+	bandwidthAfter := snapshotBandwidth(session.client)
+	readDelta := bandwidthDelta(bandwidthBefore.read, bandwidthAfter.read)
+	writeDelta := bandwidthDelta(bandwidthBefore.written, bandwidthAfter.written)
+	if readDelta == 0 || writeDelta == 0 {
+		t.Fatalf("bandwidth delta = read %d, write %d, want nonzero values", readDelta, writeDelta)
+	}
+	if readDelta < uint64(len(body)) {
+		t.Fatalf("tracked read bytes = %d, want at least body length %d", readDelta, len(body))
+	}
+}
+
+func TestIntegrationRedirectOverridesDoNotSerializeRequests(t *testing.T) {
+	if os.Getenv("TLS_CLIENT_INTEGRATION") != "1" {
+		t.Skip("set TLS_CLIENT_INTEGRATION=1 to run local tls-client integration tests")
+	}
+
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	var releaseOnce sync.Once
+	server := httptest.NewServer(nethttp.HandlerFunc(func(writer nethttp.ResponseWriter, request *nethttp.Request) {
+		switch request.URL.Path {
+		case "/redirect":
+			nethttp.Redirect(writer, request, "/slow", nethttp.StatusFound)
+		case "/slow":
+			close(slowStarted)
+			<-releaseSlow
+			_, _ = writer.Write([]byte("slow"))
+		case "/fast":
+			_, _ = writer.Write([]byte("fast"))
+		}
+	}))
+	defer func() {
+		releaseOnce.Do(func() { close(releaseSlow) })
+		server.Close()
+	}()
+
+	session, err := buildSession(protocol.SessionConfigMeta{
+		SessionID:       "redirect-concurrency",
+		Profile:         stringPointer("chrome_146"),
+		ForceHTTP1:      true,
+		FollowRedirects: boolPointer(false),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+
+	slowRequest, err := http.NewRequest("GET", server.URL+"/redirect", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowDone := make(chan error, 1)
+	go func() {
+		follow := true
+		response, _, _, requestErr := session.do(slowRequest, &follow)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		slowDone <- requestErr
+	}()
+	<-slowStarted
+
+	fastRequest, err := http.NewRequest("GET", server.URL+"/fast", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastDone := make(chan error, 1)
+	go func() {
+		follow := false
+		response, _, _, requestErr := session.do(fastRequest, &follow)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		fastDone <- requestErr
+	}()
+
+	select {
+	case requestErr := <-fastDone:
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("request with the session default redirect policy was serialized behind another request")
+	}
+
+	releaseOnce.Do(func() { close(releaseSlow) })
+	if requestErr := <-slowDone; requestErr != nil {
+		t.Fatal(requestErr)
+	}
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func stringPointer(value string) *string {

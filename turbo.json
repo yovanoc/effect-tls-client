@@ -11,7 +11,7 @@
     },
     "test": {
       "dependsOn": ["build"],
-      "env": ["TLS_CLIENT_BRIDGE_PATH"]
+      "env": ["TLS_CLIENT_BRIDGE_PATH", "TLS_CLIENT_INTEGRATION"]
     },
     "lint": {},
     "format": {}

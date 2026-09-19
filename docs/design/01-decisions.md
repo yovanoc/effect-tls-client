@@ -40,7 +40,7 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 
 ## D5 — Response bodies: streamed on the wire, buffered conveniences on top
 
-**Decision:** Wire = `headers` frame → N `chunk` frames → `end` | `error` frame per requestId; a `cancel` frame from JS closes the Go body mid-stream. `TlsResponse` exposes `stream: Stream<Uint8Array>` plus cached `bytes`/`text`/`json` (Effect.cached). `HttpClientResponse.stream` maps 1:1; interrupting body consumption sends `cancel`. Chunk size configurable, default 64 KiB.
+**Decision:** Wire = `headers` frame → N `chunk` frames → `end` | `error` frame per requestId; a `cancel` frame from JS closes the Go body mid-stream. `TlsResponse` exposes `stream: Stream<Uint8Array>` plus cached `bytes`/`text`/`json` (Effect.cached). `HttpClientResponse.stream` maps 1:1; interrupting body consumption sends `cancel`. A response registers scoped cleanup and exposes `close` so an abandoned stream cannot leave a Go operation pending. Chunk size configurable, default 64 KiB.
 
 **Why:** buffered-only would make `HttpClient.stream` a lie and keep upstream's read-everything-first behaviour; streamed-only taxes the 90 % text/json case. Cost of the conveniences ≈ 20 lines.
 

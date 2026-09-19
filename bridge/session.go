@@ -26,21 +26,46 @@ import (
 )
 
 type tlsSession struct {
-	id         string
-	client     tlsClient.HttpClient
-	identity   protocol.IdentityMeta
-	redirectMu sync.Mutex
+	id              string
+	client          tlsClient.HttpClient
+	redirectClient  tlsClient.HttpClient
+	followRedirects bool
+	identity        protocol.IdentityMeta
 }
 
-func (s *tlsSession) do(request *http.Request, followRedirects *bool) (*http.Response, error) {
-	s.redirectMu.Lock()
-	defer s.redirectMu.Unlock()
-	if followRedirects != nil {
-		previous := s.client.GetFollowRedirect()
-		s.client.SetFollowRedirect(*followRedirects)
-		defer s.client.SetFollowRedirect(previous)
+type bandwidthSnapshot struct {
+	read    int64
+	written int64
+}
+
+func snapshotBandwidth(client tlsClient.HttpClient) bandwidthSnapshot {
+	tracker := client.GetBandwidthTracker()
+	return bandwidthSnapshot{
+		read:    tracker.GetReadBytes(),
+		written: tracker.GetWriteBytes(),
 	}
-	return s.client.Do(request)
+}
+
+func bandwidthDelta(before, after int64) uint64 {
+	if after <= before {
+		return 0
+	}
+	return uint64(after - before)
+}
+
+func (s *tlsSession) do(request *http.Request, followRedirects *bool) (*http.Response, tlsClient.HttpClient, bandwidthSnapshot, error) {
+	client := s.client
+	if followRedirects != nil && *followRedirects != s.followRedirects {
+		client = s.redirectClient
+	}
+	before := snapshotBandwidth(client)
+	response, err := client.Do(request)
+	return response, client, before, err
+}
+
+func (s *tlsSession) closeIdleConnections() {
+	s.client.CloseIdleConnections()
+	s.redirectClient.CloseIdleConnections()
 }
 
 type sessionStore struct {
@@ -88,7 +113,7 @@ func (s *sessionStore) closeAll() {
 	}
 	s.mu.Unlock()
 	for _, session := range sessions {
-		session.client.CloseIdleConnections()
+		session.closeIdleConnections()
 	}
 }
 
@@ -99,7 +124,7 @@ func (d *dispatcher) runSessionCreate(_ context.Context, op *operation, config p
 		return
 	}
 	if err := d.sessions.add(session); err != nil {
-		session.client.CloseIdleConnections()
+		session.closeIdleConnections()
 		_ = d.finishError(op, protocol.ErrorKindSessionConfig, err.Error())
 		return
 	}
@@ -113,7 +138,7 @@ func (d *dispatcher) runSessionDestroy(_ context.Context, op *operation, meta pr
 		return
 	}
 	d.cancelSession(meta.SessionID)
-	session.client.CloseIdleConnections()
+	session.closeIdleConnections()
 	_ = d.finishOK(op)
 }
 
@@ -237,65 +262,57 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 	if config.TimeoutMs != nil {
 		timeoutMs = *config.TimeoutMs
 	}
-	options := []tlsClient.HttpClientOption{
+	clientOptions := []tlsClient.HttpClientOption{
 		tlsClient.WithClientProfile(clientProfile),
 		tlsClient.WithTimeoutMilliseconds(int(timeoutMs)),
 		tlsClient.WithBandwidthTracker(),
 	}
-
-	followRedirects := false
-	if config.FollowRedirects != nil {
-		followRedirects = *config.FollowRedirects
-	}
-	if !followRedirects {
-		options = append(options, tlsClient.WithNotFollowRedirects())
-	}
 	if config.ProxyURL != "" {
-		options = append(options, tlsClient.WithProxyUrl(config.ProxyURL))
+		clientOptions = append(clientOptions, tlsClient.WithProxyUrl(config.ProxyURL))
 	}
 	if config.InsecureSkipVerify {
-		options = append(options, tlsClient.WithInsecureSkipVerify())
+		clientOptions = append(clientOptions, tlsClient.WithInsecureSkipVerify())
 	}
 	if config.RandomTLSExtensionOrder {
-		options = append(options, tlsClient.WithRandomTLSExtensionOrder())
+		clientOptions = append(clientOptions, tlsClient.WithRandomTLSExtensionOrder())
 	}
 	if config.DisableSessionTickets {
-		options = append(options, tlsClient.WithDisableSessionTickets())
+		clientOptions = append(clientOptions, tlsClient.WithDisableSessionTickets())
 	}
 	if config.ForceHTTP1 {
-		options = append(options, tlsClient.WithForceHttp1())
+		clientOptions = append(clientOptions, tlsClient.WithForceHttp1())
 	}
 	if config.DisableHTTP3 {
-		options = append(options, tlsClient.WithDisableHttp3())
+		clientOptions = append(clientOptions, tlsClient.WithDisableHttp3())
 	}
 	if config.ProtocolRacing {
-		options = append(options, tlsClient.WithProtocolRacing())
+		clientOptions = append(clientOptions, tlsClient.WithProtocolRacing())
 	}
 	if config.DisableIPv4 {
-		options = append(options, tlsClient.WithDisableIPV4())
+		clientOptions = append(clientOptions, tlsClient.WithDisableIPV4())
 	}
 	if config.DisableIPv6 {
-		options = append(options, tlsClient.WithDisableIPV6())
+		clientOptions = append(clientOptions, tlsClient.WithDisableIPV6())
 	}
 	if config.ServerName != "" {
-		options = append(options, tlsClient.WithServerNameOverwrite(config.ServerName))
+		clientOptions = append(clientOptions, tlsClient.WithServerNameOverwrite(config.ServerName))
 	}
 	if len(config.CertificatePins) > 0 {
-		options = append(options, tlsClient.WithCertificatePinning(config.CertificatePins, nil))
+		clientOptions = append(clientOptions, tlsClient.WithCertificatePinning(config.CertificatePins, nil))
 	}
 	if config.LocalAddress != "" {
 		address, err := net.ResolveTCPAddr("", config.LocalAddress)
 		if err != nil {
 			return nil, fmt.Errorf("localAddress: %w", err)
 		}
-		options = append(options, tlsClient.WithLocalAddr(*address))
+		clientOptions = append(clientOptions, tlsClient.WithLocalAddr(*address))
 	}
 	if config.Transport != nil {
 		transport, err := makeTransportOptions(*config.Transport)
 		if err != nil {
 			return nil, err
 		}
-		options = append(options, tlsClient.WithTransportOptions(transport))
+		clientOptions = append(clientOptions, tlsClient.WithTransportOptions(transport))
 	}
 
 	jarMode := config.CookieJar
@@ -304,20 +321,42 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cookie jar: %w", err)
 		}
-		options = append(options, tlsClient.WithCookieJar(jar))
+		clientOptions = append(clientOptions, tlsClient.WithCookieJar(jar))
 	} else if jarMode == "strict" {
-		options = append(options, tlsClient.WithCookieJar(tlsClient.NewCookieJar()))
+		clientOptions = append(clientOptions, tlsClient.WithCookieJar(tlsClient.NewCookieJar()))
 	}
 
-	client, err := tlsClient.NewHttpClient(tlsClient.NewNoopLogger(), options...)
+	followRedirects := false
+	if config.FollowRedirects != nil {
+		followRedirects = *config.FollowRedirects
+	}
+	makeClient := func(follow bool) (tlsClient.HttpClient, error) {
+		options := append([]tlsClient.HttpClientOption(nil), clientOptions...)
+		if !follow {
+			options = append(options, tlsClient.WithNotFollowRedirects())
+		}
+		return tlsClient.NewHttpClient(tlsClient.NewNoopLogger(), options...)
+	}
+	client, err := makeClient(followRedirects)
 	if err != nil {
+		return nil, err
+	}
+	redirectClient, err := makeClient(!followRedirects)
+	if err != nil {
+		client.CloseIdleConnections()
 		return nil, err
 	}
 	identity := protocol.IdentityMeta{}
 	if config.Identity != nil {
 		identity = *config.Identity
 	}
-	return &tlsSession{id: config.SessionID, client: client, identity: identity}, nil
+	return &tlsSession{
+		id:              config.SessionID,
+		client:          client,
+		redirectClient:  redirectClient,
+		followRedirects: followRedirects,
+		identity:        identity,
+	}, nil
 }
 
 func makeTransportOptions(config protocol.TransportMeta) (*tlsClient.TransportOptions, error) {
@@ -619,12 +658,11 @@ func classifyRequestError(err error) protocol.ErrorKind {
 		return protocol.ErrorKindHttp
 	}
 	var operationError *net.OpError
-	if errors.As(err, &operationError) && strings.Contains(strings.ToLower(operationError.Op), "proxy") {
-		return protocol.ErrorKindProxy
-	}
-	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "proxy") || strings.Contains(message, "socks") {
-		return protocol.ErrorKindProxy
+	if errors.As(err, &operationError) {
+		operation := strings.ToLower(operationError.Op)
+		if operation == "proxyconnect" || strings.HasPrefix(operation, "socks ") {
+			return protocol.ErrorKindProxy
+		}
 	}
 	var networkError net.Error
 	if errors.As(err, &networkError) {
@@ -697,7 +735,7 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 	if meta.HostOverride != "" {
 		req.Host = meta.HostOverride
 	}
-	response, err := session.do(req, meta.FollowRedirects)
+	response, client, bandwidthBefore, err := session.do(req, meta.FollowRedirects)
 	if err != nil {
 		kind := classifyRequestError(err)
 		if requestContext.Err() != nil {
@@ -727,7 +765,6 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		return
 	}
 
-	var bytesRead uint64
 	for {
 		if requestContext.Err() != nil {
 			_ = d.finishError(op, protocol.ErrorKindCancelled, "operation cancelled")
@@ -744,7 +781,6 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 			op.credits.ack(requested - uint64(read))
 		}
 		if read > 0 {
-			bytesRead += uint64(read)
 			if !d.isCurrent(op) {
 				return
 			}
@@ -771,10 +807,11 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		}
 	}
 
+	bandwidthAfter := snapshotBandwidth(client)
 	endMeta, err := protocol.EncodeMeta(protocol.EndMeta{
 		Protocol:     protocolName,
-		BytesRead:    bytesRead,
-		BytesWritten: 0,
+		BytesRead:    bandwidthDelta(bandwidthBefore.read, bandwidthAfter.read),
+		BytesWritten: bandwidthDelta(bandwidthBefore.written, bandwidthAfter.written),
 	})
 	if err != nil {
 		_ = d.finishError(op, protocol.ErrorKindInternal, err.Error())

@@ -93,6 +93,8 @@ type Cookie = {
 
 ## 5. `SessionConfig` (meta of `session.create`)
 
+Exactly one of `profile` or `customProfile` is required; omitting both is a `SessionConfig` error.
+
 ```ts
 {
   sessionId: string                       // chosen by JS (uuid)
@@ -111,7 +113,7 @@ type Cookie = {
                 maxResponseHeaderBytes?, writeBufferSize?, readBufferSize?, disableKeepAlives?, disableCompression? }
 }
 ```
-Go validates strictly: unknown profile, unknown H2/H3 setting names, `profile`+`customProfile`, ipv4+ipv6 both disabled, pins+skipVerify, racing+forceHttp1/disableHttp3 → `error{kind:"SessionConfig"}`. Sessions are immutable except `session.proxy`.
+Go validates strictly: exactly one of `profile`/`customProfile`, unknown profile, unknown H2/H3 setting names, ipv4+ipv6 both disabled, pins+skipVerify, racing+forceHttp1/disableHttp3 → `error{kind:"SessionConfig"}`. Sessions are immutable except `session.proxy`.
 
 ## 6. Request / response
 
@@ -153,7 +155,7 @@ Sequence: `ws.connect` → `ws.open` → `ws.frame`* (credited) interleaved with
 {
   kind: "InvalidConfig" | "InvalidUrl" | "Dns" | "Connect" | "Tls" | "Proxy" | "Timeout" | "Cancelled"
       | "Http" | "Body" | "Pinning" | "SessionNotFound" | "SessionConfig"
-      | "WsHandshake" | "WsRead" | "WsWrite" | "Protocol" | "Internal"
+      | "WsHandshake" | "WsRead" | "WsWrite" | "Protocol" | "Internal" | "Unknown"
   message: string                          // Go error text, for humans
   detail?: Record<string, unknown>         // kind-specific (e.g. Pinning: { host, pins })
 }
