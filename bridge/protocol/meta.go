@@ -45,6 +45,7 @@ type CookieMeta struct {
 	Value    string `json:"value"`
 	Domain   string `json:"domain"`
 	Path     string `json:"path"`
+	Origin   string `json:"origin,omitempty"`
 	Expires  *int64 `json:"expires"`
 	Secure   bool   `json:"secure"`
 	HttpOnly bool   `json:"httpOnly"`
@@ -144,6 +145,42 @@ type TransportMeta struct {
 // SessionIDMeta identifies a session operation.
 type SessionIDMeta struct {
 	SessionID string `json:"sessionId"`
+}
+
+// SessionProxyMeta changes the live proxy for a session. A null proxyUrl
+// clears proxy routing; the pointer distinguishes null from a missing field.
+type SessionProxyMeta struct {
+	SessionID string  `json:"sessionId"`
+	ProxyURL  *string `json:"proxyUrl"`
+}
+
+// CookiesGetMeta reads cookies selected for a URL.
+type CookiesGetMeta struct {
+	SessionID string `json:"sessionId"`
+	URL       string `json:"url"`
+}
+
+// CookiesSetMeta writes cookies selected for a URL.
+type CookiesSetMeta struct {
+	SessionID string       `json:"sessionId"`
+	URL       string       `json:"url"`
+	Cookies   []CookieMeta `json:"cookies"`
+}
+
+// CookiesExportMeta exports every cookie in a session Jar.
+type CookiesExportMeta struct {
+	SessionID string `json:"sessionId"`
+}
+
+// CookiesImportMeta imports every cookie in a session Jar.
+type CookiesImportMeta struct {
+	SessionID string       `json:"sessionId"`
+	Cookies   []CookieMeta `json:"cookies"`
+}
+
+// CookiesResultMeta is the result of a cookies.get/export operation.
+type CookiesResultMeta struct {
+	Cookies []CookieMeta `json:"cookies"`
 }
 
 // RequestMeta is the metadata of a JS -> Go request frame.

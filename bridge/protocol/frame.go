@@ -30,6 +30,11 @@ const (
 	KindShutdown       Kind = 0x02
 	KindSessionCreate  Kind = 0x10
 	KindSessionDestroy Kind = 0x11
+	KindSessionProxy   Kind = 0x12
+	KindCookiesGet     Kind = 0x13
+	KindCookiesSet     Kind = 0x14
+	KindCookiesExport  Kind = 0x15
+	KindCookiesImport  Kind = 0x16
 	KindRequest        Kind = 0x20
 	KindBodyChunk      Kind = 0x21
 	KindBodyEnd        Kind = 0x22
@@ -63,7 +68,8 @@ type Frame struct {
 // IsKnownKind reports whether kind is implemented by this protocol-v1 Bridge.
 func IsKnownKind(kind Kind) bool {
 	switch kind {
-	case KindHello, KindShutdown, KindSessionCreate, KindSessionDestroy, KindRequest,
+	case KindHello, KindShutdown, KindSessionCreate, KindSessionDestroy, KindSessionProxy,
+		KindCookiesGet, KindCookiesSet, KindCookiesExport, KindCookiesImport, KindRequest,
 		KindBodyChunk, KindBodyEnd, KindCancel, KindAck, KindDebugPing, KindDebugSleep, KindDebugStream,
 		KindHelloAck, KindOk, KindError, KindHeaders, KindChunk, KindEnd, KindBodyAck:
 		return true

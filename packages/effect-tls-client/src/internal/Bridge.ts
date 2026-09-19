@@ -41,22 +41,27 @@ import {
   DEFAULT_WINDOW,
   DebugSleepMeta,
   DebugStreamMeta,
-  EmptyMeta,
   EndMeta,
   ErrorMeta,
   HelloAckMeta,
+  CookiesExportMeta,
+  CookiesGetMeta,
+  CookiesImportMeta,
+  CookiesSetMeta,
+  EmptyMeta,
   HelloMeta,
   RequestMeta,
   isRequestErrorKind,
   ResponseHeadersMeta,
   SessionConfigWire,
   SessionIdMeta,
+  SessionProxyMeta,
   PROTOCOL_VERSION,
-  decodeEmptyMeta,
   decodeMeta,
   encodeEmptyMeta,
   encodeMeta,
 } from "./Protocol.js";
+import type { MetaSchema } from "./Protocol.js";
 
 export const PACKAGE_VERSION = packageJson.version;
 const STDERR_TAIL_BYTES = 4096;
@@ -66,7 +71,12 @@ type CallKind =
   | typeof FrameKind.debugPing
   | typeof FrameKind.debugSleep
   | typeof FrameKind.sessionCreate
-  | typeof FrameKind.sessionDestroy;
+  | typeof FrameKind.sessionDestroy
+  | typeof FrameKind.sessionProxy
+  | typeof FrameKind.cookiesGet
+  | typeof FrameKind.cookiesSet
+  | typeof FrameKind.cookiesExport
+  | typeof FrameKind.cookiesImport;
 
 export interface BridgeVersion {
   readonly packageVersion: string;
@@ -82,6 +92,7 @@ interface PendingDeferred {
   readonly _tag: "deferred";
   readonly deferred: Deferred.Deferred<Frame, BridgeError>;
   readonly expected: "hello" | "call" | "shutdown";
+  readonly response: MetaSchema;
 }
 
 interface PendingStream {
@@ -140,6 +151,7 @@ export interface BridgeService {
     kind: CallKind,
     meta?: unknown,
     body?: Uint8Array,
+    response?: MetaSchema,
   ) => Effect.Effect<Frame, BridgeError>;
   readonly stream: (
     kind: typeof FrameKind.debugStream,
@@ -507,13 +519,12 @@ const makeBridge = Effect.gen(function* () {
         ) {
           throw failProtocol("expected helloAck for hello");
         }
-        decodeMeta(HelloAckMeta, frame.meta);
       } else {
         if (frame.kind !== FrameKind.ok || frame.body.byteLength !== 0) {
           throw failProtocol("expected ok for Bridge operation");
         }
-        decodeEmptyMeta(frame.meta);
       }
+      decodeMeta(operation.response, frame.meta);
     } catch (cause) {
       const error =
         cause instanceof BridgeProtocolError
@@ -588,7 +599,12 @@ const makeBridge = Effect.gen(function* () {
       return;
     }
     const deferred = Deferred.makeUnsafe<Frame, BridgeError>();
-    pending.set(0, { _tag: "deferred", deferred, expected: "shutdown" });
+    pending.set(0, {
+      _tag: "deferred",
+      deferred,
+      expected: "shutdown",
+      response: EmptyMeta,
+    });
     yield* writeFrame({
       kind: FrameKind.shutdown,
       id: 0,
@@ -614,6 +630,7 @@ const makeBridge = Effect.gen(function* () {
     _tag: "deferred",
     deferred: helloDeferred,
     expected: "hello",
+    response: HelloAckMeta,
   });
   yield* writeFrame({
     kind: FrameKind.hello,
@@ -691,9 +708,39 @@ const makeBridge = Effect.gen(function* () {
         Schema.decodeUnknownSync(SessionConfigWire)(meta ?? {}),
       );
     }
+    if (kind === FrameKind.sessionDestroy) {
+      return encodeMeta(
+        SessionIdMeta,
+        Schema.decodeUnknownSync(SessionIdMeta)(meta ?? {}),
+      );
+    }
+    if (kind === FrameKind.sessionProxy) {
+      return encodeMeta(
+        SessionProxyMeta,
+        Schema.decodeUnknownSync(SessionProxyMeta)(meta ?? {}),
+      );
+    }
+    if (kind === FrameKind.cookiesGet) {
+      return encodeMeta(
+        CookiesGetMeta,
+        Schema.decodeUnknownSync(CookiesGetMeta)(meta ?? {}),
+      );
+    }
+    if (kind === FrameKind.cookiesSet) {
+      return encodeMeta(
+        CookiesSetMeta,
+        Schema.decodeUnknownSync(CookiesSetMeta)(meta ?? {}),
+      );
+    }
+    if (kind === FrameKind.cookiesExport) {
+      return encodeMeta(
+        CookiesExportMeta,
+        Schema.decodeUnknownSync(CookiesExportMeta)(meta ?? {}),
+      );
+    }
     return encodeMeta(
-      SessionIdMeta,
-      Schema.decodeUnknownSync(SessionIdMeta)(meta ?? {}),
+      CookiesImportMeta,
+      Schema.decodeUnknownSync(CookiesImportMeta)(meta ?? {}),
     );
   };
 
@@ -713,6 +760,7 @@ const makeBridge = Effect.gen(function* () {
     kind: CallKind,
     meta?: unknown,
     body?: Uint8Array,
+    response?: MetaSchema,
   ) {
     const initialDead = getDead();
     if (initialDead !== undefined) return yield* initialDead;
@@ -735,6 +783,7 @@ const makeBridge = Effect.gen(function* () {
       _tag: "deferred",
       deferred,
       expected: "call",
+      response: response ?? EmptyMeta,
     };
     pending.set(id, operation);
     const dead = getDead();

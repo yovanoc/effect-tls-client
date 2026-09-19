@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	nethttp "net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -550,6 +554,334 @@ func TestIntegrationRedirectOverridesDoNotSerializeRequests(t *testing.T) {
 	releaseOnce.Do(func() { close(releaseSlow) })
 	if requestErr := <-slowDone; requestErr != nil {
 		t.Fatal(requestErr)
+	}
+}
+
+type localProxy struct {
+	listener net.Listener
+	scheme   string
+	hits     chan struct{}
+}
+
+func startLocalProxy(t *testing.T, scheme string) *localProxy {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := &localProxy{
+		listener: listener,
+		scheme:   scheme,
+		hits:     make(chan struct{}, 16),
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go proxy.handle(connection)
+		}
+	}()
+	return proxy
+}
+
+func (p *localProxy) URL() string {
+	return p.scheme + "://" + p.listener.Addr().String()
+}
+
+func (p *localProxy) handle(connection net.Conn) {
+	defer connection.Close()
+	select {
+	case p.hits <- struct{}{}:
+	default:
+	}
+	if p.scheme == "socks5" {
+		p.handleSocks5(connection)
+		return
+	}
+	p.handleConnect(connection)
+}
+
+func (p *localProxy) handleConnect(connection net.Conn) {
+	reader := bufio.NewReader(connection)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 2 || fields[0] != "CONNECT" {
+		return
+	}
+	for {
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+	target, err := net.Dial("tcp", fields[1])
+	if err != nil {
+		_, _ = io.WriteString(connection, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		return
+	}
+	defer target.Close()
+	if _, err := io.WriteString(connection, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		return
+	}
+	proxyConnections(connection, target)
+}
+
+func (p *localProxy) handleSocks5(connection net.Conn) {
+	var greeting [2]byte
+	if _, err := io.ReadFull(connection, greeting[:]); err != nil || greeting[0] != 5 {
+		return
+	}
+	methods := make([]byte, int(greeting[1]))
+	if _, err := io.ReadFull(connection, methods); err != nil {
+		return
+	}
+	if _, err := connection.Write([]byte{5, 0}); err != nil {
+		return
+	}
+	var header [4]byte
+	if _, err := io.ReadFull(connection, header[:]); err != nil || header[0] != 5 || header[1] != 1 {
+		return
+	}
+	var host string
+	switch header[3] {
+	case 1:
+		address := make([]byte, net.IPv4len)
+		if _, err := io.ReadFull(connection, address); err != nil {
+			return
+		}
+		host = net.IP(address).String()
+	case 3:
+		var length [1]byte
+		if _, err := io.ReadFull(connection, length[:]); err != nil {
+			return
+		}
+		address := make([]byte, int(length[0]))
+		if _, err := io.ReadFull(connection, address); err != nil {
+			return
+		}
+		host = string(address)
+	case 4:
+		address := make([]byte, net.IPv6len)
+		if _, err := io.ReadFull(connection, address); err != nil {
+			return
+		}
+		host = net.IP(address).String()
+	default:
+		return
+	}
+	var portBytes [2]byte
+	if _, err := io.ReadFull(connection, portBytes[:]); err != nil {
+		return
+	}
+	target, err := net.Dial("tcp", net.JoinHostPort(host, stringPort(binary.BigEndian.Uint16(portBytes[:]))))
+	if err != nil {
+		_, _ = connection.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer target.Close()
+	if _, err := connection.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		return
+	}
+	proxyConnections(connection, target)
+}
+
+func stringPort(port uint16) string {
+	if port < 10 {
+		return string([]byte{'0' + byte(port)})
+	}
+	return fmt.Sprintf("%d", port)
+}
+
+func proxyConnections(left, right net.Conn) {
+	copyDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(right, left)
+		close(copyDone)
+	}()
+	_, _ = io.Copy(left, right)
+	<-copyDone
+}
+
+func TestValidateProxyURL(t *testing.T) {
+	for _, scheme := range []string{"http", "https", "socks4", "socks5"} {
+		if err := validateProxyURL(scheme + "://127.0.0.1:8080"); err != nil {
+			t.Fatalf("%s proxy rejected: %v", scheme, err)
+		}
+	}
+	for _, proxyURL := range []string{"ftp://127.0.0.1:8080", "http://", "not a url"} {
+		if err := validateProxyURL(proxyURL); err == nil {
+			t.Fatalf("invalid proxy %q was accepted", proxyURL)
+		}
+	}
+}
+
+func TestIntegrationCookiesRedirectExportImportAndStrictJar(t *testing.T) {
+	if os.Getenv("TLS_CLIENT_INTEGRATION") != "1" {
+		t.Skip("set TLS_CLIENT_INTEGRATION=1 to run local tls-client integration tests")
+	}
+	server := httptest.NewServer(nethttp.HandlerFunc(func(writer nethttp.ResponseWriter, request *nethttp.Request) {
+		switch request.URL.Path {
+		case "/set":
+			writer.Header().Add("Set-Cookie", "jar=one; Path=/; Expires=Wed, 01 Jan 2030 00:00:00 GMT; HttpOnly; SameSite=Strict")
+			_, _ = writer.Write([]byte("set"))
+		case "/redirect-start":
+			writer.Header().Add("Set-Cookie", "redirect=one; Path=/")
+			nethttp.Redirect(writer, request, "/redirect-final", nethttp.StatusFound)
+		case "/redirect-final", "/echo":
+			_, _ = writer.Write([]byte(request.Header.Get("Cookie")))
+		case "/empty":
+			writer.Header().Add("Set-Cookie", "empty=; Path=/")
+			_, _ = writer.Write([]byte("empty"))
+		}
+	}))
+	defer server.Close()
+
+	profile := "chrome_146"
+	session, err := buildSession(protocol.SessionConfigMeta{
+		SessionID:       "cookies",
+		Profile:         &profile,
+		ForceHTTP1:      true,
+		FollowRedirects: boolPointer(true),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+	request, err := http.NewRequest("GET", server.URL+"/set", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := session.client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	parsed, _ := url.Parse(server.URL + "/echo")
+	cookies := session.client.GetCookies(parsed)
+	if len(cookies) != 1 || cookies[0].Name != "jar" || cookies[0].Value != "one" || cookies[0].Path != "/" || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("cookies = %#v", cookies)
+	}
+	request, _ = http.NewRequest("GET", server.URL+"/redirect-start", nil)
+	response, err = session.client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil || !strings.Contains(string(body), "redirect=one") {
+		t.Fatalf("redirect body = %q, err = %v", body, err)
+	}
+
+	exported := allSessionCookies(session.client)
+	if len(exported) != 2 {
+		t.Fatalf("exported cookies = %#v", exported)
+	}
+	fresh, err := buildSession(protocol.SessionConfigMeta{SessionID: "cookies-fresh", Profile: &profile, ForceHTTP1: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.closeIdleConnections()
+	for _, cookie := range exported {
+		cookieURL, importErr := importCookieURL(cookie)
+		if importErr != nil {
+			t.Fatal(importErr)
+		}
+		converted, conversionErr := requestCookie(cookie)
+		if conversionErr != nil {
+			t.Fatal(conversionErr)
+		}
+		fresh.client.SetCookies(cookieURL, []*http.Cookie{converted})
+	}
+	request, _ = http.NewRequest("GET", server.URL+"/echo", nil)
+	response, err = fresh.client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if !strings.Contains(string(body), "jar=one") || !strings.Contains(string(body), "redirect=one") {
+		t.Fatalf("imported cookie body = %q", body)
+	}
+
+	strict, err := buildSession(protocol.SessionConfigMeta{SessionID: "cookies-strict", Profile: &profile, ForceHTTP1: true, CookieJar: "strict"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer strict.closeIdleConnections()
+	request, _ = http.NewRequest("GET", server.URL+"/empty", nil)
+	response, err = strict.client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if got := strict.client.GetCookies(parsed); len(got) != 0 {
+		t.Fatalf("strict jar retained empty cookie: %#v", got)
+	}
+}
+
+func TestIntegrationLiveProxySwitchPreservesJar(t *testing.T) {
+	if os.Getenv("TLS_CLIENT_INTEGRATION") != "1" {
+		t.Skip("set TLS_CLIENT_INTEGRATION=1 to run local tls-client integration tests")
+	}
+	server := httptest.NewServer(nethttp.HandlerFunc(func(writer nethttp.ResponseWriter, request *nethttp.Request) {
+		if request.URL.Path == "/set" {
+			writer.Header().Set("Set-Cookie", "proxy-jar=survives; Path=/")
+		}
+		_, _ = writer.Write([]byte(request.Header.Get("Cookie")))
+	}))
+	defer server.Close()
+	profile := "chrome_146"
+	session, err := buildSession(protocol.SessionConfigMeta{SessionID: "proxy", Profile: &profile, ForceHTTP1: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+	request, _ := http.NewRequest("GET", server.URL+"/set", nil)
+	response, err := session.client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+
+	for _, scheme := range []string{"http", "socks5"} {
+		proxy := startLocalProxy(t, scheme)
+		if err := session.setProxy(proxy.URL()); err != nil {
+			t.Fatalf("set %s proxy: %v", scheme, err)
+		}
+		request, _ = http.NewRequest("GET", server.URL+"/echo", nil)
+		response, err = session.client.Do(request)
+		if err != nil {
+			t.Fatalf("request through %s proxy: %v", scheme, err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil || !strings.Contains(string(body), "proxy-jar=survives") {
+			t.Fatalf("%s proxy body = %q, err = %v", scheme, body, readErr)
+		}
+		select {
+		case <-proxy.hits:
+		case <-time.After(time.Second):
+			t.Fatalf("%s proxy did not receive a connection", scheme)
+		}
+	}
+	if err := session.setProxy("ftp://127.0.0.1:1"); err == nil {
+		t.Fatal("invalid proxy was accepted")
+	}
+	if err := session.setProxy(""); err != nil {
+		t.Fatal(err)
 	}
 }
 

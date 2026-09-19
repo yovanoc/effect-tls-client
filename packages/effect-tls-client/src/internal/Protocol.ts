@@ -20,12 +20,17 @@ export const Cookie = Schema.Struct({
   value: Schema.String,
   domain: Schema.String,
   path: Schema.String,
+  origin: Schema.optionalKey(Schema.String),
   expires: Schema.NullOr(Schema.Int),
   secure: Schema.Boolean,
   httpOnly: Schema.Boolean,
   sameSite: Schema.optionalKey(Schema.Literals(["Strict", "Lax", "None"])),
 });
 export interface Cookie extends Schema.Schema.Type<typeof Cookie> {}
+
+/** JSON representation used for cross-process Jar persistence. */
+export const CookiesJson = Schema.fromJsonString(Schema.Array(Cookie));
+export type CookiesJson = Schema.Schema.Type<typeof CookiesJson>;
 
 export const Identity = Schema.Struct({
   headers: Schema.Array(Pair),
@@ -180,6 +185,53 @@ export const SessionIdMeta = Schema.Struct({
 });
 export interface SessionIdMeta extends Schema.Schema.Type<
   typeof SessionIdMeta
+> {}
+
+export const SessionProxyMeta = Schema.Struct({
+  sessionId: Schema.String,
+  proxyUrl: Schema.NullOr(Schema.String),
+});
+export interface SessionProxyMeta extends Schema.Schema.Type<
+  typeof SessionProxyMeta
+> {}
+
+export const CookiesGetMeta = Schema.Struct({
+  sessionId: Schema.String,
+  url: Schema.String,
+});
+export interface CookiesGetMeta extends Schema.Schema.Type<
+  typeof CookiesGetMeta
+> {}
+
+export const CookiesSetMeta = Schema.Struct({
+  sessionId: Schema.String,
+  url: Schema.String,
+  cookies: Schema.Array(Cookie),
+});
+export interface CookiesSetMeta extends Schema.Schema.Type<
+  typeof CookiesSetMeta
+> {}
+
+export const CookiesExportMeta = Schema.Struct({
+  sessionId: Schema.String,
+});
+export interface CookiesExportMeta extends Schema.Schema.Type<
+  typeof CookiesExportMeta
+> {}
+
+export const CookiesImportMeta = Schema.Struct({
+  sessionId: Schema.String,
+  cookies: Schema.Array(Cookie),
+});
+export interface CookiesImportMeta extends Schema.Schema.Type<
+  typeof CookiesImportMeta
+> {}
+
+export const CookiesResultMeta = Schema.Struct({
+  cookies: Schema.Array(Cookie),
+});
+export interface CookiesResultMeta extends Schema.Schema.Type<
+  typeof CookiesResultMeta
 > {}
 
 export const RequestMeta = Schema.Struct({
@@ -351,15 +403,15 @@ export const ErrorMeta = Schema.Struct({
 });
 export interface ErrorMeta extends Schema.Schema.Type<typeof ErrorMeta> {}
 
-type JsonSchema = Schema.Codec<unknown, unknown, never, never>;
-const json = <S extends JsonSchema>(schema: S) => Schema.fromJsonString(schema);
+export type MetaSchema = Schema.Codec<unknown, unknown, never, never>;
+const json = <S extends MetaSchema>(schema: S) => Schema.fromJsonString(schema);
 
-export const decodeMeta = <S extends JsonSchema>(
+export const decodeMeta = <S extends MetaSchema>(
   schema: S,
   bytes: Uint8Array,
 ): S["Type"] => Schema.decodeSync(json(schema))(decodeUtf8(bytes));
 
-export const encodeMeta = <S extends JsonSchema>(
+export const encodeMeta = <S extends MetaSchema>(
   schema: S,
   value: Schema.Schema.Type<S>,
 ): Uint8Array =>

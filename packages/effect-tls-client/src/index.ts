@@ -4,6 +4,7 @@ export type {
   RequestCookieInput,
   RequestInput,
   RequestOptions,
+  ProxyInput,
   TlsClientService,
   TlsResponse,
   TlsSession,

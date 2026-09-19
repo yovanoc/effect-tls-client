@@ -13,6 +13,24 @@ This is a Bun workspace with Turborepo wiring both the TS packages and the `brid
   packages; the Bridge binary is dropped into `bin/` by a release build task (not yet implemented).
 - `bridge/` — the Go module (Bridge sidecar), a `go.work` member.
 
+## Session cookies and proxies
+
+A scoped `TlsSession` owns the Go RFC 6265 Jar:
+
+```ts
+const session = yield * client.session({ profile: "chrome_146" });
+const cookies = yield * session.cookies(url);
+yield * session.setCookies(url, cookies);
+const exported = yield * session.exportCookies; // Schema-validated JSON
+yield * session.setProxy("http://127.0.0.1:8080");
+yield * session.setProxy(null); // direct routing again
+```
+
+`Cookie` request headers are passed through unchanged, but are discouraged: use `setCookies` so domain,
+path, expiry, security, and redirect behavior stay in the Go Jar. `exportCookies`/`importCookies` persist
+all cookie fields without creating a JavaScript-side Jar. Live proxy URLs support `http`, `https`, `socks4`,
+and `socks5`; proxy failures are typed as `TlsRequestError` with `kind: "Proxy"`.
+
 ## Running checks
 
 ```sh

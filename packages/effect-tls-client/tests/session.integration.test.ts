@@ -1,8 +1,17 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Effect, Fiber, Layer, Result, Stream } from "effect";
+import {
+  ConfigProvider,
+  Effect,
+  Fiber,
+  Layer,
+  Option,
+  Result,
+  Stream,
+} from "effect";
 import { Cookies } from "effect/unstable/http";
 import type { Scope } from "effect";
 import { NodeServices } from "@effect/platform-node";
+import { createConnection } from "node:net";
 import { createServer, type Server } from "node:http";
 import { createSecureServer, type Http2SecureServer } from "node:http2";
 import { readFileSync } from "node:fs";
@@ -89,6 +98,51 @@ const close = (server: RunningServer): Promise<void> =>
   new Promise((resolve, reject) => {
     server.close((error) => (error === undefined ? resolve() : reject(error)));
   });
+
+interface LocalConnectProxy {
+  readonly url: string;
+  readonly connections: Promise<number>;
+  readonly close: () => Promise<void>;
+}
+
+const startConnectProxy = async (): Promise<LocalConnectProxy> => {
+  let connectionCount = 0;
+  let resolveConnections: (value: number) => void = () => {};
+  const connections = new Promise<number>((resolve) => {
+    resolveConnections = resolve;
+  });
+  const server = createServer();
+  server.on("connect", (request, client, head) => {
+    connectionCount += 1;
+    resolveConnections(connectionCount);
+    const target = new URL(`http://${request.url ?? ""}`);
+    const upstream = createConnection({
+      host: target.hostname,
+      port: Number(target.port),
+    });
+    upstream.once("connect", () => {
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.byteLength > 0) upstream.write(head);
+      upstream.pipe(client);
+      client.pipe(upstream);
+    });
+    upstream.once("error", () => client.destroy());
+    client.once("error", () => upstream.destroy());
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("local proxy did not expose an address");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    connections,
+    close: () => close(server),
+  };
+};
 
 const tryPromise = <A>(thunk: () => Promise<A>) => Effect.promise(thunk);
 
@@ -188,6 +242,29 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
     }
     if (path === "/cookie") {
       response.end(request.headers.cookie ?? "");
+      return;
+    }
+    if (path === "/set-cookie") {
+      response.setHeader(
+        "Set-Cookie",
+        "jar=one; Path=/; Expires=Wed, 01 Jan 2030 00:00:00 GMT; HttpOnly; SameSite=Strict",
+      );
+      response.end("set-cookie");
+      return;
+    }
+    if (path === "/redirect-cookie-start") {
+      response.setHeader("Set-Cookie", "redirect=one; Path=/");
+      response.writeHead(302, { Location: "/redirect-cookie-final" });
+      response.end();
+      return;
+    }
+    if (path === "/redirect-cookie-final") {
+      response.end(request.headers.cookie ?? "");
+      return;
+    }
+    if (path === "/empty-cookie") {
+      response.setHeader("Set-Cookie", "empty=; Path=/");
+      response.end("empty-cookie");
       return;
     }
     if (path === "/upload-early") {
@@ -552,6 +629,141 @@ describeRealIntegration("real Bridge session requests", () => {
           expect(pulls).toBe(chunkCount);
         }),
       ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("exposes and persists the Go-owned cookie Jar", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          const setResponse = yield* session.request(
+            `${server.url}/set-cookie`,
+          );
+          expect(yield* setResponse.text).toBe("set-cookie");
+          expect(setResponse.cookies.cookies["jar"]?.value).toBe("one");
+
+          const jar = yield* session.cookies(`${server.url}/cookie`);
+          expect(jar.cookies["jar"]?.value).toBe("one");
+          expect(jar.cookies["jar"]?.options?.path).toBe("/");
+          expect(jar.cookies["jar"]?.options?.httpOnly).toBe(true);
+          expect(jar.cookies["jar"]?.options?.sameSite).toBe("strict");
+          expect(jar.cookies["jar"]?.options?.expires?.getUTCFullYear()).toBe(
+            2030,
+          );
+
+          const sent = yield* session.request(`${server.url}/cookie`);
+          expect(yield* sent.text).toContain("jar=one");
+          const redirect = yield* session.request(
+            `${server.url}/redirect-cookie-start`,
+            { followRedirects: true },
+          );
+          expect(yield* redirect.text).toContain("redirect=one");
+
+          yield* session.setCookies(
+            `${server.url}/cookie`,
+            Cookies.fromSetCookie("api=two; Path=/; HttpOnly; SameSite=Lax"),
+          );
+          const explicit = yield* session.request(`${server.url}/cookie`, {
+            headers: [["Cookie", "manual=one"]],
+          });
+          expect(yield* explicit.text).toContain("manual=one");
+          expect(
+            yield* (yield* session.request(`${server.url}/cookie`)).text,
+          ).toContain("api=two");
+
+          const malformed = yield* session
+            .importCookies("not-json")
+            .pipe(Effect.result);
+          expect(malformed._tag).toBe("Failure");
+          if (malformed._tag === "Failure") {
+            expect(malformed.failure._tag).toBe("TlsRequestError");
+            if (malformed.failure._tag === "TlsRequestError") {
+              expect(malformed.failure.kind).toBe("InvalidConfig");
+            }
+          }
+
+          const exported = yield* session.exportCookies;
+          const exportedCookies: ReadonlyArray<{
+            readonly name: string;
+            readonly value: string;
+            readonly domain: string;
+            readonly path: string;
+            readonly expires: number | null;
+            readonly secure: boolean;
+            readonly httpOnly: boolean;
+            readonly sameSite?: "Strict" | "Lax" | "None";
+          }> = JSON.parse(exported);
+          expect(exportedCookies.map((cookie) => cookie.name)).toEqual([
+            "api",
+            "jar",
+            "redirect",
+          ]);
+
+          const fresh = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          yield* fresh.importCookies(exported);
+          const imported = yield* fresh.request(`${server.url}/cookie`);
+          expect(yield* imported.text).toContain("jar=one");
+          expect(yield* imported.text).toContain("api=two");
+
+          const strict = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+            cookieJar: "strict",
+          });
+          yield* strict.request(`${server.url}/empty-cookie`);
+          const strictCookies = yield* strict.cookies(`${server.url}/cookie`);
+          expect(strictCookies.cookies["empty"]).toBeUndefined();
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("switches a live HTTP CONNECT proxy without losing the Jar", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      const proxy = yield* tryPromise(startConnectProxy);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          yield* session.request(`${server.url}/set-cookie`);
+          yield* session.setProxy(proxy.url);
+          const proxied = yield* session.request(`${server.url}/cookie`);
+          expect(yield* proxied.text).toContain("jar=one");
+          expect(yield* Effect.promise(() => proxy.connections)).toBe(1);
+
+          const invalid = yield* session
+            .setProxy("ftp://127.0.0.1:1")
+            .pipe(Effect.result);
+          expect(invalid._tag).toBe("Failure");
+          if (invalid._tag === "Failure") {
+            expect(invalid.failure._tag).toBe("TlsRequestError");
+            if (invalid.failure._tag === "TlsRequestError") {
+              expect(invalid.failure.kind).toBe("Proxy");
+            }
+          }
+          yield* session.setProxy(Option.none());
+          const direct = yield* session.request(`${server.url}/cookie`);
+          expect(yield* direct.text).toContain("jar=one");
+        }),
+      ).pipe(
+        Effect.ensuring(Effect.promise(server.close)),
+        Effect.ensuring(Effect.promise(proxy.close)),
+      );
     }),
   );
 

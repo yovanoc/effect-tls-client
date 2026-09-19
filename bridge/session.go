@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"github.com/bogdanfinn/fhttp/cookiejar"
 	"io"
 	"math"
 	"net"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
+	"github.com/bogdanfinn/fhttp/cookiejar"
 	"github.com/bogdanfinn/fhttp/http2"
 	tlsClient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -35,6 +35,140 @@ type tlsSession struct {
 	identity              protocol.IdentityMeta
 	clientBandwidthGate   chan struct{}
 	redirectBandwidthGate chan struct{}
+	proxyMu               sync.RWMutex
+}
+
+type sessionCookieJar struct {
+	jar     *cookiejar.Jar
+	strict  bool
+	mu      sync.Mutex
+	cookies map[string]*http.Cookie
+}
+
+func newSessionCookieJar(strict bool) (*sessionCookieJar, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &sessionCookieJar{
+		jar:     jar,
+		strict:  strict,
+		cookies: make(map[string]*http.Cookie),
+	}, nil
+}
+
+func cloneCookie(cookie *http.Cookie) *http.Cookie {
+	copy := *cookie
+	return &copy
+}
+
+func defaultCookiePath(path string) string {
+	if path == "" || path[0] != '/' {
+		return "/"
+	}
+	lastSlash := strings.LastIndexByte(path, '/')
+	if lastSlash <= 0 {
+		return "/"
+	}
+	return path[:lastSlash]
+}
+
+func normalizeJarCookie(u *url.URL, cookie *http.Cookie) *http.Cookie {
+	result := cloneCookie(cookie)
+	if result.Domain != "" {
+		result.Domain = strings.TrimPrefix(strings.ToLower(result.Domain), ".")
+	}
+	if result.Path == "" {
+		result.Path = defaultCookiePath(u.Path)
+	}
+	return result
+}
+
+func cookieDomain(u *url.URL, cookie *http.Cookie) string {
+	if cookie.Domain == "" {
+		return strings.ToLower(u.Hostname())
+	}
+	return strings.TrimPrefix(strings.ToLower(cookie.Domain), ".")
+}
+
+func cookieKeyFor(domain string, cookie *http.Cookie) string {
+	return strings.ToLower(domain) + "\x00" + cookie.Path + "\x00" + cookie.Name
+}
+
+func cookieKey(cookie *http.Cookie) string {
+	return strings.ToLower(cookie.Domain) + "\x00" + cookie.Path + "\x00" + cookie.Name
+}
+
+func (j *sessionCookieJar) Cookies(u *url.URL) []*http.Cookie {
+	if u == nil {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	selected := j.jar.Cookies(u)
+	result := make([]*http.Cookie, 0, len(selected))
+	for _, cookie := range selected {
+		if tracked := j.cookies[cookieKey(cookie)]; tracked != nil {
+			result = append(result, cloneCookie(tracked))
+		} else {
+			result = append(result, cloneCookie(cookie))
+		}
+	}
+	return result
+}
+
+func (j *sessionCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	if u == nil || len(cookies) == 0 {
+		return
+	}
+	accepted := make([]*http.Cookie, 0, len(cookies))
+	for _, cookie := range cookies {
+		if cookie == nil || (j.strict && cookie.Value == "") {
+			continue
+		}
+		accepted = append(accepted, cookie)
+	}
+	if len(accepted) == 0 {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.jar.SetCookies(u, accepted)
+	now := time.Now()
+	for _, cookie := range accepted {
+		normalized := normalizeJarCookie(u, cookie)
+		key := cookieKeyFor(cookieDomain(u, normalized), normalized)
+		if normalized.MaxAge < 0 || (!normalized.Expires.IsZero() && !normalized.Expires.After(now)) {
+			delete(j.cookies, key)
+			continue
+		}
+		j.cookies[key] = normalized
+	}
+}
+
+func (j *sessionCookieJar) GetAllCookies() map[string][]*http.Cookie {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	now := time.Now()
+	byDomain := make(map[string][]*http.Cookie)
+	for key, cookie := range j.cookies {
+		if cookie.MaxAge < 0 || (!cookie.Expires.IsZero() && !cookie.Expires.After(now)) {
+			delete(j.cookies, key)
+			continue
+		}
+		domain := strings.SplitN(key, "\x00", 2)[0]
+		byDomain[domain] = append(byDomain[domain], cloneCookie(cookie))
+	}
+	for domain := range byDomain {
+		sort.Slice(byDomain[domain], func(i, k int) bool {
+			left, right := byDomain[domain][i], byDomain[domain][k]
+			if left.Path != right.Path {
+				return left.Path < right.Path
+			}
+			return left.Name < right.Name
+		})
+	}
+	return byDomain
 }
 
 type uploadCredits struct {
@@ -297,6 +431,7 @@ func bandwidthDelta(before, after int64) uint64 {
 // spans Do through body EOF to keep each end delta attributable to one request.
 // ponytail: same-client request bodies serialize; use upstream per-request counters when available.
 func (s *tlsSession) beginTrackedRequest(ctx context.Context, followRedirects *bool) (tlsClient.HttpClient, bandwidthSnapshot, func(), error) {
+	s.proxyMu.RLock()
 	client := s.client
 	gate := s.clientBandwidthGate
 	if followRedirects != nil && *followRedirects != s.followRedirects {
@@ -304,21 +439,69 @@ func (s *tlsSession) beginTrackedRequest(ctx context.Context, followRedirects *b
 		gate = s.redirectBandwidthGate
 	}
 	if err := ctx.Err(); err != nil {
+		s.proxyMu.RUnlock()
 		return nil, bandwidthSnapshot{}, func() {}, err
 	}
 	select {
 	case gate <- struct{}{}:
 		if err := ctx.Err(); err != nil {
 			<-gate
+			s.proxyMu.RUnlock()
 			return nil, bandwidthSnapshot{}, func() {}, err
 		}
-		return client, snapshotBandwidth(client), func() { <-gate }, nil
+		return client, snapshotBandwidth(client), func() {
+			<-gate
+			s.proxyMu.RUnlock()
+		}, nil
 	case <-ctx.Done():
+		s.proxyMu.RUnlock()
 		return nil, bandwidthSnapshot{}, func() {}, ctx.Err()
 	}
 }
 
+func validateProxyURL(proxyURL string) error {
+	if proxyURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	if parsed.Host == "" || parsed.Hostname() == "" {
+		return errors.New("proxy URL must include a host")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks4", "socks5":
+		return nil
+	default:
+		return fmt.Errorf("unsupported proxy scheme %q", parsed.Scheme)
+	}
+}
+
+func (s *tlsSession) setProxy(proxyURL string) error {
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+	if err := validateProxyURL(proxyURL); err != nil {
+		return err
+	}
+	previous := s.client.GetProxy()
+	s.client.CloseIdleConnections()
+	s.redirectClient.CloseIdleConnections()
+	if err := s.client.SetProxy(proxyURL); err != nil {
+		return err
+	}
+	if err := s.redirectClient.SetProxy(proxyURL); err != nil {
+		_ = s.client.SetProxy(previous)
+		return err
+	}
+	s.client.CloseIdleConnections()
+	s.redirectClient.CloseIdleConnections()
+	return nil
+}
+
 func (s *tlsSession) closeIdleConnections() {
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
 	s.client.CloseIdleConnections()
 	s.redirectClient.CloseIdleConnections()
 }
@@ -394,6 +577,266 @@ func (d *dispatcher) runSessionDestroy(_ context.Context, op *operation, meta pr
 	}
 	d.cancelSession(meta.SessionID)
 	session.closeIdleConnections()
+	_ = d.finishOK(op)
+}
+
+func (d *dispatcher) finishResult(op *operation, value interface{}) error {
+	meta, err := protocol.EncodeMeta(value)
+	if err != nil {
+		return err
+	}
+	return d.finish(op, protocol.Frame{Kind: protocol.KindOk, ID: op.id, Meta: meta})
+}
+
+func sessionNotFound(d *dispatcher, op *operation, sessionID string) {
+	_ = d.finishErrorDetail(op, protocol.ErrorKindSessionNotFound, fmt.Sprintf("session %q was not found", sessionID), map[string]interface{}{"sessionId": sessionID})
+}
+
+func (d *dispatcher) runSessionProxy(ctx context.Context, op *operation, meta protocol.SessionProxyMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	session, ok := d.sessions.get(meta.SessionID)
+	if !ok {
+		sessionNotFound(d, op, meta.SessionID)
+		return
+	}
+	proxyURL := ""
+	if meta.ProxyURL != nil {
+		proxyURL = *meta.ProxyURL
+	}
+	if err := session.setProxy(proxyURL); err != nil {
+		_ = d.finishError(op, protocol.ErrorKindProxy, err.Error())
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	_ = d.finishOK(op)
+}
+
+func parseCookieURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("cookie URL must be an absolute http or https URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, errors.New("cookie URL must use http or https")
+	}
+	parsed.Fragment = ""
+	return parsed, nil
+}
+
+func cookieMeta(cookie *http.Cookie) protocol.CookieMeta {
+	var expires *int64
+	if !cookie.Expires.IsZero() {
+		value := cookie.Expires.Unix()
+		expires = &value
+	}
+	sameSite := ""
+	switch cookie.SameSite {
+	case http.SameSiteLaxMode:
+		sameSite = "Lax"
+	case http.SameSiteStrictMode:
+		sameSite = "Strict"
+	case http.SameSiteNoneMode:
+		sameSite = "None"
+	}
+	return protocol.CookieMeta{
+		Name:     cookie.Name,
+		Value:    cookie.Value,
+		Domain:   cookie.Domain,
+		Path:     cookie.Path,
+		Expires:  expires,
+		Secure:   cookie.Secure,
+		HttpOnly: cookie.HttpOnly,
+		SameSite: sameSite,
+	}
+}
+
+func cookieMetas(cookies []*http.Cookie) []protocol.CookieMeta {
+	result := make([]protocol.CookieMeta, 0, len(cookies))
+	for _, cookie := range cookies {
+		if cookie != nil {
+			result = append(result, cookieMeta(cookie))
+		}
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].Domain != result[j].Domain {
+			return result[i].Domain < result[j].Domain
+		}
+		if result[i].Path != result[j].Path {
+			return result[i].Path < result[j].Path
+		}
+		return result[i].Name < result[j].Name
+	})
+	return result
+}
+
+func allSessionCookies(client tlsClient.HttpClient) []protocol.CookieMeta {
+	jar, ok := client.GetCookieJar().(interface {
+		GetAllCookies() map[string][]*http.Cookie
+	})
+	if !ok {
+		return nil
+	}
+	var cookies []protocol.CookieMeta
+	for origin, entries := range jar.GetAllCookies() {
+		for _, cookie := range entries {
+			if cookie == nil {
+				continue
+			}
+			meta := cookieMeta(cookie)
+			if meta.Domain == "" {
+				meta.Origin = origin
+			}
+			cookies = append(cookies, meta)
+		}
+	}
+	sort.SliceStable(cookies, func(i, j int) bool {
+		if cookies[i].Domain != cookies[j].Domain {
+			return cookies[i].Domain < cookies[j].Domain
+		}
+		if cookies[i].Origin != cookies[j].Origin {
+			return cookies[i].Origin < cookies[j].Origin
+		}
+		if cookies[i].Path != cookies[j].Path {
+			return cookies[i].Path < cookies[j].Path
+		}
+		return cookies[i].Name < cookies[j].Name
+	})
+	return cookies
+}
+
+func importCookieURL(cookie protocol.CookieMeta) (*url.URL, error) {
+	host := strings.TrimPrefix(cookie.Domain, ".")
+	if host == "" {
+		host = cookie.Origin
+	}
+	if host == "" {
+		return nil, errors.New("cookie domain or origin is required for import")
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	scheme := "http"
+	if cookie.Secure {
+		scheme = "https"
+	}
+	path := cookie.Path
+	if path == "" {
+		path = "/"
+	}
+	return parseCookieURL(scheme + "://" + host + path)
+}
+
+func (d *dispatcher) runCookiesGet(ctx context.Context, op *operation, meta protocol.CookiesGetMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	session, ok := d.sessions.get(meta.SessionID)
+	if !ok {
+		sessionNotFound(d, op, meta.SessionID)
+		return
+	}
+	parsed, err := parseCookieURL(meta.URL)
+	if err != nil {
+		_ = d.finishError(op, protocol.ErrorKindInvalidUrl, err.Error())
+		return
+	}
+	session.proxyMu.RLock()
+	cookies := cookieMetas(session.client.GetCookies(parsed))
+	session.proxyMu.RUnlock()
+	_ = d.finishResult(op, protocol.CookiesResultMeta{Cookies: cookies})
+}
+
+func (d *dispatcher) runCookiesSet(ctx context.Context, op *operation, meta protocol.CookiesSetMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	session, ok := d.sessions.get(meta.SessionID)
+	if !ok {
+		sessionNotFound(d, op, meta.SessionID)
+		return
+	}
+	parsed, err := parseCookieURL(meta.URL)
+	if err != nil {
+		_ = d.finishError(op, protocol.ErrorKindInvalidUrl, err.Error())
+		return
+	}
+	converted := make([]*http.Cookie, 0, len(meta.Cookies))
+	for _, cookie := range meta.Cookies {
+		convertedCookie, conversionErr := requestCookie(cookie)
+		if conversionErr != nil {
+			_ = d.finishError(op, protocol.ErrorKindInvalidConfig, conversionErr.Error())
+			return
+		}
+		converted = append(converted, convertedCookie)
+	}
+	session.proxyMu.RLock()
+	session.client.SetCookies(parsed, converted)
+	session.proxyMu.RUnlock()
+	_ = d.finishOK(op)
+}
+
+func (d *dispatcher) runCookiesExport(ctx context.Context, op *operation, meta protocol.CookiesExportMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	session, ok := d.sessions.get(meta.SessionID)
+	if !ok {
+		sessionNotFound(d, op, meta.SessionID)
+		return
+	}
+	session.proxyMu.RLock()
+	cookies := allSessionCookies(session.client)
+	session.proxyMu.RUnlock()
+	_ = d.finishResult(op, protocol.CookiesResultMeta{Cookies: cookies})
+}
+
+func (d *dispatcher) runCookiesImport(ctx context.Context, op *operation, meta protocol.CookiesImportMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	session, ok := d.sessions.get(meta.SessionID)
+	if !ok {
+		sessionNotFound(d, op, meta.SessionID)
+		return
+	}
+	converted := make([]struct {
+		url    *url.URL
+		cookie *http.Cookie
+	}, 0, len(meta.Cookies))
+	for _, cookie := range meta.Cookies {
+		parsed, parseErr := importCookieURL(cookie)
+		if parseErr != nil {
+			_ = d.finishError(op, protocol.ErrorKindInvalidConfig, parseErr.Error())
+			return
+		}
+		convertedCookie, conversionErr := requestCookie(cookie)
+		if conversionErr != nil {
+			_ = d.finishError(op, protocol.ErrorKindInvalidConfig, conversionErr.Error())
+			return
+		}
+		converted = append(converted, struct {
+			url    *url.URL
+			cookie *http.Cookie
+		}{parsed, convertedCookie})
+	}
+	session.proxyMu.RLock()
+	for _, item := range converted {
+		session.client.SetCookies(item.url, []*http.Cookie{item.cookie})
+	}
+	session.proxyMu.RUnlock()
 	_ = d.finishOK(op)
 }
 
@@ -519,8 +962,10 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 	}
 	clientOptions := []tlsClient.HttpClientOption{
 		tlsClient.WithClientProfile(clientProfile),
-		// Request contexts below own the deadline so timeoutMs: 0 can remove the session default.
-		tlsClient.WithTimeoutMilliseconds(0),
+		// Request contexts below own the deadline. Keep the upstream client's
+		// transport deadline effectively disabled so its HTTP CONNECT dialer does
+		// not turn timeoutMs: 0 into an already-expired proxy deadline.
+		tlsClient.WithTimeoutMilliseconds(int((1 << 62) / int64(time.Millisecond))),
 		tlsClient.WithBandwidthTracker(),
 	}
 	if config.ProxyURL != "" {
@@ -572,14 +1017,12 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 	}
 
 	jarMode := config.CookieJar
-	if jarMode == "" || jarMode == "default" {
-		jar, err := cookiejar.New(nil)
+	if jarMode == "" || jarMode == "default" || jarMode == "strict" {
+		jar, err := newSessionCookieJar(jarMode == "strict")
 		if err != nil {
 			return nil, fmt.Errorf("cookie jar: %w", err)
 		}
 		clientOptions = append(clientOptions, tlsClient.WithCookieJar(jar))
-	} else if jarMode == "strict" {
-		clientOptions = append(clientOptions, tlsClient.WithCookieJar(tlsClient.NewCookieJar()))
 	}
 
 	followRedirects := false

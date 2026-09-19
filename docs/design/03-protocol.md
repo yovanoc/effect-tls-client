@@ -88,6 +88,7 @@ type Cookie = {
   expires: number | null   // unix seconds; null = session cookie
   secure: boolean; httpOnly: boolean
   sameSite?: "Strict" | "Lax" | "None"
+  origin?: string           // export-only host for a host-only cookie
 }
 ```
 
@@ -113,7 +114,7 @@ Exactly one of `profile` or `customProfile` is required; omitting both is a `Ses
                 maxResponseHeaderBytes?, writeBufferSize?, readBufferSize?, disableKeepAlives?, disableCompression? }
 }
 ```
-Go validates strictly: exactly one of `profile`/`customProfile`, unknown profile, unknown H2/H3 setting names, ipv4+ipv6 both disabled, pins+skipVerify, racing+forceHttp1/disableHttp3 → `error{kind:"SessionConfig"}`. Sessions are immutable except `session.proxy`.
+Go validates strictly: exactly one of `profile`/`customProfile`, unknown profile, unknown H2/H3 setting names, ipv4+ipv6 both disabled, pins+skipVerify, racing+forceHttp1/disableHttp3 → `error{kind:"SessionConfig"}`. Session transport and identity are immutable except `session.proxy`; the Go Jar is mutable only through the cookie operations. `session.proxy` accepts `http`, `https`, `socks4`, and `socks5` URLs or `null`; switching waits for the current request route lock, replaces both redirect-policy clients, and closes their idle connections without replacing the Jar or identity. Invalid proxy configuration is `error{kind:"Proxy"}`.
 
 ## 6. Request / response
 
@@ -136,6 +137,8 @@ Go validates strictly: exactly one of `profile`/`customProfile`, unknown profile
 Sequence: `request` → (`body.chunk`* → `body.end` if `hasBody`) … Go: `headers` → `chunk`* → `end`. `body.end` is sent only after the body producer completes; it is never inferred from response completion. If Go receives response headers before `body.end`, it closes the upload pipe with an explicit `request upload aborted after response headers` error, and the TS pump stops without sending `body.end`. The accepted response is still delivered and may finish with `end`; that response terminal frame does not claim that the upload completed. An upload producer failure before response headers sends `cancel` for Go cleanup, but the pending request reports the original `error{kind:"Body"}`.
 
 `contentLength` is the normalized request length. TS derives it for bytes, strings, and `FormData`, and validates any explicit `Content-Length` header against it; Go validates the value, sets the request's `ContentLength`, and removes the header before handing the request to the transport. Unknown-length streams omit it unless the caller supplies a valid matching header. `cookies` are inserted into the target session's Go Jar for this URL immediately before the request; they therefore persist in a named session and are scoped to the one ephemeral client for sessionless requests. They are not a replacement for an explicit `Cookie` header.
+
+The public session API maps `cookies(url)` and `setCookies(url, Cookies.Cookies)` to `cookies.get/set`. `exportCookies` is an Effect containing Schema-validated JSON for the complete Jar; `importCookies(json)` validates that JSON before sending it to Go. Host-only exported cookies keep their original `domain: ""` and carry an additive `origin` only so they can be restored in a fresh session. Explicit `Cookie` request headers pass through unchanged but are discouraged because they bypass the Jar's domain/path policy.
 
 `ResponseHeadersMeta`:
 ```ts

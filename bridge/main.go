@@ -516,6 +516,126 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		}
 		return false, nil
 
+	case protocol.KindSessionProxy:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "session.proxy id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "session.proxy does not accept a body")
+		}
+		var meta protocol.SessionProxyMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if meta.SessionID == "" {
+			return false, writeProtocolError(d.writer, frame.ID, "sessionId is required")
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runSessionProxy(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindCookiesGet:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.get id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.get does not accept a body")
+		}
+		var meta protocol.CookiesGetMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if meta.SessionID == "" || meta.URL == "" {
+			return false, writeProtocolError(d.writer, frame.ID, "sessionId and url are required")
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runCookiesGet(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindCookiesSet:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.set id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.set does not accept a body")
+		}
+		var meta protocol.CookiesSetMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if meta.SessionID == "" || meta.URL == "" {
+			return false, writeProtocolError(d.writer, frame.ID, "sessionId and url are required")
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runCookiesSet(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindCookiesExport:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.export id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.export does not accept a body")
+		}
+		var meta protocol.CookiesExportMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if meta.SessionID == "" {
+			return false, writeProtocolError(d.writer, frame.ID, "sessionId is required")
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runCookiesExport(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindCookiesImport:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.import id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.import does not accept a body")
+		}
+		var meta protocol.CookiesImportMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if meta.SessionID == "" {
+			return false, writeProtocolError(d.writer, frame.ID, "sessionId is required")
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runCookiesImport(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
 	case protocol.KindRequest:
 		if frame.ID == 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "request id 0 is reserved")

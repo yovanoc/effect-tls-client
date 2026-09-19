@@ -1,5 +1,5 @@
 import { Cookies } from "effect/unstable/http";
-import { Context, Effect, Exit, Layer, Schema, Stream } from "effect";
+import { Context, Effect, Exit, Layer, Option, Schema, Stream } from "effect";
 import type { Scope } from "effect";
 import {
   Bridge,
@@ -8,6 +8,7 @@ import {
   type RequestBody as BridgeRequestBody,
 } from "./internal/Bridge.js";
 import {
+  BridgeProtocolError,
   SessionConfigError,
   TlsRequestError,
   type BridgeError,
@@ -15,10 +16,13 @@ import {
 import { FrameKind } from "./internal/Frame.js";
 import {
   Cookie as CookieSchema,
+  CookiesJson,
+  CookiesResultMeta,
   SessionConfig as SessionConfigSchema,
   type Cookie as WireCookie,
   type Pair,
   type SessionConfig as SessionConfigType,
+  decodeMeta,
 } from "./internal/Protocol.js";
 
 export const SessionConfig = SessionConfigSchema;
@@ -96,12 +100,28 @@ export interface TlsResponse {
   readonly close: Effect.Effect<void>;
 }
 
+export type ProxyInput = string | null | undefined | Option.Option<string>;
+
 export interface TlsSession {
   readonly id: string;
   readonly request: (
     url: string | RequestInput,
     options?: RequestOptions,
   ) => Effect.Effect<TlsResponse, TlsOperationError, Scope.Scope>;
+  readonly cookies: (
+    url: string,
+  ) => Effect.Effect<Cookies.Cookies, TlsOperationError>;
+  readonly setCookies: (
+    url: string,
+    cookies: Cookies.Cookies,
+  ) => Effect.Effect<void, TlsOperationError>;
+  readonly exportCookies: Effect.Effect<string, TlsOperationError>;
+  readonly importCookies: (
+    json: string,
+  ) => Effect.Effect<void, TlsOperationError>;
+  readonly setProxy: (
+    proxy: ProxyInput,
+  ) => Effect.Effect<void, TlsOperationError>;
 }
 
 export interface TlsClientService {
@@ -267,6 +287,60 @@ const normalizeCookies = (
     catch: (cause) => requestConfigError("invalid request cookies", cause),
   });
 };
+
+const cookiesFromWire = (
+  values: ReadonlyArray<WireCookie>,
+): Effect.Effect<Cookies.Cookies, TlsRequestError> =>
+  Effect.try({
+    try: () =>
+      Cookies.fromIterable(
+        values.map((cookie) => {
+          const expires =
+            cookie.expires === null
+              ? undefined
+              : new Date(cookie.expires * 1000);
+          if (expires !== undefined && Number.isNaN(expires.getTime())) {
+            throw new Error(
+              `cookie ${cookie.name} has an invalid expires value`,
+            );
+          }
+          return Cookies.makeCookieUnsafe(cookie.name, cookie.value, {
+            ...(cookie.domain === "" ? {} : { domain: cookie.domain }),
+            ...(cookie.path === "" ? {} : { path: cookie.path }),
+            ...(expires === undefined ? {} : { expires }),
+            ...(cookie.secure ? { secure: true } : {}),
+            ...(cookie.httpOnly ? { httpOnly: true } : {}),
+            ...(cookie.sameSite === undefined
+              ? {}
+              : {
+                  sameSite:
+                    cookie.sameSite === "Lax"
+                      ? "lax"
+                      : cookie.sameSite === "Strict"
+                        ? "strict"
+                        : "none",
+                }),
+          });
+        }),
+      ),
+    catch: (cause) =>
+      requestConfigError("invalid cookies returned by Bridge", cause),
+  });
+
+const decodeCookieResult = (frame: {
+  readonly meta: Uint8Array;
+}): Effect.Effect<ReadonlyArray<WireCookie>, BridgeProtocolError> =>
+  Effect.try({
+    try: () => decodeMeta(CookiesResultMeta, frame.meta).cookies,
+    catch: (cause) =>
+      new BridgeProtocolError({
+        message: "invalid cookie response metadata",
+        cause,
+      }),
+  });
+
+const normalizeProxy = (proxy: ProxyInput): string | null =>
+  Option.isOption(proxy) ? Option.getOrNull(proxy) : (proxy ?? null);
 
 const headerValue = (
   headers: ReadonlyArray<Pair>,
@@ -519,8 +593,78 @@ export const makeTlsClientLayer = makeTlsClientLayerInternal(TlsClient);
 const makeSession = (
   bridge: Bridge["Service"],
   sessionId: string,
-): TlsSession => ({
-  id: sessionId,
-  request: (urlOrInput, options) =>
-    requestWith(bridge, { sessionId }, urlOrInput, options),
-});
+): TlsSession => {
+  const cookies = Effect.fn("TlsSession.cookies")(function* (url: string) {
+    const frame = yield* bridge.call(
+      FrameKind.cookiesGet,
+      { sessionId, url },
+      undefined,
+      CookiesResultMeta,
+    );
+    const values = yield* decodeCookieResult(frame);
+    return yield* cookiesFromWire(values);
+  });
+  const setCookies = Effect.fn("TlsSession.setCookies")(function* (
+    url: string,
+    value: Cookies.Cookies,
+  ) {
+    const values = yield* normalizeCookies(value);
+    yield* bridge
+      .call(FrameKind.cookiesSet, {
+        sessionId,
+        url,
+        cookies: values ?? [],
+      })
+      .pipe(Effect.asVoid);
+  });
+  const exportCookies = Effect.gen(function* () {
+    const frame = yield* bridge.call(
+      FrameKind.cookiesExport,
+      { sessionId },
+      undefined,
+      CookiesResultMeta,
+    );
+    const values = yield* decodeCookieResult(frame);
+    return yield* Effect.try({
+      try: () => Schema.encodeSync(CookiesJson)(values),
+      catch: (cause) =>
+        new BridgeProtocolError({
+          message: "failed to encode exported cookies",
+          cause,
+        }),
+    });
+  });
+  const importCookies = Effect.fn("TlsSession.importCookies")(function* (
+    json: string,
+  ) {
+    const values = yield* Schema.decodeUnknownEffect(CookiesJson)(json).pipe(
+      Effect.mapError((cause) =>
+        requestConfigError("invalid cookie export", cause),
+      ),
+    );
+    yield* bridge
+      .call(FrameKind.cookiesImport, { sessionId, cookies: values })
+      .pipe(Effect.asVoid);
+  });
+  const setProxy = Effect.fn("TlsSession.setProxy")(function* (
+    proxy: ProxyInput,
+  ) {
+    yield* bridge
+      .call(FrameKind.sessionProxy, {
+        sessionId,
+        proxyUrl: normalizeProxy(proxy),
+      })
+      .pipe(Effect.asVoid);
+  });
+
+  return {
+    id: sessionId,
+    request: (urlOrInput, options) =>
+      requestWith(bridge, { sessionId }, urlOrInput, options),
+    cookies,
+    setCookies,
+    exportCookies,
+    importCookies,
+    setProxy,
+  };
+};
