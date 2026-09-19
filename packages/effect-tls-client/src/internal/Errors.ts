@@ -61,6 +61,28 @@ export class TlsRequestError extends Schema.TaggedError<TlsRequestError>()(
   },
 ) {}
 
+export const TlsWebSocketErrorKind = Schema.Literals([
+  "Handshake",
+  "Read",
+  "Write",
+  "Closed",
+]);
+export type TlsWebSocketErrorKind = Schema.Schema.Type<
+  typeof TlsWebSocketErrorKind
+>;
+
+export class TlsWebSocketError extends Schema.TaggedError<TlsWebSocketError>()(
+  "TlsWebSocketError",
+  {
+    kind: TlsWebSocketErrorKind,
+    message: Schema.String,
+    code: Schema.optionalKey(Schema.Int),
+    reason: Schema.optionalKey(Schema.String),
+    initiator: Schema.optionalKey(Schema.Literals(["local", "remote"])),
+    cause: Schema.optionalKey(Schema.Defect()),
+  },
+) {}
+
 export type BridgeError =
   | BridgeSpawnError
   | BridgeVersionMismatch
@@ -68,7 +90,8 @@ export type BridgeError =
   | BridgeExited
   | SessionConfigError
   | SessionNotFound
-  | TlsRequestError;
+  | TlsRequestError
+  | TlsWebSocketError;
 
 export const isTransientRequestKind = (kind: RequestErrorKind): boolean =>
   kind === "Dns" ||

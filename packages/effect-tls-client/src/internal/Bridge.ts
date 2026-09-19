@@ -21,6 +21,7 @@ import {
   SessionConfigError,
   SessionNotFound,
   TlsRequestError,
+  TlsWebSocketError,
   isTransientRequestKind,
   type BridgeError,
 } from "./Errors.js";
@@ -51,6 +52,12 @@ import {
   EmptyMeta,
   HelloMeta,
   RequestMeta,
+  WsCloseMeta,
+  WsConnectMeta,
+  WsFrameMeta,
+  WsOpenMeta,
+  WsClosedMeta,
+  WsWriteMeta,
   isRequestErrorKind,
   ResponseHeadersMeta,
   SessionConfigWire,
@@ -66,6 +73,7 @@ import type { MetaSchema } from "./Protocol.js";
 export const PACKAGE_VERSION = packageJson.version;
 const STDERR_TAIL_BYTES = 4096;
 const SHUTDOWN_TIMEOUT_MILLIS = 2000;
+const WS_QUEUE_CAPACITY = 16_384;
 
 type CallKind =
   | typeof FrameKind.debugPing
@@ -106,6 +114,34 @@ interface PendingStream {
   headersSeen: boolean;
 }
 
+interface PendingWebSocket {
+  readonly _tag: "websocket";
+  readonly queue: Queue.Queue<WebSocketFrame, BridgeError>;
+  readonly open: Deferred.Deferred<WsOpenMeta, BridgeError>;
+  readonly done: Deferred.Deferred<void>;
+  opened: boolean;
+  closeSent: boolean;
+  failure?: BridgeError;
+}
+
+export interface WebSocketFrame {
+  readonly opcode: 1 | 2;
+  readonly body: Uint8Array;
+}
+
+export interface BridgeWebSocket {
+  readonly open: WsOpenMeta;
+  readonly pull: Effect.Effect<WebSocketFrame, BridgeError>;
+  readonly write: (
+    opcode: 1 | 2,
+    body: Uint8Array,
+  ) => Effect.Effect<void, BridgeError>;
+  readonly close: (
+    code?: number,
+    reason?: string,
+  ) => Effect.Effect<void, BridgeError>;
+}
+
 interface UploadState {
   readonly body: Stream.Stream<Uint8Array, unknown, never>;
   readonly stop: Deferred.Deferred<void>;
@@ -128,7 +164,7 @@ class UploadStopped extends Error {
   }
 }
 
-type Pending = PendingDeferred | PendingStream;
+type Pending = PendingDeferred | PendingStream | PendingWebSocket;
 
 export interface BridgeResponse {
   readonly headers: ResponseHeadersMeta;
@@ -161,6 +197,9 @@ export interface BridgeService {
     meta: unknown,
     body?: RequestBody,
   ) => Effect.Effect<BridgeResponse, BridgeError>;
+  readonly webSocket: (
+    meta: unknown,
+  ) => Effect.Effect<BridgeWebSocket, BridgeError>;
   readonly version: Effect.Effect<BridgeVersion, BridgeError>;
 }
 
@@ -269,6 +308,11 @@ const makeBridge = Effect.gen(function* () {
         Deferred.doneUnsafe(operation.headers, Effect.fail(error));
         Deferred.doneUnsafe(operation.end, Effect.fail(error));
         Deferred.doneUnsafe(operation.done, Effect.void);
+      } else if (operation._tag === "websocket") {
+        operation.failure = error;
+        Queue.failCauseUnsafe(operation.queue, Cause.fail(error));
+        Deferred.doneUnsafe(operation.open, Effect.fail(error));
+        Deferred.doneUnsafe(operation.done, Effect.void);
       } else {
         Deferred.doneUnsafe(operation.deferred, Effect.fail(error));
       }
@@ -334,6 +378,16 @@ const makeBridge = Effect.gen(function* () {
     Deferred.doneUnsafe(operation.deferred, effect);
   };
 
+  const completeWebSocket = (id: number, error: BridgeError): void => {
+    const operation = pending.get(id);
+    if (operation === undefined || operation._tag !== "websocket") return;
+    pending.delete(id);
+    operation.failure = error;
+    Queue.failCauseUnsafe(operation.queue, Cause.fail(error));
+    Deferred.doneUnsafe(operation.open, Effect.fail(error));
+    Deferred.doneUnsafe(operation.done, Effect.void);
+  };
+
   const completeStream = (id: number, result: EndMeta | BridgeError): void => {
     const operation = pending.get(id);
     if (operation === undefined || operation._tag !== "stream") return;
@@ -371,6 +425,21 @@ const makeBridge = Effect.gen(function* () {
     if (meta.kind === "Internal") {
       return new BridgeProtocolError({ message: meta.message });
     }
+    if (
+      meta.kind === "WsHandshake" ||
+      meta.kind === "WsRead" ||
+      meta.kind === "WsWrite"
+    ) {
+      return new TlsWebSocketError({
+        kind:
+          meta.kind === "WsHandshake"
+            ? "Handshake"
+            : meta.kind === "WsRead"
+              ? "Read"
+              : "Write",
+        message: meta.message,
+      });
+    }
     if (!isRequestErrorKind(meta.kind)) {
       return new BridgeProtocolError({
         message: `unsupported request error kind: ${meta.kind}`,
@@ -397,6 +466,15 @@ const makeBridge = Effect.gen(function* () {
     try {
       const meta = decodeMeta(ErrorMeta, frame.meta);
       let error = errorFromMeta(meta);
+      if (operation._tag === "websocket" && meta.kind === "Cancelled") {
+        error = new TlsWebSocketError({
+          kind: "Closed",
+          message: meta.message,
+          code: 1000,
+          reason: meta.message,
+          initiator: "local",
+        });
+      }
       if (
         operation._tag === "stream" &&
         !operation.headersSeen &&
@@ -406,6 +484,8 @@ const makeBridge = Effect.gen(function* () {
       }
       if (operation._tag === "stream") {
         completeStream(frame.id, error);
+      } else if (operation._tag === "websocket") {
+        completeWebSocket(frame.id, error);
       } else {
         completePending(frame.id, Effect.fail(error));
       }
@@ -491,6 +571,75 @@ const makeBridge = Effect.gen(function* () {
     }
   };
 
+  const handleWebSocketFrame = (
+    frame: Frame,
+    operation: PendingWebSocket,
+  ): BridgeProtocolError | undefined => {
+    if (frame.kind === FrameKind.error) {
+      return handleErrorFrame(frame, operation);
+    }
+    try {
+      if (frame.kind === FrameKind.wsOpen) {
+        if (operation.opened || frame.body.byteLength !== 0) {
+          throw failProtocol("invalid or duplicate ws.open frame");
+        }
+        const open = decodeMeta(WsOpenMeta, frame.meta);
+        operation.opened = true;
+        Deferred.doneUnsafe(operation.open, Effect.succeed(open));
+        return undefined;
+      }
+      if (frame.kind === FrameKind.wsFrame) {
+        if (!operation.opened) {
+          throw failProtocol("ws.frame received before ws.open");
+        }
+        const frameMeta = decodeMeta(WsFrameMeta, frame.meta);
+        if (
+          !Queue.offerUnsafe(operation.queue, {
+            opcode: frameMeta.opcode,
+            body: frame.body,
+          })
+        ) {
+          completeWebSocket(
+            frame.id,
+            new TlsWebSocketError({
+              kind: "Read",
+              message: "WebSocket frame queue capacity exceeded",
+            }),
+          );
+        }
+        return undefined;
+      }
+      if (frame.kind === FrameKind.wsClosed) {
+        if (frame.body.byteLength !== 0) {
+          throw failProtocol("ws.closed frame cannot contain a body");
+        }
+        const closed = decodeMeta(WsClosedMeta, frame.meta);
+        completeWebSocket(
+          frame.id,
+          new TlsWebSocketError({
+            kind: "Closed",
+            message:
+              closed.reason === ""
+                ? `WebSocket closed with code ${closed.code}`
+                : closed.reason,
+            code: closed.code,
+            reason: closed.reason,
+            initiator: closed.initiator,
+          }),
+        );
+        return undefined;
+      }
+      throw failProtocol("expected ws.open, ws.frame, ws.closed, or error");
+    } catch (cause) {
+      const error =
+        cause instanceof BridgeProtocolError
+          ? cause
+          : failProtocol("invalid WebSocket response metadata", cause);
+      markDead(error);
+      return error;
+    }
+  };
+
   const handleFrame = (frame: Frame): BridgeProtocolError | undefined => {
     if (!Object.values(FrameKind).includes(frame.kind)) {
       const error = failProtocol(
@@ -505,6 +654,9 @@ const makeBridge = Effect.gen(function* () {
 
     if (operation._tag === "stream") {
       return handleStreamFrame(frame, operation);
+    }
+    if (operation._tag === "websocket") {
+      return handleWebSocketFrame(frame, operation);
     }
     if (frame.kind === FrameKind.error) {
       return handleErrorFrame(frame, operation);
@@ -919,6 +1071,141 @@ const makeBridge = Effect.gen(function* () {
       }),
     );
 
+  const webSocket = Effect.fnUntraced(function* (
+    meta: unknown,
+  ): Effect.fn.Return<BridgeWebSocket, BridgeError> {
+    const initialDead = getDead();
+    if (initialDead !== undefined) return yield* initialDead;
+    const frameMeta = yield* Effect.try({
+      try: () =>
+        encodeMeta(
+          WsConnectMeta,
+          Schema.decodeUnknownSync(WsConnectMeta)(meta ?? {}),
+        ),
+      catch: (cause) =>
+        new BridgeProtocolError({
+          message: "invalid WebSocket metadata",
+          cause,
+        }),
+    });
+    const queue = yield* Queue.bounded<WebSocketFrame, BridgeError>(
+      WS_QUEUE_CAPACITY,
+    );
+    const open = Deferred.makeUnsafe<WsOpenMeta, BridgeError>();
+    const done = Deferred.makeUnsafe<void>();
+    const id = allocateId();
+    const operation: PendingWebSocket = {
+      _tag: "websocket",
+      queue,
+      open,
+      done,
+      opened: false,
+      closeSent: false,
+    };
+    let requestSent = false;
+    const cleanup = Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (!requestSent) {
+          if (pending.get(id) === operation) pending.delete(id);
+          return;
+        }
+        yield* sendCancel(id).pipe(Effect.ignore);
+        if (pending.get(id) === operation) {
+          yield* Deferred.await(done).pipe(Effect.ignore);
+        }
+      }),
+    );
+    const opened = yield* Effect.onInterrupt(
+      Effect.uninterruptible(
+        Effect.sync(() => pending.set(id, operation)).pipe(
+          Effect.flatMap(() =>
+            writeFrame({
+              kind: FrameKind.wsConnect,
+              id,
+              meta: frameMeta,
+            }).pipe(Effect.tap(() => Effect.sync(() => (requestSent = true)))),
+          ),
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              if (pending.get(id) === operation) pending.delete(id);
+            }),
+          ),
+          Effect.flatMap(() => Deferred.await(open)),
+        ),
+      ),
+      () => cleanup,
+    );
+
+    const pull = Queue.take(queue).pipe(
+      Effect.flatMap((frame) =>
+        writeFrame({
+          kind: FrameKind.ack,
+          id,
+          meta: encodeMeta(AckMeta, { bytes: frame.body.byteLength }),
+        }).pipe(Effect.as(frame)),
+      ),
+    );
+    const write = (opcode: 1 | 2, body: Uint8Array) =>
+      Effect.suspend(() => {
+        if (pending.get(id) !== operation) {
+          return Effect.fail(
+            operation.failure ??
+              new TlsWebSocketError({
+                kind: "Closed",
+                message: "WebSocket is closed",
+                code: 1000,
+                reason: "",
+                initiator: "local",
+              }),
+          );
+        }
+        return writeFrame({
+          kind: FrameKind.wsWrite,
+          id,
+          meta: encodeMeta(WsWriteMeta, { opcode }),
+          body,
+        });
+      });
+    const close = (code = 1000, reason = "") =>
+      Effect.uninterruptible(
+        Effect.suspend(() => {
+          if (
+            state.dead !== undefined ||
+            state.closing ||
+            pending.get(id) !== operation
+          ) {
+            return Effect.void;
+          }
+          if (!operation.closeSent) {
+            operation.closeSent = true;
+            Queue.failCauseUnsafe(
+              queue,
+              Cause.fail(
+                new TlsWebSocketError({
+                  kind: "Closed",
+                  message:
+                    reason === ""
+                      ? `WebSocket closed with code ${code}`
+                      : reason,
+                  code,
+                  reason,
+                  initiator: "local",
+                }),
+              ),
+            );
+            return writeFrame({
+              kind: FrameKind.wsClose,
+              id,
+              meta: encodeMeta(WsCloseMeta, { code, reason }),
+            }).pipe(Effect.ignore);
+          }
+          return Effect.void;
+        }),
+      );
+
+    return { open: opened, pull, write, close };
+  });
+
   const uploadStopped = new UploadStopped();
 
   const request = Effect.fnUntraced(function* (
@@ -1173,6 +1460,7 @@ const makeBridge = Effect.gen(function* () {
     call,
     stream,
     request,
+    webSocket,
     version: Effect.suspend(() => {
       const dead = getDead();
       return dead === undefined

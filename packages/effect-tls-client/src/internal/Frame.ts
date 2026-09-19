@@ -17,6 +17,9 @@ export const FrameKind = {
   request: 0x20,
   bodyChunk: 0x21,
   bodyEnd: 0x22,
+  wsConnect: 0x30,
+  wsWrite: 0x31,
+  wsClose: 0x32,
   cancel: 0x40,
   ack: 0x41,
   debugPing: 0xf0,
@@ -28,6 +31,9 @@ export const FrameKind = {
   headers: 0x90,
   chunk: 0x91,
   end: 0x92,
+  wsOpen: 0xa0,
+  wsFrame: 0xa1,
+  wsClosed: 0xa2,
   bodyAck: 0xc1,
 } as const;
 

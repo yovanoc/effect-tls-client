@@ -1,16 +1,28 @@
 import { Cookies } from "effect/unstable/http";
-import { Context, Effect, Exit, Layer, Option, Schema, Stream } from "effect";
+import * as Socket from "effect/unstable/socket/Socket";
+import {
+  Context,
+  Effect,
+  Exit,
+  Layer,
+  Latch,
+  Option,
+  Schema,
+  Stream,
+} from "effect";
 import type { Scope } from "effect";
 import {
   Bridge,
   type BridgeResponse,
   type BridgeVersion,
+  type BridgeWebSocket,
   type RequestBody as BridgeRequestBody,
 } from "./internal/Bridge.js";
 import {
   BridgeProtocolError,
   SessionConfigError,
   TlsRequestError,
+  TlsWebSocketError,
   type BridgeError,
 } from "./internal/Errors.js";
 import { FrameKind } from "./internal/Frame.js";
@@ -22,6 +34,7 @@ import {
   type Cookie as WireCookie,
   type Pair,
   type SessionConfig as SessionConfigType,
+  WsConnectMeta,
   decodeMeta,
 } from "./internal/Protocol.js";
 
@@ -55,6 +68,23 @@ const RequestOptionsSchema = Schema.Struct({
   cookies: Schema.optionalKey(Schema.Unknown),
 });
 
+const WebSocketOptionsSchema = Schema.Struct({
+  headers: Schema.optionalKey(
+    Schema.Array(Schema.Tuple([Schema.String, Schema.String])),
+  ),
+  headerOrder: Schema.optionalKey(Schema.Array(Schema.String)),
+  subprotocols: Schema.optionalKey(Schema.Array(Schema.String)),
+  handshakeTimeoutMs: Schema.optionalKey(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  ),
+  readBufferSize: Schema.optionalKey(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  ),
+  writeBufferSize: Schema.optionalKey(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  ),
+});
+
 export interface RequestCookieInput {
   readonly name: string;
   readonly value: string;
@@ -85,6 +115,15 @@ export interface RequestOptions {
 
 export type RequestInput = RequestOptions & { readonly url: string };
 
+export interface WebSocketOptions {
+  readonly headers?: ReadonlyArray<Pair>;
+  readonly headerOrder?: ReadonlyArray<string>;
+  readonly subprotocols?: ReadonlyArray<string>;
+  readonly handshakeTimeoutMs?: number;
+  readonly readBufferSize?: number;
+  readonly writeBufferSize?: number;
+}
+
 type TlsOperationError = BridgeError;
 
 export interface TlsResponse {
@@ -108,6 +147,10 @@ export interface TlsSession {
     url: string | RequestInput,
     options?: RequestOptions,
   ) => Effect.Effect<TlsResponse, TlsOperationError, Scope.Scope>;
+  readonly webSocket: (
+    url: string,
+    options?: WebSocketOptions,
+  ) => Effect.Effect<Socket.Socket, TlsWebSocketError, Scope.Scope>;
   readonly cookies: (
     url: string,
   ) => Effect.Effect<Cookies.Cookies, TlsOperationError>;
@@ -168,6 +211,229 @@ const requestConfigError = (
     isTransient: false,
     ...(cause === undefined ? {} : { cause }),
   });
+
+const socketError = (
+  phase: "open" | "read" | "write",
+  error: BridgeError,
+): Socket.SocketError => {
+  if (error._tag === "TlsWebSocketError") {
+    if (error.kind === "Closed") {
+      return new Socket.SocketError({
+        reason: new Socket.SocketCloseError({
+          code: error.code ?? 1000,
+          ...(error.reason === undefined ? {} : { closeReason: error.reason }),
+        }),
+      });
+    }
+    if (error.kind === "Read") {
+      return new Socket.SocketError({
+        reason: new Socket.SocketReadError({ cause: error }),
+      });
+    }
+    if (error.kind === "Write") {
+      return new Socket.SocketError({
+        reason: new Socket.SocketWriteError({ cause: error }),
+      });
+    }
+    return new Socket.SocketError({
+      reason: new Socket.SocketOpenError({
+        kind: /timeout|deadline/i.test(error.message) ? "Timeout" : "Unknown",
+        cause: error,
+      }),
+    });
+  }
+  return new Socket.SocketError({
+    reason:
+      phase === "open"
+        ? new Socket.SocketOpenError({ kind: "Unknown", cause: error })
+        : phase === "read"
+          ? new Socket.SocketReadError({ cause: error })
+          : new Socket.SocketWriteError({ cause: error }),
+  });
+};
+
+const normalizeWebSocket = (
+  url: string,
+  options: WebSocketOptions | undefined,
+): Effect.Effect<WsConnectMeta, TlsWebSocketError> =>
+  Effect.gen(function* () {
+    const parsedUrl = yield* Schema.decodeEffect(Schema.String)(url).pipe(
+      Effect.mapError(
+        (cause) =>
+          new TlsWebSocketError({
+            kind: "Handshake",
+            message: errorMessage(cause),
+            cause,
+          }),
+      ),
+    );
+    const parsedOptions = yield* Schema.decodeEffect(WebSocketOptionsSchema)(
+      options ?? {},
+    ).pipe(
+      Effect.mapError(
+        (cause) =>
+          new TlsWebSocketError({
+            kind: "Handshake",
+            message: "invalid WebSocket options",
+            cause,
+          }),
+      ),
+    );
+    return yield* Schema.decodeEffect(WsConnectMeta)({
+      sessionId: "",
+      url: parsedUrl,
+      headers: parsedOptions.headers ?? [],
+      ...(parsedOptions.headerOrder === undefined
+        ? {}
+        : { headerOrder: parsedOptions.headerOrder }),
+      ...(parsedOptions.subprotocols === undefined
+        ? {}
+        : { subprotocols: parsedOptions.subprotocols }),
+      ...(parsedOptions.handshakeTimeoutMs === undefined
+        ? {}
+        : { handshakeTimeoutMs: parsedOptions.handshakeTimeoutMs }),
+      ...(parsedOptions.readBufferSize === undefined
+        ? {}
+        : { readBufferSize: parsedOptions.readBufferSize }),
+      ...(parsedOptions.writeBufferSize === undefined
+        ? {}
+        : { writeBufferSize: parsedOptions.writeBufferSize }),
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new TlsWebSocketError({
+            kind: "Handshake",
+            message: "invalid WebSocket metadata",
+            cause,
+          }),
+      ),
+    );
+  });
+
+interface ManagedWebSocket {
+  readonly socket: Socket.Socket;
+  readonly close: Effect.Effect<void>;
+}
+
+const makeWebSocketSocket = (
+  bridge: Bridge["Service"],
+  sessionId: string,
+  meta: WsConnectMeta,
+): ManagedWebSocket => {
+  const latch = Latch.makeUnsafe(false);
+  let connection: BridgeWebSocket | undefined;
+  let failure: Socket.SocketError | undefined;
+
+  const localCloseError = (code = 1000, reason = "") =>
+    new Socket.SocketError({
+      reason: new Socket.SocketCloseError({
+        code,
+        ...(reason === "" ? {} : { closeReason: reason }),
+      }),
+    });
+  const setFailure = (error: Socket.SocketError): void => {
+    if (failure === undefined) failure = error;
+    connection = undefined;
+    latch.openUnsafe();
+  };
+  const closeConnection = (
+    active: BridgeWebSocket,
+    code = 1000,
+    reason = "",
+  ): Effect.Effect<void> => {
+    const closeReason = reason ?? "";
+    setFailure(localCloseError(code, closeReason));
+    return active.close(code, closeReason).pipe(Effect.ignore);
+  };
+
+  const reader: Socket.Socket["reader"] = Effect.gen(function* () {
+    failure = undefined;
+    connection = undefined;
+    latch.closeUnsafe();
+    const active = yield* bridge
+      .webSocket({ ...meta, sessionId })
+      .pipe(Effect.mapError((error) => socketError("open", error)));
+    connection = active;
+    latch.openUnsafe();
+    yield* Effect.addFinalizer(() => closeConnection(active));
+
+    const read = Effect.suspend(() => {
+      if (connection !== active) {
+        return Effect.fail(failure ?? localCloseError());
+      }
+      return active.pull.pipe(
+        Effect.map((frame) =>
+          frame.opcode === 1
+            ? new TextDecoder().decode(frame.body)
+            : frame.body,
+        ),
+        Effect.mapError((error) => {
+          const mapped = socketError("read", error);
+          if (connection === active) setFailure(mapped);
+          return mapped;
+        }),
+      );
+    });
+    return {
+      pull: read.pipe(Effect.map((value) => [value] as const)),
+      upgrade: Socket.SocketUpgradeError.unsupported,
+    };
+  });
+
+  const write = (
+    chunk: Uint8Array | string | Socket.CloseEvent,
+  ): Effect.Effect<void, Socket.SocketError> =>
+    Effect.suspend(() => {
+      const active = connection;
+      if (active === undefined) {
+        if (failure !== undefined) return Effect.fail(failure);
+        return latch.whenOpen(
+          Effect.suspend(() => {
+            if (connection !== undefined) return write(chunk);
+            return Effect.fail(failure ?? localCloseError());
+          }),
+        );
+      }
+      if (Socket.isCloseEvent(chunk)) {
+        return closeConnection(active, chunk.code, chunk.reason).pipe(
+          Effect.mapError((error) => socketError("write", error)),
+        );
+      }
+      const opcode = typeof chunk === "string" ? 1 : 2;
+      return active
+        .write(
+          opcode,
+          chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk),
+        )
+        .pipe(
+          Effect.mapError((error) => {
+            const mapped = socketError("write", error);
+            if (connection === active) setFailure(mapped);
+            return mapped;
+          }),
+        );
+    });
+  const writer: Socket.Socket["writer"] = Effect.acquireRelease(
+    Effect.succeed({
+      write,
+      writeAll: (chunks: ReadonlyArray<Uint8Array | string>) =>
+        Effect.forEach(chunks, (chunk) => write(chunk), { discard: true }),
+    }),
+    () =>
+      Effect.suspend(() => {
+        const active = connection;
+        return active === undefined ? Effect.void : closeConnection(active);
+      }),
+  );
+
+  return {
+    socket: Socket.make({ reader, writer }),
+    close: Effect.suspend(() => {
+      const active = connection;
+      return active === undefined ? Effect.void : closeConnection(active);
+    }),
+  };
+};
 
 interface EncodedBody {
   readonly stream: BridgeRequestBody;
@@ -656,11 +922,21 @@ const makeSession = (
       })
       .pipe(Effect.asVoid);
   });
+  const webSocket = Effect.fn("TlsSession.webSocket")(function* (
+    url: string,
+    options?: WebSocketOptions,
+  ) {
+    const meta = yield* normalizeWebSocket(url, options);
+    const managed = makeWebSocketSocket(bridge, sessionId, meta);
+    yield* Effect.addFinalizer(() => managed.close);
+    return managed.socket;
+  });
 
   return {
     id: sessionId,
     request: (urlOrInput, options) =>
       requestWith(bridge, { sessionId }, urlOrInput, options),
+    webSocket,
     cookies,
     setCookies,
     exportCookies,

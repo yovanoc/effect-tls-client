@@ -205,6 +205,47 @@ type BodyChunkMeta struct{}
 // BodyEndMeta is the metadata of a JS -> Go body.end frame.
 type BodyEndMeta struct{}
 
+// WSConnectMeta is the metadata of a JS -> Go ws.connect frame.
+type WSConnectMeta struct {
+	SessionID          string       `json:"sessionId"`
+	URL                string       `json:"url"`
+	Headers            []HeaderPair `json:"headers,omitempty"`
+	HeaderOrder        []string     `json:"headerOrder,omitempty"`
+	Subprotocols       []string     `json:"subprotocols,omitempty"`
+	HandshakeTimeoutMs *uint64      `json:"handshakeTimeoutMs,omitempty"`
+	ReadBufferSize     *uint64      `json:"readBufferSize,omitempty"`
+	WriteBufferSize    *uint64      `json:"writeBufferSize,omitempty"`
+}
+
+// WSWriteMeta is the metadata of a JS -> Go ws.write frame.
+type WSWriteMeta struct {
+	Opcode int `json:"opcode"`
+}
+
+// WSCloseMeta is the metadata of a JS -> Go ws.close frame.
+type WSCloseMeta struct {
+	Code   *int    `json:"code,omitempty"`
+	Reason *string `json:"reason,omitempty"`
+}
+
+// WSOpenMeta is the metadata of a Go -> JS ws.open frame.
+type WSOpenMeta struct {
+	Status  int          `json:"status"`
+	Headers []HeaderPair `json:"headers"`
+}
+
+// WSFrameMeta is the metadata of a Go -> JS ws.frame frame.
+type WSFrameMeta struct {
+	Opcode int `json:"opcode"`
+}
+
+// WSClosedMeta is the terminal metadata of a Go -> JS WebSocket operation.
+type WSClosedMeta struct {
+	Code      int    `json:"code"`
+	Reason    string `json:"reason"`
+	Initiator string `json:"initiator"`
+}
+
 // ResponseHeadersMeta is the first response frame for a request.
 type ResponseHeadersMeta struct {
 	Status   int          `json:"status"`

@@ -219,6 +219,7 @@ describe("TlsClient sessions", () => {
           },
           stream: () => Stream.empty,
           request: () => Effect.die("unused in session lifecycle test"),
+          webSocket: () => Effect.die("unused in session lifecycle test"),
           version: Effect.succeed({
             packageVersion: "fixture",
             bridgeVersion: "fixture",

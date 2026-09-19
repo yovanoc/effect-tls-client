@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yovanoc/effect-tls-client/bridge/protocol"
@@ -41,6 +42,8 @@ type operation struct {
 	cancel    context.CancelFunc
 	credits   *credits
 	upload    *requestUpload
+	ws        *webSocketState
+	cancelled atomic.Bool
 }
 
 type credits struct {
@@ -88,6 +91,26 @@ func (c *credits) reserve(ctx context.Context, requested uint64) (uint64, bool) 
 		select {
 		case <-ctx.Done():
 			return 0, false
+		case <-wake:
+		}
+	}
+}
+
+func (c *credits) reserveWhole(ctx context.Context, requested uint64) bool {
+	for {
+		c.mu.Lock()
+		outstanding := c.sent - c.acked
+		if outstanding <= c.window && requested <= c.window-outstanding {
+			c.sent += requested
+			c.mu.Unlock()
+			return true
+		}
+		wake := c.wake
+		c.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return false
 		case <-wake:
 		}
 	}
@@ -178,7 +201,15 @@ func (d *dispatcher) remove(op *operation) bool {
 func (d *dispatcher) cancel(id uint32) {
 	op := d.operation(id)
 	if op != nil {
-		op.cancel()
+		op.cancelled.Store(true)
+		op.stop()
+	}
+}
+
+func (op *operation) stop() {
+	op.cancel()
+	if op.ws != nil {
+		op.ws.close()
 	}
 }
 
@@ -192,7 +223,7 @@ func (d *dispatcher) cancelSession(sessionID string) {
 	}
 	d.mu.Unlock()
 	for _, op := range operations {
-		op.cancel()
+		op.stop()
 	}
 }
 
@@ -204,7 +235,7 @@ func (d *dispatcher) cancelAll() {
 	}
 	d.mu.Unlock()
 	for _, op := range operations {
-		op.cancel()
+		op.stop()
 	}
 }
 
@@ -709,6 +740,9 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 			return false, err
 		}
 		return false, nil
+
+	case protocol.KindWSConnect, protocol.KindWSWrite, protocol.KindWSClose:
+		return d.dispatchWebSocket(frame)
 
 	case protocol.KindCancel:
 		if frame.ID == 0 {

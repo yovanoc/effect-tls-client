@@ -31,6 +31,7 @@ type tlsSession struct {
 	id                    string
 	client                tlsClient.HttpClient
 	redirectClient        tlsClient.HttpClient
+	wsClient              tlsClient.HttpClient
 	followRedirects       bool
 	timeoutMs             int64
 	identity              protocol.IdentityMeta
@@ -686,6 +687,7 @@ func (s *tlsSession) setProxy(ctx context.Context, proxyURL string) error {
 	previous := s.client.GetProxy()
 	s.client.CloseIdleConnections()
 	s.redirectClient.CloseIdleConnections()
+	s.wsClient.CloseIdleConnections()
 	if err := s.client.SetProxy(proxyURL); err != nil {
 		return err
 	}
@@ -693,8 +695,14 @@ func (s *tlsSession) setProxy(ctx context.Context, proxyURL string) error {
 		_ = s.client.SetProxy(previous)
 		return err
 	}
+	if err := s.wsClient.SetProxy(proxyURL); err != nil {
+		_ = s.client.SetProxy(previous)
+		_ = s.redirectClient.SetProxy(previous)
+		return err
+	}
 	s.client.CloseIdleConnections()
 	s.redirectClient.CloseIdleConnections()
+	s.wsClient.CloseIdleConnections()
 	return nil
 }
 
@@ -706,6 +714,7 @@ func (s *tlsSession) closeIdleConnections() {
 	defer releaseProxy()
 	s.client.CloseIdleConnections()
 	s.redirectClient.CloseIdleConnections()
+	s.wsClient.CloseIdleConnections()
 }
 
 type sessionStore struct {
@@ -1258,8 +1267,11 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 	if config.FollowRedirects != nil {
 		followRedirects = *config.FollowRedirects
 	}
-	makeClient := func(follow bool) (tlsClient.HttpClient, error) {
+	makeClient := func(follow, forceHTTP1 bool) (tlsClient.HttpClient, error) {
 		options := append([]tlsClient.HttpClientOption(nil), clientOptions...)
+		if forceHTTP1 {
+			options = append(options, tlsClient.WithForceHttp1())
+		}
 		if sessionJar != nil {
 			options = append(options, tlsClient.WithCookieJar(sessionJar.clone()))
 		}
@@ -1268,13 +1280,19 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 		}
 		return tlsClient.NewHttpClient(tlsClient.NewNoopLogger(), options...)
 	}
-	client, err := makeClient(followRedirects)
+	client, err := makeClient(followRedirects, false)
 	if err != nil {
 		return nil, err
 	}
-	redirectClient, err := makeClient(!followRedirects)
+	redirectClient, err := makeClient(!followRedirects, false)
 	if err != nil {
 		client.CloseIdleConnections()
+		return nil, err
+	}
+	wsClient, err := makeClient(false, true)
+	if err != nil {
+		client.CloseIdleConnections()
+		redirectClient.CloseIdleConnections()
 		return nil, err
 	}
 	identity := protocol.IdentityMeta{}
@@ -1285,6 +1303,7 @@ func buildSession(config protocol.SessionConfigMeta) (*tlsSession, error) {
 		id:                    config.SessionID,
 		client:                client,
 		redirectClient:        redirectClient,
+		wsClient:              wsClient,
 		followRedirects:       followRedirects,
 		timeoutMs:             timeoutMs,
 		identity:              identity,

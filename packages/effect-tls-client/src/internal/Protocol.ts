@@ -272,6 +272,49 @@ export interface BodyChunkMeta extends Schema.Schema.Type<
 export const BodyEndMeta = Schema.Struct({});
 export interface BodyEndMeta extends Schema.Schema.Type<typeof BodyEndMeta> {}
 
+export const WsConnectMeta = Schema.Struct({
+  sessionId: Schema.String,
+  url: Schema.String,
+  headers: Schema.Array(Pair),
+  headerOrder: Schema.optionalKey(StringArray),
+  subprotocols: Schema.optionalKey(StringArray),
+  handshakeTimeoutMs: Schema.optionalKey(NonNegativeInt),
+  readBufferSize: Schema.optionalKey(NonNegativeInt),
+  writeBufferSize: Schema.optionalKey(NonNegativeInt),
+});
+export interface WsConnectMeta extends Schema.Schema.Type<
+  typeof WsConnectMeta
+> {}
+
+export const WsWriteMeta = Schema.Struct({
+  opcode: Schema.Literals([1, 2]),
+});
+export interface WsWriteMeta extends Schema.Schema.Type<typeof WsWriteMeta> {}
+
+export const WsCloseMeta = Schema.Struct({
+  code: Schema.optionalKey(Schema.Int),
+  reason: Schema.optionalKey(Schema.String),
+});
+export interface WsCloseMeta extends Schema.Schema.Type<typeof WsCloseMeta> {}
+
+export const WsOpenMeta = Schema.Struct({
+  status: Schema.Int,
+  headers: Schema.Array(Pair),
+});
+export interface WsOpenMeta extends Schema.Schema.Type<typeof WsOpenMeta> {}
+
+export const WsFrameMeta = Schema.Struct({
+  opcode: Schema.Literals([1, 2]),
+});
+export interface WsFrameMeta extends Schema.Schema.Type<typeof WsFrameMeta> {}
+
+export const WsClosedMeta = Schema.Struct({
+  code: Schema.Int,
+  reason: Schema.String,
+  initiator: Schema.Literals(["local", "remote"]),
+});
+export interface WsClosedMeta extends Schema.Schema.Type<typeof WsClosedMeta> {}
+
 export const ResponseProtocol = Schema.Literals([
   "HTTP/1.1",
   "HTTP/2.0",

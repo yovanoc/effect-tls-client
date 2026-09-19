@@ -26,6 +26,25 @@ func TestDebugMetadataRejectsNegativeNumbers(t *testing.T) {
 	}
 }
 
+func TestWebSocketMetadataRoundTrip(t *testing.T) {
+	meta, err := EncodeMeta(WSConnectMeta{
+		SessionID:    "session",
+		URL:          "ws://fixture.test/echo",
+		Headers:      []HeaderPair{{"X-Test", "yes"}},
+		Subprotocols: []string{"chat"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded WSConnectMeta
+	if err := DecodeObject(meta, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.SessionID != "session" || decoded.URL != "ws://fixture.test/echo" || len(decoded.Headers) != 1 {
+		t.Fatalf("decoded WebSocket metadata = %+v", decoded)
+	}
+}
+
 func TestHelloAckOptionalCreditMetadata(t *testing.T) {
 	var ack HelloAckMeta
 	if err := DecodeObject([]byte(`{"protocolVersion":1,"bridgeVersion":"0.0.0","tlsClientVersion":"fixture","goVersion":"go","future":true}`), &ack); err != nil {

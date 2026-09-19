@@ -38,6 +38,9 @@ const (
 	KindRequest        Kind = 0x20
 	KindBodyChunk      Kind = 0x21
 	KindBodyEnd        Kind = 0x22
+	KindWSConnect      Kind = 0x30
+	KindWSWrite        Kind = 0x31
+	KindWSClose        Kind = 0x32
 	KindCancel         Kind = 0x40
 	KindAck            Kind = 0x41
 	KindDebugPing      Kind = 0xF0
@@ -51,6 +54,9 @@ const (
 	KindHeaders  Kind = 0x90
 	KindChunk    Kind = 0x91
 	KindEnd      Kind = 0x92
+	KindWSOpen   Kind = 0xA0
+	KindWSFrame  Kind = 0xA1
+	KindWSClosed Kind = 0xA2
 	KindBodyAck  Kind = 0xC1
 )
 
@@ -70,8 +76,9 @@ func IsKnownKind(kind Kind) bool {
 	switch kind {
 	case KindHello, KindShutdown, KindSessionCreate, KindSessionDestroy, KindSessionProxy,
 		KindCookiesGet, KindCookiesSet, KindCookiesExport, KindCookiesImport, KindRequest,
-		KindBodyChunk, KindBodyEnd, KindCancel, KindAck, KindDebugPing, KindDebugSleep, KindDebugStream,
-		KindHelloAck, KindOk, KindError, KindHeaders, KindChunk, KindEnd, KindBodyAck:
+		KindBodyChunk, KindBodyEnd, KindWSConnect, KindWSWrite, KindWSClose, KindCancel, KindAck,
+		KindDebugPing, KindDebugSleep, KindDebugStream, KindHelloAck, KindOk, KindError, KindHeaders,
+		KindChunk, KindEnd, KindWSOpen, KindWSFrame, KindWSClosed, KindBodyAck:
 		return true
 	default:
 		return false

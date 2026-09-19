@@ -4,6 +4,7 @@ export type {
   RequestCookieInput,
   RequestInput,
   RequestOptions,
+  WebSocketOptions,
   ProxyInput,
   TlsClientService,
   TlsResponse,
@@ -17,6 +18,7 @@ export {
   SessionConfigError,
   SessionNotFound,
   TlsRequestError,
+  TlsWebSocketError,
   isTransientRequestKind,
 } from "./internal/Errors.js";
 export type { BridgeError, RequestErrorKind } from "./internal/Errors.js";
