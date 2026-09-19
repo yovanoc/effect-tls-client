@@ -18,7 +18,7 @@ const platformKey = (): string =>
   `${globalThis.process.platform}-${globalThis.process.arch}`;
 
 /** Resolves the override first, then the matching optionalDependency binary. */
-export const resolveBridgeBinary = Effect.fnUntraced(function* () {
+export const resolveBridgeBinary = Effect.gen(function* () {
   const override = yield* bridgePathConfig.pipe(
     Effect.mapError(
       (cause) =>

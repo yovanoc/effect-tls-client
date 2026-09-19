@@ -42,3 +42,9 @@ jobs:
           cd packages/effect-tls-client &&
           TLS_CLIENT_BRIDGE_PATH="$RUNNER_TEMP/effect-tls-client-bridge"
           bun run test:bun
+
+      - name: Test real Bridge with Node
+        run: >-
+          cd packages/effect-tls-client &&
+          TLS_CLIENT_BRIDGE_PATH="$RUNNER_TEMP/effect-tls-client-bridge"
+          node tests/bridge.node.mjs

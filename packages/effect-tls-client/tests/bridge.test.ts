@@ -13,6 +13,9 @@ const fixturePath = fileURLToPath(
 const delayedStderrFixturePath = fileURLToPath(
   new URL("./fixtures/bridge-delayed-stderr-fixture.mjs", import.meta.url),
 );
+const silentFixturePath = fileURLToPath(
+  new URL("./fixtures/bridge-silent-fixture.mjs", import.meta.url),
+);
 
 const withClientAt = <A, E>(
   path: string,
@@ -128,27 +131,48 @@ describe("Bridge lifecycle", () => {
     ),
   );
 
-  it.effect("propagates a killed Bridge with its signal and stderr tail", () =>
-    Effect.flip(
+  it.live(
+    "propagates a killed Bridge and keeps subsequent operations dead",
+    () =>
       withBridgeAt(
         fileURLToPath(
           new URL("./fixtures/bridge-exit-fixture.mjs", import.meta.url),
         ),
         Effect.gen(function* () {
           const bridge = yield* Bridge;
-          yield* bridge.call(FrameKind.debugPing);
+          const first = yield* Effect.flip(bridge.call(FrameKind.debugPing));
+          const second = yield* Effect.flip(
+            bridge.call(FrameKind.debugPing),
+          ).pipe(Effect.timeout(Duration.millis(500)));
+          const version = yield* Effect.flip(bridge.version).pipe(
+            Effect.timeout(Duration.millis(500)),
+          );
+
+          expect(first._tag).toBe("BridgeExited");
+          if (first._tag === "BridgeExited") {
+            expect(first.exitCode).toBeNull();
+            expect(first.signal).toBe("SIGKILL");
+            expect(first.stderrTail).toBe(
+              `${"a".repeat(96)}${"b".repeat(2000)}${"c".repeat(2000)}`,
+            );
+          }
+          expect(second).toBe(first);
+          expect(version).toBe(first);
         }),
+      ),
+  );
+
+  it.live("fails a silent Bridge handshake with BridgeProtocolError", () =>
+    Effect.flip(
+      withClientAt(silentFixturePath, TlsClient).pipe(
+        Effect.timeout(Duration.millis(5000)),
       ),
     ).pipe(
       Effect.tap((error) =>
         Effect.sync(() => {
-          expect(error._tag).toBe("BridgeExited");
-          if (error._tag === "BridgeExited") {
-            expect(error.exitCode).toBeNull();
-            expect(error.signal).toBe("SIGKILL");
-            expect(error.stderrTail).toBe(
-              `${"a".repeat(96)}${"b".repeat(2000)}${"c".repeat(2000)}`,
-            );
+          expect(error._tag).toBe("BridgeProtocolError");
+          if (error._tag === "BridgeProtocolError") {
+            expect(error.message).toBe("Bridge hello timed out");
           }
         }),
       ),
