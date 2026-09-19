@@ -7,6 +7,9 @@ const LENGTH_PREFIX = 4;
 export const FrameKind = {
   hello: 0x01,
   shutdown: 0x02,
+  sessionCreate: 0x10,
+  sessionDestroy: 0x11,
+  request: 0x20,
   cancel: 0x40,
   ack: 0x41,
   debugPing: 0xf0,
@@ -15,6 +18,7 @@ export const FrameKind = {
   helloAck: 0x80,
   ok: 0x81,
   error: 0x82,
+  headers: 0x90,
   chunk: 0x91,
   end: 0x92,
 } as const;

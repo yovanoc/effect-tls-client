@@ -1,4 +1,5 @@
 import { Schema } from "effect";
+import { ErrorKind } from "./Protocol.js";
 
 export class BridgeSpawnError extends Schema.TaggedError<BridgeSpawnError>()(
   "BridgeSpawnError",
@@ -34,8 +35,43 @@ export class BridgeExited extends Schema.TaggedError<BridgeExited>()(
   },
 ) {}
 
+export class SessionConfigError extends Schema.TaggedError<SessionConfigError>()(
+  "SessionConfigError",
+  {
+    message: Schema.String,
+  },
+) {}
+
+export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
+  "SessionNotFound",
+  {
+    sessionId: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+export class TlsRequestError extends Schema.TaggedError<TlsRequestError>()(
+  "TlsRequestError",
+  {
+    kind: ErrorKind,
+    message: Schema.String,
+    isTransient: Schema.Boolean,
+    detail: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
+    cause: Schema.optionalKey(Schema.Defect()),
+  },
+) {}
+
 export type BridgeError =
   | BridgeSpawnError
   | BridgeVersionMismatch
   | BridgeProtocolError
-  | BridgeExited;
+  | BridgeExited
+  | SessionConfigError
+  | SessionNotFound
+  | TlsRequestError;
+
+export const isTransientRequestKind = (kind: ErrorKind): boolean =>
+  kind === "Dns" ||
+  kind === "Connect" ||
+  kind === "Timeout" ||
+  kind === "Proxy";

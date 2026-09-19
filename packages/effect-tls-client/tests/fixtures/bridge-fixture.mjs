@@ -6,14 +6,17 @@ import packageJson from "../../package.json" with { type: "json" };
 const mismatch = process.argv.includes("--mismatch");
 const exitOnPing = process.argv.includes("--exit");
 const delayedStderr = process.argv.includes("--delayed-stderr");
+const sessions = new Set();
 let buffer = Buffer.alloc(0);
-const writeFrame = (kind, id, metadata = {}) => {
+const writeFrame = (kind, id, metadata = {}, body = undefined) => {
   const meta = Buffer.from(JSON.stringify(metadata));
-  const rest = Buffer.alloc(9 + meta.length);
+  const payload = body ?? Buffer.alloc(0);
+  const rest = Buffer.alloc(9 + meta.length + payload.length);
   rest.writeUInt8(kind, 0);
   rest.writeUInt32BE(id, 1);
   rest.writeUInt32BE(meta.length, 5);
   meta.copy(rest, 9);
+  payload.copy(rest, 9 + meta.length);
   const frame = Buffer.alloc(4 + rest.length);
   frame.writeUInt32BE(rest.length, 0);
   rest.copy(frame, 4);
@@ -38,6 +41,46 @@ process.stdin.on("data", (chunk) => {
         tlsClientVersion: "fixture",
         goVersion: "fixture-go",
       });
+    } else if (kind === 0x10) {
+      const metadata = JSON.parse(frame.subarray(9).toString("utf8"));
+      if (metadata.profile === "unknown") {
+        writeFrame(0x82, id, {
+          kind: "SessionConfig",
+          message: "unknown profile",
+        });
+      } else {
+        sessions.add(metadata.sessionId);
+        writeFrame(0x81, id, {});
+      }
+    } else if (kind === 0x11) {
+      const metadata = JSON.parse(frame.subarray(9).toString("utf8"));
+      sessions.delete(metadata.sessionId);
+      writeFrame(0x81, id, {});
+    } else if (kind === 0x20) {
+      const metadata = JSON.parse(frame.subarray(9).toString("utf8"));
+      if (!sessions.has(metadata.sessionId)) {
+        writeFrame(0x82, id, {
+          kind: "SessionNotFound",
+          message: "session not found",
+          detail: { sessionId: metadata.sessionId },
+        });
+      } else {
+        writeFrame(0x90, id, {
+          status: 200,
+          url: metadata.url,
+          headers: [
+            ["Content-Type", "application/json"],
+            ["Set-Cookie", "fixture=1; Path=/"],
+          ],
+          protocol: "HTTP/1.1",
+        });
+        writeFrame(0x91, id, {}, Buffer.from('{"ok":true}'));
+        writeFrame(0x92, id, {
+          protocol: "HTTP/1.1",
+          bytesRead: 11,
+          bytesWritten: 0,
+        });
+      }
     } else if (kind === 0xf0) {
       if (exitOnPing) {
         const writeStderrChunk = (chunk, next) =>

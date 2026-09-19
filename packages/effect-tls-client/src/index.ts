@@ -1,10 +1,20 @@
-export { TlsClient } from "./TlsClient.js";
-export type { TlsClientService } from "./TlsClient.js";
+export { TlsClient, SessionConfig } from "./TlsClient.js";
+export type {
+  RequestInput,
+  RequestOptions,
+  TlsClientService,
+  TlsResponse,
+  TlsSession,
+} from "./TlsClient.js";
 export {
   BridgeExited,
   BridgeProtocolError,
   BridgeSpawnError,
   BridgeVersionMismatch,
+  SessionConfigError,
+  SessionNotFound,
+  TlsRequestError,
+  isTransientRequestKind,
 } from "./internal/Errors.js";
 export type { BridgeError } from "./internal/Errors.js";
 export type { BridgeVersion } from "./internal/Bridge.js";

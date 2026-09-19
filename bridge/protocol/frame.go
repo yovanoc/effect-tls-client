@@ -26,18 +26,22 @@ type Kind uint8
 
 const (
 	// JS -> Go.
-	KindHello       Kind = 0x01
-	KindShutdown    Kind = 0x02
-	KindCancel      Kind = 0x40
-	KindAck         Kind = 0x41
-	KindDebugPing   Kind = 0xF0
-	KindDebugSleep  Kind = 0xF1
-	KindDebugStream Kind = 0xF2
+	KindHello          Kind = 0x01
+	KindShutdown       Kind = 0x02
+	KindSessionCreate  Kind = 0x10
+	KindSessionDestroy Kind = 0x11
+	KindRequest        Kind = 0x20
+	KindCancel         Kind = 0x40
+	KindAck            Kind = 0x41
+	KindDebugPing      Kind = 0xF0
+	KindDebugSleep     Kind = 0xF1
+	KindDebugStream    Kind = 0xF2
 
 	// Go -> JS.
 	KindHelloAck Kind = 0x80
 	KindOk       Kind = 0x81
 	KindError    Kind = 0x82
+	KindHeaders  Kind = 0x90
 	KindChunk    Kind = 0x91
 	KindEnd      Kind = 0x92
 )
@@ -56,9 +60,9 @@ type Frame struct {
 // IsKnownKind reports whether kind is implemented by this protocol-v1 Bridge.
 func IsKnownKind(kind Kind) bool {
 	switch kind {
-	case KindHello, KindShutdown, KindCancel, KindAck,
-		KindDebugPing, KindDebugSleep, KindDebugStream,
-		KindHelloAck, KindOk, KindError, KindChunk, KindEnd:
+	case KindHello, KindShutdown, KindSessionCreate, KindSessionDestroy, KindRequest,
+		KindCancel, KindAck, KindDebugPing, KindDebugSleep, KindDebugStream,
+		KindHelloAck, KindOk, KindError, KindHeaders, KindChunk, KindEnd:
 		return true
 	default:
 		return false

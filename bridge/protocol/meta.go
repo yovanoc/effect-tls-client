@@ -36,6 +36,125 @@ type HelloAckMeta struct {
 // EmptyMeta is the metadata of frames with no payload.
 type EmptyMeta struct{}
 
+// HeaderPair is one ordered HTTP header name and value.
+type HeaderPair [2]string
+
+// IdentityMeta contains the fixed headers attached to every session request.
+type IdentityMeta struct {
+	Headers     []HeaderPair `json:"headers,omitempty"`
+	HeaderOrder []string     `json:"headerOrder,omitempty"`
+}
+
+// PriorityParamMeta describes one HTTP/2 priority parameter.
+type PriorityParamMeta struct {
+	StreamDep uint32 `json:"streamDep"`
+	Exclusive bool   `json:"exclusive"`
+	Weight    uint8  `json:"weight"`
+}
+
+// PriorityFrameMeta describes one HTTP/2 priority frame in a custom profile.
+type PriorityFrameMeta struct {
+	PriorityParam PriorityParamMeta `json:"priorityParam"`
+	StreamID      uint32            `json:"streamID"`
+}
+
+// CandidateCipherSuiteMeta describes one ECH candidate cipher suite.
+type CandidateCipherSuiteMeta struct {
+	KdfID  string `json:"kdfId"`
+	AeadID string `json:"aeadId"`
+}
+
+// CustomProfileMeta mirrors tls-client's customTlsClient input.
+type CustomProfileMeta struct {
+	H2Settings                              map[string]uint32          `json:"h2Settings,omitempty"`
+	H2SettingsOrder                         []string                   `json:"h2SettingsOrder,omitempty"`
+	H3Settings                              map[string]uint64          `json:"h3Settings,omitempty"`
+	H3SettingsOrder                         []string                   `json:"h3SettingsOrder,omitempty"`
+	H3PseudoHeaderOrder                     []string                   `json:"h3PseudoHeaderOrder,omitempty"`
+	HeaderPriority                          *PriorityParamMeta         `json:"headerPriority,omitempty"`
+	CertCompressionAlgos                    []string                   `json:"certCompressionAlgos,omitempty"`
+	Ja3String                               string                     `json:"ja3String,omitempty"`
+	KeyShareCurves                          []string                   `json:"keyShareCurves,omitempty"`
+	ALPNProtocols                           []string                   `json:"alpnProtocols,omitempty"`
+	ALPSProtocols                           []string                   `json:"alpsProtocols,omitempty"`
+	ECHCandidatePayloads                    []uint16                   `json:"ECHCandidatePayloads,omitempty"`
+	ECHCandidateCipherSuites                []CandidateCipherSuiteMeta `json:"ECHCandidateCipherSuites,omitempty"`
+	PriorityFrames                          []PriorityFrameMeta        `json:"priorityFrames,omitempty"`
+	PseudoHeaderOrder                       []string                   `json:"pseudoHeaderOrder,omitempty"`
+	SupportedDelegatedCredentialsAlgorithms []string                   `json:"supportedDelegatedCredentialsAlgorithms,omitempty"`
+	SupportedSignatureAlgorithms            []string                   `json:"supportedSignatureAlgorithms,omitempty"`
+	SupportedVersions                       []string                   `json:"supportedVersions,omitempty"`
+	ConnectionFlow                          uint32                     `json:"connectionFlow,omitempty"`
+	RecordSizeLimit                         uint16                     `json:"recordSizeLimit,omitempty"`
+	StreamID                                uint32                     `json:"streamId,omitempty"`
+	H3PriorityParam                         uint32                     `json:"h3PriorityParam,omitempty"`
+	H3SendGreaseFrames                      bool                       `json:"h3SendGreaseFrames,omitempty"`
+	AllowHTTP                               bool                       `json:"allowHttp,omitempty"`
+}
+
+// SessionConfigMeta is the metadata of a JS -> Go session.create frame.
+type SessionConfigMeta struct {
+	SessionID               string              `json:"sessionId"`
+	Profile                 *string             `json:"profile,omitempty"`
+	CustomProfile           *CustomProfileMeta  `json:"customProfile,omitempty"`
+	Identity                *IdentityMeta       `json:"identity,omitempty"`
+	TimeoutMs               *int64              `json:"timeoutMs,omitempty"`
+	FollowRedirects         *bool               `json:"followRedirects,omitempty"`
+	ProxyURL                string              `json:"proxyUrl,omitempty"`
+	InsecureSkipVerify      bool                `json:"insecureSkipVerify,omitempty"`
+	RandomTLSExtensionOrder bool                `json:"randomTlsExtensionOrder,omitempty"`
+	DisableSessionTickets   bool                `json:"disableSessionTickets,omitempty"`
+	ForceHTTP1              bool                `json:"forceHttp1,omitempty"`
+	DisableHTTP3            bool                `json:"disableHttp3,omitempty"`
+	ProtocolRacing          bool                `json:"protocolRacing,omitempty"`
+	DisableIPv4             bool                `json:"disableIpv4,omitempty"`
+	DisableIPv6             bool                `json:"disableIpv6,omitempty"`
+	LocalAddress            string              `json:"localAddress,omitempty"`
+	ServerName              string              `json:"serverName,omitempty"`
+	CertificatePins         map[string][]string `json:"certificatePins,omitempty"`
+	CookieJar               string              `json:"cookieJar,omitempty"`
+	Transport               *TransportMeta      `json:"transport,omitempty"`
+}
+
+// TransportMeta contains the transport knobs accepted by tls-client.
+type TransportMeta struct {
+	IdleConnTimeoutMs      *int64 `json:"idleConnTimeoutMs,omitempty"`
+	MaxIdleConns           int    `json:"maxIdleConns,omitempty"`
+	MaxIdleConnsPerHost    int    `json:"maxIdleConnsPerHost,omitempty"`
+	MaxConnsPerHost        int    `json:"maxConnsPerHost,omitempty"`
+	MaxResponseHeaderBytes int64  `json:"maxResponseHeaderBytes,omitempty"`
+	WriteBufferSize        int    `json:"writeBufferSize,omitempty"`
+	ReadBufferSize         int    `json:"readBufferSize,omitempty"`
+	DisableKeepAlives      bool   `json:"disableKeepAlives,omitempty"`
+	DisableCompression     bool   `json:"disableCompression,omitempty"`
+}
+
+// SessionIDMeta identifies a session operation.
+type SessionIDMeta struct {
+	SessionID string `json:"sessionId"`
+}
+
+// RequestMeta is the metadata of a JS -> Go request frame.
+type RequestMeta struct {
+	SessionID       string       `json:"sessionId"`
+	URL             string       `json:"url"`
+	Method          string       `json:"method"`
+	Headers         []HeaderPair `json:"headers,omitempty"`
+	HeaderOrder     []string     `json:"headerOrder,omitempty"`
+	HasBody         bool         `json:"hasBody,omitempty"`
+	TimeoutMs       *int64       `json:"timeoutMs,omitempty"`
+	FollowRedirects *bool        `json:"followRedirects,omitempty"`
+	HostOverride    string       `json:"hostOverride,omitempty"`
+}
+
+// ResponseHeadersMeta is the first response frame for a request.
+type ResponseHeadersMeta struct {
+	Status   int          `json:"status"`
+	URL      string       `json:"url"`
+	Headers  []HeaderPair `json:"headers"`
+	Protocol string       `json:"protocol"`
+}
+
 // CancelMeta is the metadata of a JS -> Go cancel frame.
 type CancelMeta struct{}
 
@@ -60,6 +179,7 @@ type ChunkMeta struct{}
 
 // EndMeta is the terminal metadata for a streamed operation.
 type EndMeta struct {
+	Protocol     string `json:"protocol,omitempty"`
 	BytesRead    uint64 `json:"bytesRead"`
 	BytesWritten uint64 `json:"bytesWritten"`
 }
@@ -86,6 +206,7 @@ const (
 	ErrorKindWsWrite         ErrorKind = "WsWrite"
 	ErrorKindProtocol        ErrorKind = "Protocol"
 	ErrorKindInternal        ErrorKind = "Internal"
+	ErrorKindUnknown         ErrorKind = "Unknown"
 )
 
 // ErrorMeta is the meta of a Go -> JS error frame.

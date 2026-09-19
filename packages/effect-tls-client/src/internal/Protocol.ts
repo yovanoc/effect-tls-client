@@ -6,6 +6,184 @@ export const DEFAULT_WINDOW = 1024 * 1024;
 export const DEFAULT_CHUNK_SIZE = 64 * 1024;
 
 const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+const UInt8 = NonNegativeInt.check(Schema.isLessThanOrEqualTo(0xff));
+const UInt16 = NonNegativeInt.check(Schema.isLessThanOrEqualTo(0xffff));
+const UInt32 = NonNegativeInt.check(Schema.isLessThanOrEqualTo(0xffffffff));
+const HeaderPair = Schema.Tuple([Schema.String, Schema.String]);
+const StringArray = Schema.Array(Schema.String);
+
+export const Pair = HeaderPair;
+export interface Pair extends Schema.Schema.Type<typeof Pair> {}
+
+export const Identity = Schema.Struct({
+  headers: Schema.Array(Pair),
+  headerOrder: Schema.optionalKey(StringArray),
+});
+export interface Identity extends Schema.Schema.Type<typeof Identity> {}
+
+export const PriorityParam = Schema.Struct({
+  streamDep: UInt32,
+  exclusive: Schema.Boolean,
+  weight: UInt8,
+});
+export interface PriorityParam extends Schema.Schema.Type<
+  typeof PriorityParam
+> {}
+
+export const PriorityFrame = Schema.Struct({
+  priorityParam: PriorityParam,
+  streamID: UInt32,
+});
+export interface PriorityFrame extends Schema.Schema.Type<
+  typeof PriorityFrame
+> {}
+
+export const CandidateCipherSuite = Schema.Struct({
+  kdfId: Schema.String,
+  aeadId: Schema.String,
+});
+export interface CandidateCipherSuite extends Schema.Schema.Type<
+  typeof CandidateCipherSuite
+> {}
+
+/** Mirrors tls-client's customTlsClient input; Go performs semantic validation. */
+export const CustomProfile = Schema.Struct({
+  h2Settings: Schema.optionalKey(Schema.Record(Schema.String, UInt32)),
+  h2SettingsOrder: Schema.optionalKey(StringArray),
+  h3Settings: Schema.optionalKey(Schema.Record(Schema.String, NonNegativeInt)),
+  h3SettingsOrder: Schema.optionalKey(StringArray),
+  h3PseudoHeaderOrder: Schema.optionalKey(StringArray),
+  headerPriority: Schema.optionalKey(PriorityParam),
+  certCompressionAlgos: Schema.optionalKey(StringArray),
+  ja3String: Schema.optionalKey(Schema.String),
+  keyShareCurves: Schema.optionalKey(StringArray),
+  alpnProtocols: Schema.optionalKey(StringArray),
+  alpsProtocols: Schema.optionalKey(StringArray),
+  ECHCandidatePayloads: Schema.optionalKey(Schema.Array(UInt16)),
+  ECHCandidateCipherSuites: Schema.optionalKey(
+    Schema.Array(CandidateCipherSuite),
+  ),
+  priorityFrames: Schema.optionalKey(Schema.Array(PriorityFrame)),
+  pseudoHeaderOrder: Schema.optionalKey(StringArray),
+  supportedDelegatedCredentialsAlgorithms: Schema.optionalKey(StringArray),
+  supportedSignatureAlgorithms: Schema.optionalKey(StringArray),
+  supportedVersions: Schema.optionalKey(StringArray),
+  connectionFlow: Schema.optionalKey(UInt32),
+  recordSizeLimit: Schema.optionalKey(UInt16),
+  streamId: Schema.optionalKey(UInt32),
+  h3PriorityParam: Schema.optionalKey(UInt32),
+  h3SendGreaseFrames: Schema.optionalKey(Schema.Boolean),
+  allowHttp: Schema.optionalKey(Schema.Boolean),
+});
+export interface CustomProfile extends Schema.Schema.Type<
+  typeof CustomProfile
+> {}
+
+export const TransportOptions = Schema.Struct({
+  idleConnTimeoutMs: Schema.optionalKey(NonNegativeInt),
+  maxIdleConns: Schema.optionalKey(NonNegativeInt),
+  maxIdleConnsPerHost: Schema.optionalKey(NonNegativeInt),
+  maxConnsPerHost: Schema.optionalKey(NonNegativeInt),
+  maxResponseHeaderBytes: Schema.optionalKey(NonNegativeInt),
+  writeBufferSize: Schema.optionalKey(NonNegativeInt),
+  readBufferSize: Schema.optionalKey(NonNegativeInt),
+  disableKeepAlives: Schema.optionalKey(Schema.Boolean),
+  disableCompression: Schema.optionalKey(Schema.Boolean),
+});
+export interface TransportOptions extends Schema.Schema.Type<
+  typeof TransportOptions
+> {}
+
+export const Profile = Schema.String;
+export type Profile = Schema.Schema.Type<typeof Profile>;
+
+const SessionConfigBase = Schema.Struct({
+  profile: Schema.optionalKey(Profile),
+  customProfile: Schema.optionalKey(CustomProfile),
+  identity: Schema.optionalKey(Identity),
+  timeoutMs: Schema.optionalKey(NonNegativeInt),
+  followRedirects: Schema.optionalKey(Schema.Boolean),
+  proxyUrl: Schema.optionalKey(Schema.String),
+  insecureSkipVerify: Schema.optionalKey(Schema.Boolean),
+  randomTlsExtensionOrder: Schema.optionalKey(Schema.Boolean),
+  disableSessionTickets: Schema.optionalKey(Schema.Boolean),
+  forceHttp1: Schema.optionalKey(Schema.Boolean),
+  disableHttp3: Schema.optionalKey(Schema.Boolean),
+  protocolRacing: Schema.optionalKey(Schema.Boolean),
+  disableIpv4: Schema.optionalKey(Schema.Boolean),
+  disableIpv6: Schema.optionalKey(Schema.Boolean),
+  localAddress: Schema.optionalKey(Schema.String),
+  serverName: Schema.optionalKey(Schema.String),
+  certificatePins: Schema.optionalKey(
+    Schema.Record(Schema.String, Schema.Array(Schema.String)),
+  ),
+  cookieJar: Schema.optionalKey(Schema.Literals(["default", "strict", "none"])),
+  transport: Schema.optionalKey(TransportOptions),
+});
+
+/** Public session configuration. Exactly one of profile/customProfile is required. */
+export const SessionConfig = SessionConfigBase.check(
+  Schema.makeFilter(
+    (value) => {
+      const hasProfile = value.profile !== undefined;
+      const hasCustomProfile = value.customProfile !== undefined;
+      return hasProfile !== hasCustomProfile
+        ? undefined
+        : {
+            path: [],
+            issue: "exactly one of profile or customProfile is required",
+          };
+    },
+    { expected: "exactly one of profile or customProfile" },
+  ),
+);
+export interface SessionConfig extends Schema.Schema.Type<
+  typeof SessionConfig
+> {}
+
+export const SessionConfigWire = Schema.Struct({
+  sessionId: Schema.String,
+  ...SessionConfigBase.fields,
+});
+export interface SessionConfigWire extends Schema.Schema.Type<
+  typeof SessionConfigWire
+> {}
+
+export const SessionIdMeta = Schema.Struct({
+  sessionId: Schema.String,
+});
+export interface SessionIdMeta extends Schema.Schema.Type<
+  typeof SessionIdMeta
+> {}
+
+export const RequestMeta = Schema.Struct({
+  sessionId: Schema.String,
+  url: Schema.String,
+  method: Schema.String,
+  headers: Schema.Array(Pair),
+  headerOrder: Schema.optionalKey(StringArray),
+  hasBody: Schema.Boolean,
+  timeoutMs: Schema.optionalKey(NonNegativeInt),
+  followRedirects: Schema.optionalKey(Schema.Boolean),
+  hostOverride: Schema.optionalKey(Schema.String),
+});
+export interface RequestMeta extends Schema.Schema.Type<typeof RequestMeta> {}
+
+export const ResponseProtocol = Schema.Literals([
+  "HTTP/1.1",
+  "HTTP/2.0",
+  "HTTP/3.0",
+]);
+
+export const ResponseHeadersMeta = Schema.Struct({
+  status: Schema.Int,
+  url: Schema.String,
+  headers: Schema.Array(Pair),
+  protocol: ResponseProtocol,
+});
+export interface ResponseHeadersMeta extends Schema.Schema.Type<
+  typeof ResponseHeadersMeta
+> {}
 
 export const HelloMeta = Schema.Struct({
   protocolVersion: Schema.Int,
@@ -55,6 +233,7 @@ export const ChunkMeta = Schema.Struct({});
 export interface ChunkMeta extends Schema.Schema.Type<typeof ChunkMeta> {}
 
 export const EndMeta = Schema.Struct({
+  protocol: Schema.optionalKey(ResponseProtocol),
   bytesRead: NonNegativeInt,
   bytesWritten: NonNegativeInt,
 });
@@ -79,7 +258,9 @@ export const ErrorKind = Schema.Literals([
   "WsWrite",
   "Protocol",
   "Internal",
+  "Unknown",
 ]);
+export type ErrorKind = Schema.Schema.Type<typeof ErrorKind>;
 
 export const ErrorMeta = Schema.Struct({
   kind: ErrorKind,

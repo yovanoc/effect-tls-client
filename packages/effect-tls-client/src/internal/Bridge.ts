@@ -18,6 +18,10 @@ import {
   BridgeProtocolError,
   BridgeSpawnError,
   BridgeVersionMismatch,
+  SessionConfigError,
+  SessionNotFound,
+  TlsRequestError,
+  isTransientRequestKind,
   type BridgeError,
 } from "./Errors.js";
 import {
@@ -40,6 +44,10 @@ import {
   ErrorMeta,
   HelloAckMeta,
   HelloMeta,
+  RequestMeta,
+  ResponseHeadersMeta,
+  SessionConfigWire,
+  SessionIdMeta,
   PROTOCOL_VERSION,
   decodeEmptyMeta,
   decodeMeta,
@@ -51,7 +59,11 @@ export const PACKAGE_VERSION = packageJson.version;
 const STDERR_TAIL_BYTES = 4096;
 const SHUTDOWN_TIMEOUT_MILLIS = 2000;
 
-type CallKind = typeof FrameKind.debugPing | typeof FrameKind.debugSleep;
+type CallKind =
+  | typeof FrameKind.debugPing
+  | typeof FrameKind.debugSleep
+  | typeof FrameKind.sessionCreate
+  | typeof FrameKind.sessionDestroy;
 
 export interface BridgeVersion {
   readonly packageVersion: string;
@@ -73,9 +85,18 @@ interface PendingStream {
   readonly _tag: "stream";
   readonly queue: Queue.Queue<Uint8Array, BridgeError | Cause.Done>;
   readonly done: Deferred.Deferred<void>;
+  readonly headers: Deferred.Deferred<ResponseHeadersMeta, BridgeError>;
+  readonly end: Deferred.Deferred<unknown, BridgeError>;
+  readonly expectsHeaders: boolean;
+  headersSeen: boolean;
 }
 
 type Pending = PendingDeferred | PendingStream;
+
+export interface BridgeResponse {
+  readonly headers: ResponseHeadersMeta;
+  readonly stream: Stream.Stream<Uint8Array, BridgeError>;
+}
 
 interface State {
   dead: BridgeError | undefined;
@@ -95,6 +116,9 @@ export interface BridgeService {
     kind: typeof FrameKind.debugStream,
     meta?: unknown,
   ) => Stream.Stream<Uint8Array, BridgeError>;
+  readonly request: (
+    meta: unknown,
+  ) => Effect.Effect<BridgeResponse, BridgeError>;
   readonly version: Effect.Effect<BridgeVersion, BridgeError>;
 }
 
@@ -170,6 +194,7 @@ const makeBridge = Effect.gen(function* () {
     );
 
   const pending = new Map<number, Pending>();
+  const activeSessions = new Set<string>();
   const writeSemaphore = yield* Semaphore.make(1);
   const state: State = {
     dead: undefined,
@@ -179,7 +204,9 @@ const makeBridge = Effect.gen(function* () {
     chunkSize: DEFAULT_CHUNK_SIZE,
   };
   const decoder = new FrameDecoder();
-  const getDead = (): BridgeError | undefined => state.dead;
+  const getDead = (): BridgeError | undefined =>
+    state.dead ??
+    (state.closing ? makeBridgeExited(state, null, null) : undefined);
 
   const markDead = (error: BridgeError): void => {
     if (state.dead !== undefined) return;
@@ -189,6 +216,8 @@ const makeBridge = Effect.gen(function* () {
     for (const operation of operations) {
       if (operation._tag === "stream") {
         Queue.failCauseUnsafe(operation.queue, Cause.fail(error));
+        Deferred.doneUnsafe(operation.headers, Effect.fail(error));
+        Deferred.doneUnsafe(operation.end, Effect.fail(error));
         Deferred.doneUnsafe(operation.done, Effect.void);
       } else {
         Deferred.doneUnsafe(operation.deferred, Effect.fail(error));
@@ -261,19 +290,41 @@ const makeBridge = Effect.gen(function* () {
     pending.delete(id);
     if (result === "end") {
       Queue.endUnsafe(operation.queue);
+      Deferred.doneUnsafe(operation.end, Effect.void);
     } else {
       Queue.failCauseUnsafe(operation.queue, Cause.fail(result));
+      Deferred.doneUnsafe(operation.headers, Effect.fail(result));
+      Deferred.doneUnsafe(operation.end, Effect.fail(result));
     }
     Deferred.doneUnsafe(operation.done, Effect.void);
   };
 
-  const errorFromMeta = (meta: SchemaErrorMeta): BridgeProtocolError =>
-    new BridgeProtocolError({
-      message:
-        meta.kind === "Protocol"
-          ? meta.message
-          : `${meta.kind}: ${meta.message}`,
+  const errorFromMeta = (meta: ErrorMeta): BridgeError => {
+    if (meta.kind === "Protocol") {
+      return new BridgeProtocolError({ message: meta.message });
+    }
+    if (meta.kind === "SessionConfig") {
+      return new SessionConfigError({ message: meta.message });
+    }
+    if (meta.kind === "SessionNotFound") {
+      const sessionId =
+        meta.detail !== undefined &&
+        typeof meta.detail["sessionId"] === "string"
+          ? meta.detail["sessionId"]
+          : "";
+      return new SessionNotFound({
+        message: meta.message,
+        sessionId,
+      });
+    }
+    const detail = meta.detail === undefined ? {} : { detail: meta.detail };
+    return new TlsRequestError({
+      ...detail,
+      kind: meta.kind,
+      message: meta.message,
+      isTransient: isTransientRequestKind(meta.kind),
     });
+  };
 
   const handleErrorFrame = (
     frame: Frame,
@@ -308,6 +359,18 @@ const makeBridge = Effect.gen(function* () {
       return handleErrorFrame(frame, operation);
     }
     try {
+      if (operation.expectsHeaders && !operation.headersSeen) {
+        if (frame.kind !== FrameKind.headers || frame.body.byteLength !== 0) {
+          throw failProtocol("expected response headers before body chunks");
+        }
+        const headers = decodeMeta(ResponseHeadersMeta, frame.meta);
+        operation.headersSeen = true;
+        Deferred.doneUnsafe(operation.headers, Effect.succeed(headers));
+        return undefined;
+      }
+      if (!operation.expectsHeaders && frame.kind === FrameKind.headers) {
+        throw failProtocol("unexpected response headers for Bridge stream");
+      }
       if (frame.kind === FrameKind.chunk) {
         if (frame.body.byteLength === 0) {
           throw failProtocol("chunk frame cannot be empty");
@@ -331,7 +394,9 @@ const makeBridge = Effect.gen(function* () {
         completeStream(frame.id, "end");
         return undefined;
       }
-      throw failProtocol("expected chunk, end, or error for Bridge stream");
+      throw failProtocol(
+        "expected headers, chunk, end, or error for Bridge stream",
+      );
     } catch (cause) {
       const error =
         cause instanceof BridgeProtocolError
@@ -450,6 +515,14 @@ const makeBridge = Effect.gen(function* () {
       yield* handle.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore);
       return;
     }
+    for (const sessionId of activeSessions) {
+      yield* writeFrame({
+        kind: FrameKind.sessionDestroy,
+        id: allocateId(),
+        meta: encodeMeta(SessionIdMeta, { sessionId }),
+      }).pipe(Effect.ignore);
+    }
+    activeSessions.clear();
     const deferred = Deferred.makeUnsafe<Frame, BridgeError>();
     pending.set(0, { _tag: "deferred", deferred, expected: "shutdown" });
     yield* writeFrame({
@@ -538,9 +611,21 @@ const makeBridge = Effect.gen(function* () {
 
   const encodeCallMeta = (kind: CallKind, meta: unknown): Uint8Array => {
     if (kind === FrameKind.debugPing) return encodeEmptyMeta(meta);
+    if (kind === FrameKind.debugSleep) {
+      return encodeMeta(
+        DebugSleepMeta,
+        Schema.decodeUnknownSync(DebugSleepMeta)(meta ?? {}),
+      );
+    }
+    if (kind === FrameKind.sessionCreate) {
+      return encodeMeta(
+        SessionConfigWire,
+        Schema.decodeUnknownSync(SessionConfigWire)(meta ?? {}),
+      );
+    }
     return encodeMeta(
-      DebugSleepMeta,
-      Schema.decodeUnknownSync(DebugSleepMeta)(meta ?? {}),
+      SessionIdMeta,
+      Schema.decodeUnknownSync(SessionIdMeta)(meta ?? {}),
     );
   };
 
@@ -594,7 +679,7 @@ const makeBridge = Effect.gen(function* () {
         ? { kind, id, meta: frameMeta }
         : { kind, id, meta: frameMeta, body };
     let requestSent = false;
-    return yield* Effect.onInterrupt(
+    const frame = yield* Effect.onInterrupt(
       Effect.gen(function* () {
         yield* Effect.uninterruptible(
           writeFrame(input).pipe(
@@ -618,6 +703,18 @@ const makeBridge = Effect.gen(function* () {
           }),
         ),
     );
+    if (
+      frame.kind === FrameKind.ok &&
+      typeof meta === "object" &&
+      meta !== null
+    ) {
+      const sessionId = (meta as { readonly sessionId?: unknown }).sessionId;
+      if (typeof sessionId === "string") {
+        if (kind === FrameKind.sessionCreate) activeSessions.add(sessionId);
+        if (kind === FrameKind.sessionDestroy) activeSessions.delete(sessionId);
+      }
+    }
+    return frame;
   });
 
   const encodeStreamMeta = (meta: unknown): Uint8Array =>
@@ -652,8 +749,18 @@ const makeBridge = Effect.gen(function* () {
           BridgeError | Cause.Done
         >();
         const done = Deferred.makeUnsafe<void>();
+        const headers = Deferred.makeUnsafe<ResponseHeadersMeta, BridgeError>();
+        const end = Deferred.makeUnsafe<unknown, BridgeError>();
         const id = allocateId();
-        const operation: PendingStream = { _tag: "stream", queue, done };
+        const operation: PendingStream = {
+          _tag: "stream",
+          queue,
+          done,
+          headers,
+          end,
+          expectsHeaders: false,
+          headersSeen: true,
+        };
         let requestSent = false;
         yield* Effect.onInterrupt(
           Effect.uninterruptible(
@@ -706,6 +813,89 @@ const makeBridge = Effect.gen(function* () {
       }),
     );
 
+  const request = Effect.fnUntraced(function* (meta: unknown) {
+    const initialDead = getDead();
+    if (initialDead !== undefined) return yield* initialDead;
+    const requestMeta = yield* Schema.decodeUnknownEffect(RequestMeta)(
+      meta ?? {},
+    ).pipe(
+      Effect.mapError(
+        (cause) =>
+          new BridgeProtocolError({
+            message: "invalid request metadata",
+            cause,
+          }),
+      ),
+    );
+    const frameMeta = encodeMeta(RequestMeta, requestMeta);
+    const queue = yield* Queue.unbounded<
+      Uint8Array,
+      BridgeError | Cause.Done
+    >();
+    const done = Deferred.makeUnsafe<void>();
+    const headers = Deferred.makeUnsafe<ResponseHeadersMeta, BridgeError>();
+    const end = Deferred.makeUnsafe<unknown, BridgeError>();
+    const id = allocateId();
+    const operation: PendingStream = {
+      _tag: "stream",
+      queue,
+      done,
+      headers,
+      end,
+      expectsHeaders: true,
+      headersSeen: false,
+    };
+    let requestSent = false;
+    const cleanup = () =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (!requestSent) {
+            if (pending.get(id) === operation) pending.delete(id);
+            return;
+          }
+          yield* sendCancel(id).pipe(Effect.ignore);
+          if (pending.get(id) === operation) {
+            yield* Deferred.await(done).pipe(Effect.ignore);
+          }
+        }),
+      );
+    const responseHeaders = yield* Effect.onInterrupt(
+      Effect.gen(function* () {
+        yield* Effect.uninterruptible(
+          Effect.sync(() => pending.set(id, operation)).pipe(
+            Effect.flatMap(() =>
+              writeFrame({
+                kind: FrameKind.request,
+                id,
+                meta: frameMeta,
+              }).pipe(
+                Effect.tap(() => Effect.sync(() => (requestSent = true))),
+              ),
+            ),
+            Effect.tapError(() =>
+              Effect.sync(() => {
+                if (pending.get(id) === operation) pending.delete(id);
+              }),
+            ),
+          ),
+        );
+        return yield* Deferred.await(headers);
+      }),
+      cleanup,
+    );
+    const responseStream = Stream.fromQueue(queue).pipe(
+      Stream.mapEffect((bytes) =>
+        writeFrame({
+          kind: FrameKind.ack,
+          id,
+          meta: encodeMeta(AckMeta, { bytes: bytes.byteLength }),
+        }).pipe(Effect.as(bytes)),
+      ),
+      Stream.ensuring(cleanup()),
+    );
+    return { headers: responseHeaders, stream: responseStream };
+  });
+
   const bridgeVersion: BridgeVersion = {
     packageVersion: PACKAGE_VERSION,
     bridgeVersion: hello.bridgeVersion,
@@ -719,18 +909,15 @@ const makeBridge = Effect.gen(function* () {
   return Bridge.of({
     call,
     stream,
-    version: Effect.suspend(() =>
-      state.dead === undefined
+    request,
+    version: Effect.suspend(() => {
+      const dead = getDead();
+      return dead === undefined
         ? Effect.succeed(bridgeVersion)
-        : Effect.fail(state.dead),
-    ),
+        : Effect.fail(dead);
+    }),
   });
 });
-
-interface SchemaErrorMeta {
-  readonly kind: string;
-  readonly message: string;
-}
 
 export class Bridge extends Context.Service<Bridge, BridgeService>()(
   "effect-tls-client/internal/Bridge",

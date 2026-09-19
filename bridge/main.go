@@ -36,9 +36,10 @@ type bridgeSettings struct {
 }
 
 type operation struct {
-	id      uint32
-	cancel  context.CancelFunc
-	credits *credits
+	id        uint32
+	sessionID string
+	cancel    context.CancelFunc
+	credits   *credits
 }
 
 type credits struct {
@@ -94,6 +95,7 @@ func (c *credits) reserve(ctx context.Context, requested uint64) (uint64, bool) 
 type dispatcher struct {
 	writer     *protocol.Writer
 	settings   bridgeSettings
+	sessions   *sessionStore
 	mu         sync.Mutex
 	operations map[uint32]*operation
 	waitGroup  sync.WaitGroup
@@ -103,16 +105,17 @@ func newDispatcher(writer *protocol.Writer, settings bridgeSettings) *dispatcher
 	return &dispatcher{
 		writer:     writer,
 		settings:   settings,
+		sessions:   newSessionStore(),
 		operations: make(map[uint32]*operation),
 	}
 }
 
-func (d *dispatcher) start(id uint32, credited bool, run func(context.Context, *operation)) error {
+func (d *dispatcher) start(id uint32, credited bool, sessionID string, run func(context.Context, *operation)) error {
 	if id == 0 {
 		return fmt.Errorf("operation id 0 is reserved")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	op := &operation{id: id, cancel: cancel}
+	op := &operation{id: id, sessionID: sessionID, cancel: cancel}
 	if credited {
 		op.credits = newCredits(d.settings.window)
 	}
@@ -170,6 +173,20 @@ func (d *dispatcher) cancel(id uint32) {
 	}
 }
 
+func (d *dispatcher) cancelSession(sessionID string) {
+	d.mu.Lock()
+	operations := make([]*operation, 0)
+	for _, op := range d.operations {
+		if op.sessionID == sessionID {
+			operations = append(operations, op)
+		}
+	}
+	d.mu.Unlock()
+	for _, op := range operations {
+		op.cancel()
+	}
+}
+
 func (d *dispatcher) cancelAll() {
 	d.mu.Lock()
 	operations := make([]*operation, 0, len(d.operations))
@@ -203,7 +220,11 @@ func (d *dispatcher) finishOK(op *operation) error {
 }
 
 func (d *dispatcher) finishError(op *operation, kind protocol.ErrorKind, message string) error {
-	meta, err := protocol.EncodeMeta(protocol.ErrorMeta{Kind: kind, Message: message})
+	return d.finishErrorDetail(op, kind, message, nil)
+}
+
+func (d *dispatcher) finishErrorDetail(op *operation, kind protocol.ErrorKind, message string, detail map[string]interface{}) error {
+	meta, err := protocol.EncodeMeta(protocol.ErrorMeta{Kind: kind, Message: message, Detail: detail})
 	if err != nil {
 		return err
 	}
@@ -386,7 +407,7 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		if len(frame.Body) != 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.ping does not accept a body")
 		}
-		if err := d.start(frame.ID, false, func(ctx context.Context, op *operation) {
+		if err := d.start(frame.ID, false, "", func(ctx context.Context, op *operation) {
 			_ = d.finishOK(op)
 		}); err != nil {
 			return false, err
@@ -410,7 +431,7 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		if meta.Ms > maxSleepMilliseconds {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.sleep ms is too large")
 		}
-		if err := d.start(frame.ID, false, func(ctx context.Context, op *operation) {
+		if err := d.start(frame.ID, false, "", func(ctx context.Context, op *operation) {
 			d.runSleep(ctx, op, meta)
 		}); err != nil {
 			return false, err
@@ -434,8 +455,77 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		if meta.Size != 0 && meta.Chunks > ^uint64(0)/meta.Size {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.stream byte count overflows")
 		}
-		if err := d.start(frame.ID, true, func(ctx context.Context, op *operation) {
+		if err := d.start(frame.ID, true, "", func(ctx context.Context, op *operation) {
 			d.runStream(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindSessionCreate:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "session.create id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "session.create does not accept a body")
+		}
+		var meta protocol.SessionConfigMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runSessionCreate(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindSessionDestroy:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "session.destroy id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "session.destroy does not accept a body")
+		}
+		var meta protocol.SessionIDMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if meta.SessionID == "" {
+			return false, writeProtocolError(d.writer, frame.ID, "sessionId is required")
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runSessionDestroy(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindRequest:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "request id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "request does not accept a body")
+		}
+		var meta protocol.RequestMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if meta.SessionID == "" {
+			return false, writeProtocolError(d.writer, frame.ID, "sessionId is required")
+		}
+		if err := d.start(frame.ID, true, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runRequest(ctx, op, meta)
 		}); err != nil {
 			return false, err
 		}
@@ -488,6 +578,7 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 			return false, writeProtocolError(d.writer, frame.ID, "shutdown does not accept a body")
 		}
 		d.stop()
+		d.sessions.closeAll()
 		return true, writeEmptyResponse(d.writer, protocol.KindOk, 0)
 
 	case protocol.KindHello:
