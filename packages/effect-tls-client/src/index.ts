@@ -10,4 +10,4 @@ export type { BridgeError } from "./internal/Errors.js";
 export type { BridgeVersion } from "./internal/Bridge.js";
 
 /** The library's own release version, used in the Bridge handshake. */
-export const version = "0.0.0";
+export { PACKAGE_VERSION as version } from "./internal/Bridge.js";

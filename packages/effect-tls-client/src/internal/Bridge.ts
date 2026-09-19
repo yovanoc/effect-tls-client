@@ -1,3 +1,4 @@
+import packageJson from "../../package.json" with { type: "json" };
 import { Context, Deferred, Duration, Effect, Layer, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { resolveBridgeBinary } from "./BridgeBinary.js";
@@ -27,7 +28,7 @@ import {
   encodeMeta,
 } from "./Protocol.js";
 
-export const PACKAGE_VERSION = "0.0.0";
+export const PACKAGE_VERSION = packageJson.version;
 const STDERR_TAIL_BYTES = 4096;
 const SHUTDOWN_TIMEOUT_MILLIS = 2000;
 
@@ -49,10 +50,6 @@ interface State {
   closing: boolean;
   nextId: number;
   stderrTail: Uint8Array;
-  stderrDone: boolean;
-  exit:
-    | { readonly exitCode: number | null; readonly signal: string | null }
-    | undefined;
 }
 
 export interface BridgeService {
@@ -148,8 +145,6 @@ function makeBridge() {
       closing: false,
       nextId: 1,
       stderrTail: new Uint8Array(0),
-      stderrDone: false,
-      exit: undefined,
     };
     const decoder = new FrameDecoder();
 
@@ -163,36 +158,25 @@ function makeBridge() {
       }
     };
 
-    const maybeMarkExited = (): void => {
-      if (state.exit !== undefined && state.stderrDone) {
-        markDead(
-          makeBridgeExited(state, state.exit.exitCode, state.exit.signal),
-        );
-      }
-    };
-
     const markExited = (
       exitCode: number | null,
       signal: string | null,
     ): void => {
-      state.exit = { exitCode, signal };
-      maybeMarkExited();
+      markDead(makeBridgeExited(state, exitCode, signal));
     };
 
     const appendStderr = (chunk: Uint8Array): void => {
-      const total = Math.min(
-        STDERR_TAIL_BYTES,
-        state.stderrTail.byteLength + chunk.byteLength,
+      const chunkStart = Math.max(0, chunk.byteLength - STDERR_TAIL_BYTES);
+      const retainedChunk = chunk.subarray(chunkStart);
+      const retainedOld = Math.min(
+        state.stderrTail.byteLength,
+        STDERR_TAIL_BYTES - retainedChunk.byteLength,
       );
-      const next = new Uint8Array(total);
-      const oldStart = Math.max(0, state.stderrTail.byteLength - total);
-      const chunkStart = Math.max(0, chunk.byteLength - total);
-      const old = state.stderrTail.slice(oldStart);
-      next.set(old.slice(0, total), 0);
+      const next = new Uint8Array(retainedOld + retainedChunk.byteLength);
       next.set(
-        chunk.slice(chunkStart),
-        Math.max(0, total - (chunk.byteLength - chunkStart)),
+        state.stderrTail.subarray(state.stderrTail.byteLength - retainedOld),
       );
+      next.set(retainedChunk, retainedOld);
       state.stderrTail = next;
     };
 
@@ -344,12 +328,6 @@ function makeBridge() {
     const stderrLoop = handle.stderr.pipe(
       Stream.runForEach((chunk) => Effect.sync(() => appendStderr(chunk))),
       Effect.ignoreCause,
-      Effect.tap(() =>
-        Effect.sync(() => {
-          state.stderrDone = true;
-          maybeMarkExited();
-        }),
-      ),
     );
 
     const release = Effect.gen(function* () {

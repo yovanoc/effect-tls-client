@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 
+import { spawn } from "node:child_process";
+import packageJson from "../../package.json" with { type: "json" };
+
 const mismatch = process.argv.includes("--mismatch");
 const exitOnPing = process.argv.includes("--exit");
+const delayedStderr = process.argv.includes("--delayed-stderr");
 let buffer = Buffer.alloc(0);
 const writeFrame = (kind, id, metadata = {}) => {
   const meta = Buffer.from(JSON.stringify(metadata));
@@ -28,14 +32,35 @@ process.stdin.on("data", (chunk) => {
     if (kind === 0x01) {
       writeFrame(0x80, 0, {
         protocolVersion: 1,
-        bridgeVersion: mismatch ? "9.9.9" : "0.0.0",
+        bridgeVersion: mismatch
+          ? `${packageJson.version}-mismatch`
+          : packageJson.version,
         tlsClientVersion: "fixture",
         goVersion: "fixture-go",
       });
     } else if (kind === 0xf0) {
       if (exitOnPing) {
-        process.stderr.write("x".repeat(5000), () =>
-          process.kill(process.pid, "SIGKILL"),
+        const writeStderrChunk = (chunk, next) =>
+          process.stderr.write(chunk, () => setTimeout(next, 10));
+        const finishExit = () => {
+          if (!delayedStderr) {
+            process.kill(process.pid, "SIGKILL");
+            return;
+          }
+          const holder = spawn(
+            process.execPath,
+            ["-e", "setTimeout(() => process.exit(0), 1000)"],
+            { stdio: ["ignore", "ignore", process.stderr] },
+          );
+          holder.unref();
+          process.stderr.write(`holder:${holder.pid}\n`, () =>
+            process.kill(process.pid, "SIGKILL"),
+          );
+        };
+        writeStderrChunk("a".repeat(2000), () =>
+          writeStderrChunk("b".repeat(2000), () =>
+            process.stderr.write("c".repeat(2000), finishExit),
+          ),
         );
       } else {
         writeFrame(0x81, id, {});

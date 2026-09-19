@@ -33,6 +33,7 @@
     "prepare": "effect-tsgo patch --typescript --oxlint",
     "build": "tsdown",
     "test": "vitest run",
+    "test:bun": "bun tests/bridge.bun.ts",
     "dev:test": "vitest",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",

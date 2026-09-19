@@ -1,13 +1,17 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Effect, Layer } from "effect";
+import { ConfigProvider, Duration, Effect, Layer } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/internal/Bridge.js";
 import { FrameKind } from "../src/internal/Frame.js";
 import { TlsClient } from "../src/TlsClient.js";
+import { version } from "../src/index.js";
 
 const fixturePath = fileURLToPath(
   new URL("./fixtures/bridge-fixture.mjs", import.meta.url),
+);
+const delayedStderrFixturePath = fileURLToPath(
+  new URL("./fixtures/bridge-delayed-stderr-fixture.mjs", import.meta.url),
 );
 
 const withClientAt = <A, E>(
@@ -67,8 +71,8 @@ describe("Bridge lifecycle", () => {
           const client = yield* TlsClient;
           const result = yield* client.version;
           expect(result).toEqual({
-            packageVersion: "0.0.0",
-            bridgeVersion: "0.0.0",
+            packageVersion: version,
+            bridgeVersion: version,
             protocolVersion: 1,
             tlsClientVersion: "fixture",
             goVersion: "fixture-go",
@@ -115,6 +119,10 @@ describe("Bridge lifecycle", () => {
       Effect.tap((error) =>
         Effect.sync(() => {
           expect(error._tag).toBe("BridgeVersionMismatch");
+          if (error._tag === "BridgeVersionMismatch") {
+            expect(error.expected).toBe(version);
+            expect(error.actual).toBe(`${version}-mismatch`);
+          }
         }),
       ),
     ),
@@ -138,7 +146,30 @@ describe("Bridge lifecycle", () => {
           if (error._tag === "BridgeExited") {
             expect(error.exitCode).toBeNull();
             expect(error.signal).toBe("SIGKILL");
-            expect(error.stderrTail).toHaveLength(4096);
+            expect(error.stderrTail).toBe(
+              `${"a".repeat(96)}${"b".repeat(2000)}${"c".repeat(2000)}`,
+            );
+          }
+        }),
+      ),
+    ),
+  );
+
+  it.effect("fails pending calls before stderr closes after process exit", () =>
+    Effect.flip(
+      withBridgeAt(
+        delayedStderrFixturePath,
+        Effect.gen(function* () {
+          const bridge = yield* Bridge;
+          yield* bridge.call(FrameKind.debugPing);
+        }),
+      ).pipe(Effect.timeout(Duration.millis(500))),
+    ).pipe(
+      Effect.tap((error) =>
+        Effect.sync(() => {
+          expect(error._tag).toBe("BridgeExited");
+          if (error._tag === "BridgeExited") {
+            expect(error.signal).toBe("SIGKILL");
           }
         }),
       ),

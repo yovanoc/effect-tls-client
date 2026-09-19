@@ -18,6 +18,13 @@ func TestVersionString(t *testing.T) {
 	}
 }
 
+func TestTlsClientVersionFromBuildInfo(t *testing.T) {
+	got := tlsClientVersion()
+	if got == "" || got == "unknown" {
+		t.Fatalf("tlsClientVersion() = %q, want the embedded module version", got)
+	}
+}
+
 func TestRunHandshakePingShutdown(t *testing.T) {
 	hello, err := protocol.EncodeMeta(protocol.HelloMeta{
 		ProtocolVersion: protocolVersion,
@@ -55,7 +62,7 @@ func TestRunHandshakePingShutdown(t *testing.T) {
 	if err := protocol.DecodeObject(ack.Meta, &ackMeta); err != nil {
 		t.Fatal(err)
 	}
-	if ackMeta.ProtocolVersion != protocolVersion || ackMeta.BridgeVersion != version || ackMeta.TlsClientVersion != tlsClientVersion || ackMeta.GoVersion != runtime.Version() {
+	if ackMeta.ProtocolVersion != protocolVersion || ackMeta.BridgeVersion != version || ackMeta.TlsClientVersion != tlsClientVersion() || ackMeta.GoVersion != runtime.Version() {
 		t.Fatalf("helloAck metadata = %+v", ackMeta)
 	}
 

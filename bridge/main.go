@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"runtime/debug"
 
 	"github.com/yovanoc/effect-tls-client/bridge/protocol"
 
@@ -17,7 +18,7 @@ import (
 )
 
 const protocolVersion = 1
-const tlsClientVersion = "v1.16.0"
+const tlsClientModule = "github.com/bogdanfinn/tls-client"
 
 // version is stamped by release builds with -ldflags -X main.version=.... The
 // default matches the scaffold package version so local end-to-end builds can
@@ -90,7 +91,7 @@ func writeHelloAck(writer *protocol.Writer) error {
 	meta, err := protocol.EncodeMeta(protocol.HelloAckMeta{
 		ProtocolVersion:  protocolVersion,
 		BridgeVersion:    version,
-		TlsClientVersion: tlsClientVersion,
+		TlsClientVersion: tlsClientVersion(),
 		GoVersion:        runtime.Version(),
 	})
 	if err != nil {
@@ -155,6 +156,23 @@ func writeProtocolError(writer *protocol.Writer, id uint32, message string) erro
 
 func logProtocolError(diagnostics io.Writer, err error) {
 	fmt.Fprintf(diagnostics, "protocol error: %v\n", err)
+}
+
+func tlsClientVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	for _, dependency := range info.Deps {
+		if dependency.Path != tlsClientModule {
+			continue
+		}
+		if dependency.Replace != nil {
+			return dependency.Replace.Version
+		}
+		return dependency.Version
+	}
+	return "unknown"
 }
 
 func versionString() string {

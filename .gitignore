@@ -5,4 +5,5 @@ bridge/bridge
 packages/bridge-*/bin/*
 !packages/bridge-*/bin/.gitkeep
 .turbo/
+.vitest/
 .env
