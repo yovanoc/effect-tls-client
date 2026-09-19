@@ -8,6 +8,7 @@ import {
   Layer,
   Queue,
   Schema,
+  Semaphore,
   Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -169,6 +170,7 @@ const makeBridge = Effect.gen(function* () {
     );
 
   const pending = new Map<number, Pending>();
+  const writeSemaphore = yield* Semaphore.make(1);
   const state: State = {
     dead: undefined,
     closing: false,
@@ -222,12 +224,18 @@ const makeBridge = Effect.gen(function* () {
       }),
     );
 
+  // Every normal, cancellation, and acknowledgement frame uses this one
+  // permit, so concurrent fibers cannot interleave writes on stdin.
   const writeFrame = (input: FrameInput): Effect.Effect<void, BridgeError> =>
     Effect.try({
       try: () => encodeFrame(input),
       catch: (cause) =>
         new BridgeProtocolError({ message: errorMessage(cause), cause }),
-    }).pipe(Effect.flatMap(writeBytes));
+    }).pipe(
+      Effect.flatMap((bytes) =>
+        writeSemaphore.withPermit(Effect.uninterruptible(writeBytes(bytes))),
+      ),
+    );
 
   const failProtocol = (
     message: string,
@@ -585,10 +593,12 @@ const makeBridge = Effect.gen(function* () {
       body === undefined
         ? { kind, id, meta: frameMeta }
         : { kind, id, meta: frameMeta, body };
+    let requestSent = false;
     return yield* Effect.onInterrupt(
       Effect.gen(function* () {
         yield* Effect.uninterruptible(
           writeFrame(input).pipe(
+            Effect.tap(() => Effect.sync(() => (requestSent = true))),
             Effect.tapError(() => Effect.sync(() => pending.delete(id))),
           ),
         );
@@ -597,6 +607,10 @@ const makeBridge = Effect.gen(function* () {
       () =>
         Effect.uninterruptible(
           Effect.gen(function* () {
+            if (!requestSent) {
+              if (pending.get(id) === operation) pending.delete(id);
+              return;
+            }
             yield* sendCancel(id).pipe(Effect.ignore);
             if (pending.get(id) === operation) {
               yield* Deferred.await(deferred).pipe(Effect.ignore);
@@ -640,15 +654,35 @@ const makeBridge = Effect.gen(function* () {
         const done = Deferred.makeUnsafe<void>();
         const id = allocateId();
         const operation: PendingStream = { _tag: "stream", queue, done };
-        pending.set(id, operation);
-        yield* Effect.uninterruptible(
-          writeFrame({ kind, id, meta: frameMeta }).pipe(
-            Effect.tapError(() =>
-              Effect.sync(() => {
-                if (pending.get(id) === operation) pending.delete(id);
-              }),
+        let requestSent = false;
+        yield* Effect.onInterrupt(
+          Effect.uninterruptible(
+            Effect.sync(() => pending.set(id, operation)).pipe(
+              Effect.flatMap(() =>
+                writeFrame({ kind, id, meta: frameMeta }).pipe(
+                  Effect.tap(() => Effect.sync(() => (requestSent = true))),
+                ),
+              ),
+              Effect.tapError(() =>
+                Effect.sync(() => {
+                  if (pending.get(id) === operation) pending.delete(id);
+                }),
+              ),
             ),
           ),
+          () =>
+            Effect.uninterruptible(
+              Effect.gen(function* () {
+                if (!requestSent) {
+                  if (pending.get(id) === operation) pending.delete(id);
+                  return;
+                }
+                yield* sendCancel(id).pipe(Effect.ignore);
+                if (pending.get(id) === operation) {
+                  yield* Deferred.await(done).pipe(Effect.ignore);
+                }
+              }),
+            ),
         );
         return Stream.fromQueue(queue).pipe(
           Stream.mapEffect((bytes) =>

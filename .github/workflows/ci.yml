@@ -23,9 +23,7 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      - run: bunx turbo run build test lint format
-
-      - name: Build Bridge for Bun smoke test
+      - name: Build Bridge for integration tests
         run: |
           package_version="$(
             bun -e 'console.log(
@@ -37,14 +35,17 @@ jobs:
             -ldflags "-X main.version=$package_version" \
             -o "$RUNNER_TEMP/effect-tls-client-bridge" .
 
+      - name: Run Turbo checks with the built Bridge
+        env:
+          TLS_CLIENT_BRIDGE_PATH: ${{ runner.temp }}/effect-tls-client-bridge
+        run: bunx turbo run build test lint format --force
+
       - name: Test real Bridge with Bun
-        run: >-
-          cd packages/effect-tls-client &&
-          TLS_CLIENT_BRIDGE_PATH="$RUNNER_TEMP/effect-tls-client-bridge"
-          bun run test:bun
+        env:
+          TLS_CLIENT_BRIDGE_PATH: ${{ runner.temp }}/effect-tls-client-bridge
+        run: bun run --cwd packages/effect-tls-client test:bun
 
       - name: Test real Bridge with Node
-        run: >-
-          cd packages/effect-tls-client &&
-          TLS_CLIENT_BRIDGE_PATH="$RUNNER_TEMP/effect-tls-client-bridge"
-          node tests/bridge.node.mjs
+        env:
+          TLS_CLIENT_BRIDGE_PATH: ${{ runner.temp }}/effect-tls-client-bridge
+        run: node packages/effect-tls-client/tests/bridge.node.mjs

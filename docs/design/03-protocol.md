@@ -71,12 +71,13 @@ Go → JS
 1. **Every op ends with exactly one terminal frame, always sent by Go** (`ok`, `error`, `end`, `ws.closed`, `helloAck`). JS never closes a pending op itself except when the process exits (`BridgeExited`).
 2. After the terminal frame Go sends nothing more for that id; frames for unknown/finished ids are dropped by both sides (late `cancel`/`ack` are no-ops).
 3. `cancel` on a live op → Go cancels its `context`, cleans up, sends `error{kind:"Cancelled"}`. If the op already completed, nothing happens.
-4. Frame order within an id is significant; across ids there is no ordering guarantee.
-5. **Credits.** `window` (from `hello`, default 1 MiB) is the per-id budget for credited kinds (`chunk`, `ws.frame` Go→JS; `body.chunk` JS→Go). `helloAck` repeats the negotiated positive `window` and `chunkSize`; older peers may omit those additive fields, in which case the hello values (or defaults) remain in force. The producer stops when `sent − acked ≥ window` and resumes on `ack{bytes}`. A consumer acks bytes it has handed to its consumer, not bytes received. Credit is per id, never shared; an acknowledgement cannot create more credit than the id has sent.
-6. All body chunks are ≤ `chunkSize` (from `hello`, default 64 KiB); the last chunk may be smaller; zero-length chunks are not sent.
-7. Bodies are raw bytes end to end. No base64 anywhere.
-8. Go exits when stdin reaches EOF (after best-effort session/socket cleanup). JS scope close = `shutdown` → wait ≤ 2 s for `ok`/exit → `kill`.
-9. JS fails the handshake with `BridgeVersionMismatch` unless `bridgeVersion === clientVersion` and `protocolVersion === 1`.
+4. A malformed `cancel` or `ack` for a live id is a connection-level protocol failure: Go emits no error frame for that id and exits with status 2 after cleanup, so the live operation can still emit only its own terminal frame. Unknown or finished `cancel`/`ack` frames are no-ops, including malformed metadata. A start frame that reuses an active id is handled the same way; it never emits a second terminal frame for the owned operation.
+5. Frame order within an id is significant; across ids there is no ordering guarantee.
+6. **Credits.** `window` (from `hello`, default 1 MiB) is the per-id budget for credited kinds (`chunk`, `ws.frame` Go→JS; `body.chunk` JS→Go). `helloAck` repeats the negotiated positive `window` and `chunkSize`; older peers may omit those additive fields, in which case the hello values (or defaults) remain in force. The producer stops when `sent − acked ≥ window` and resumes on `ack{bytes}`. A consumer acks bytes it has handed to its consumer, not bytes received. Credit is per id, never shared; an acknowledgement cannot create more credit than the id has sent.
+7. All body chunks are ≤ `chunkSize` (from `hello`, default 64 KiB); the last chunk may be smaller; zero-length chunks are not sent.
+8. Bodies are raw bytes end to end. No base64 anywhere.
+9. Go exits when stdin reaches EOF (after best-effort session/socket cleanup). JS scope close = `shutdown` → wait ≤ 2 s for `ok`/exit → `kill`.
+10. JS fails the handshake with `BridgeVersionMismatch` unless `bridgeVersion === clientVersion` and `protocolVersion === 1`.
 
 ## 4. Common types
 
@@ -167,4 +168,16 @@ Classification happens in Go via `errors.As`/`errors.Is` (`net.OpError`, `*net.D
 
 ## 10. Versioning
 
-`protocolVersion` is an integer in `hello`/`helloAck`; any incompatible change bumps it. Package and Bridge versions are always equal (lockstep publish), so in practice compatibility = same version. Additive fields in meta are allowed without a bump; unknown meta fields are ignored by both sides. In particular, `helloAck.window` and `helloAck.chunkSize` are optional for compatibility with an issue #3 Bridge.
+`protocolVersion` is an integer in `hello`/`helloAck`; any incompatible change bumps it. Package and Bridge versions are always equal (lockstep publish), so in practice compatibility = same version. Additive fields in meta are allowed without a bump; unknown meta fields are ignored by both sides. In particular, `helloAck.window` and `helloAck.chunkSize` are optional for compatibility with an earlier Bridge.
+
+## 11. Real Bridge tests
+
+Build a local Bridge and pass its path explicitly so the real cancellation, credit, and concurrency tests run:
+
+```sh
+go build -C bridge -ldflags "-X main.version=0.0.0" -o /tmp/effect-tls-client-bridge .
+TLS_CLIENT_BRIDGE_PATH=/tmp/effect-tls-client-bridge \
+  bun run --cwd packages/effect-tls-client test -- tests/bridge.test.ts
+```
+
+Without `TLS_CLIENT_BRIDGE_PATH`, those real-process tests are skipped; CI sets it before the Turbo test task, and a configured missing path fails the tests rather than skipping them.

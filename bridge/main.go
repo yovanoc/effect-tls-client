@@ -121,7 +121,7 @@ func (d *dispatcher) start(id uint32, credited bool, run func(context.Context, *
 	if _, exists := d.operations[id]; exists {
 		d.mu.Unlock()
 		cancel()
-		return fmt.Errorf("operation id %d is already active", id)
+		return fmt.Errorf("%w: operation id %d is already active", protocol.ErrProtocol, id)
 	}
 	d.operations[id] = op
 	d.waitGroup.Add(1)
@@ -138,6 +138,13 @@ func (d *dispatcher) operation(id uint32) *operation {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.operations[id]
+}
+
+func (d *dispatcher) ensureAvailable(id uint32) error {
+	if d.operation(id) != nil {
+		return fmt.Errorf("%w: operation id %d is already active", protocol.ErrProtocol, id)
+	}
+	return nil
 }
 
 func (d *dispatcher) isCurrent(op *operation) bool {
@@ -309,7 +316,7 @@ func run(input io.Reader, output io.Writer, diagnostics io.Writer) int {
 
 		done, err := d.dispatch(frame)
 		if err != nil {
-			fmt.Fprintf(diagnostics, "write response: %v\n", err)
+			logProtocolError(diagnostics, err)
 			return 2
 		}
 		if done {
@@ -335,11 +342,6 @@ func decodeHello(frame protocol.Frame) (protocol.HelloMeta, error) {
 	return meta, nil
 }
 
-func validateHello(frame protocol.Frame) error {
-	_, err := decodeHello(frame)
-	return err
-}
-
 func negotiateHello(meta protocol.HelloMeta) (bridgeSettings, error) {
 	settings := bridgeSettings{window: protocol.DefaultWindow, chunkSize: protocol.DefaultChunkSize}
 	if meta.Window != 0 {
@@ -352,13 +354,6 @@ func negotiateHello(meta protocol.HelloMeta) (bridgeSettings, error) {
 		return bridgeSettings{}, fmt.Errorf("%w: chunkSize %d exceeds frame limit", protocol.ErrProtocol, settings.chunkSize)
 	}
 	return settings, nil
-}
-
-func writeHelloAck(writer *protocol.Writer) error {
-	return writeHelloAckWithSettings(writer, bridgeSettings{
-		window:    protocol.DefaultWindow,
-		chunkSize: protocol.DefaultChunkSize,
-	})
 }
 
 func writeHelloAckWithSettings(writer *protocol.Writer, settings bridgeSettings) error {
@@ -382,17 +377,28 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		if frame.ID == 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.ping id 0 is reserved")
 		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
 		if err := protocol.DecodeEmpty(frame.Meta); err != nil {
 			return false, writeProtocolError(d.writer, frame.ID, err.Error())
 		}
 		if len(frame.Body) != 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.ping does not accept a body")
 		}
-		return false, writeEmptyResponse(d.writer, protocol.KindOk, frame.ID)
+		if err := d.start(frame.ID, false, func(ctx context.Context, op *operation) {
+			_ = d.finishOK(op)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
 
 	case protocol.KindDebugSleep:
 		if frame.ID == 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.sleep id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
 		}
 		if len(frame.Body) != 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.sleep does not accept a body")
@@ -407,13 +413,16 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		if err := d.start(frame.ID, false, func(ctx context.Context, op *operation) {
 			d.runSleep(ctx, op, meta)
 		}); err != nil {
-			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+			return false, err
 		}
 		return false, nil
 
 	case protocol.KindDebugStream:
 		if frame.ID == 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.stream id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
 		}
 		if len(frame.Body) != 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "debug.stream does not accept a body")
@@ -428,7 +437,7 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		if err := d.start(frame.ID, true, func(ctx context.Context, op *operation) {
 			d.runStream(ctx, op, meta)
 		}); err != nil {
-			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+			return false, err
 		}
 		return false, nil
 
@@ -440,10 +449,10 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 			return false, nil
 		}
 		if err := protocol.DecodeEmpty(frame.Meta); err != nil {
-			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+			return false, err
 		}
 		if len(frame.Body) != 0 {
-			return false, writeProtocolError(d.writer, frame.ID, "cancel does not accept a body")
+			return false, fmt.Errorf("%w: cancel does not accept a body", protocol.ErrProtocol)
 		}
 		d.cancel(frame.ID)
 		return false, nil
@@ -457,11 +466,11 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 			return false, nil
 		}
 		if len(frame.Body) != 0 {
-			return false, writeProtocolError(d.writer, frame.ID, "ack does not accept a body")
+			return false, fmt.Errorf("%w: ack does not accept a body", protocol.ErrProtocol)
 		}
 		var meta protocol.AckMeta
 		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
-			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+			return false, err
 		}
 		if op.credits != nil {
 			op.credits.ack(meta.Bytes)
@@ -488,19 +497,6 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 	default:
 		return false, writeProtocolError(d.writer, frame.ID, fmt.Sprintf("frame kind 0x%02x is not implemented", byte(frame.Kind)))
 	}
-}
-
-// dispatch preserves the issue #3 helper for package-local tests and callers.
-func dispatch(writer *protocol.Writer, frame protocol.Frame) (bool, error) {
-	d := newDispatcher(writer, bridgeSettings{
-		window:    protocol.DefaultWindow,
-		chunkSize: protocol.DefaultChunkSize,
-	})
-	done, err := d.dispatch(frame)
-	if done {
-		d.stop()
-	}
-	return done, err
 }
 
 func writeEmptyResponse(writer *protocol.Writer, kind protocol.Kind, id uint32) error {

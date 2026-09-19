@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"runtime"
 	"testing"
@@ -159,6 +160,78 @@ func TestRunMalformedFrameExitsTwo(t *testing.T) {
 	}
 }
 
+func TestRunRejectsBusyIdProtocolViolations(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame protocol.Frame
+	}{
+		{
+			name: "malformed cancel",
+			frame: protocol.Frame{
+				Kind: protocol.KindCancel,
+				ID:   1,
+				Meta: []byte(`[]`),
+			},
+		},
+		{
+			name: "duplicate start",
+			frame: protocol.Frame{
+				Kind: protocol.KindDebugSleep,
+				ID:   1,
+				Meta: []byte(`{"ms":1000}`),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hello, err := protocol.EncodeMeta(protocol.HelloMeta{
+				ProtocolVersion: protocolVersion,
+				ClientVersion:   version,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sleep, err := protocol.EncodeMeta(protocol.DebugSleepMeta{Ms: 1000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var input bytes.Buffer
+			for _, frame := range []protocol.Frame{
+				{Kind: protocol.KindHello, ID: 0, Meta: hello},
+				{Kind: protocol.KindDebugSleep, ID: 1, Meta: sleep},
+				test.frame,
+			} {
+				if err := protocol.WriteFrame(&input, frame); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var output bytes.Buffer
+			if code := run(&input, &output, io.Discard); code != 2 {
+				t.Fatalf("run() exit code = %d, want 2", code)
+			}
+			if frame := readTestFrame(t, &output); frame.Kind != protocol.KindHelloAck || frame.ID != 0 {
+				t.Fatalf("hello response = %+v", frame)
+			}
+			terminal := readTestFrame(t, &output)
+			if terminal.Kind != protocol.KindError || terminal.ID != 1 {
+				t.Fatalf("operation terminal = %+v", terminal)
+			}
+			var errorMeta protocol.ErrorMeta
+			if err := protocol.DecodeObject(terminal.Meta, &errorMeta); err != nil {
+				t.Fatal(err)
+			}
+			if errorMeta.Kind != protocol.ErrorKindCancelled {
+				t.Fatalf("error kind = %q, want %q", errorMeta.Kind, protocol.ErrorKindCancelled)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("busy id produced an extra terminal frame: %d bytes", output.Len())
+			}
+		})
+	}
+}
+
 type frameWriter struct {
 	frames chan protocol.Frame
 }
@@ -236,11 +309,64 @@ func TestDebugSleepCancelSendsOneCancelledTerminal(t *testing.T) {
 	}
 	assertNoTestFrame(t, writer.frames)
 
-	if _, err := dispatcher.dispatch(protocol.Frame{Kind: protocol.KindCancel, ID: 1, Meta: []byte(`{}`)}); err != nil {
+	for _, frame := range []protocol.Frame{
+		{Kind: protocol.KindCancel, ID: 1, Meta: []byte(`[]`)},
+		{Kind: protocol.KindAck, ID: 1, Meta: []byte(`[]`), Body: []byte{1}},
+	} {
+		if _, err := dispatcher.dispatch(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertNoTestFrame(t, writer.frames)
+}
+
+func TestDebugStreamSplitsLogicalChunksAtChunkSize(t *testing.T) {
+	writer := &frameWriter{frames: make(chan protocol.Frame, 2048)}
+	dispatcher := newDispatcher(protocol.NewWriter(writer), bridgeSettings{
+		window:    64,
+		chunkSize: 4,
+	})
+	defer dispatcher.stop()
+
+	streamMeta, err := protocol.EncodeMeta(protocol.DebugStreamMeta{Chunks: 2, Size: 10})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dispatcher.dispatch(protocol.Frame{Kind: protocol.KindAck, ID: 1, Meta: []byte(`{"bytes":1}`)}); err != nil {
+	if _, err := dispatcher.dispatch(protocol.Frame{
+		Kind: protocol.KindDebugStream,
+		ID:   2,
+		Meta: streamMeta,
+	}); err != nil {
 		t.Fatal(err)
+	}
+
+	var body []byte
+	for index := 0; index < 6; index++ {
+		frame := nextTestFrame(t, writer.frames)
+		if frame.Kind != protocol.KindChunk || frame.ID != 2 {
+			t.Fatalf("chunk %d = %+v", index, frame)
+		}
+		if len(frame.Body) == 0 || uint64(len(frame.Body)) > dispatcher.settings.chunkSize {
+			t.Fatalf("chunk %d length = %d, want 1..%d", index, len(frame.Body), dispatcher.settings.chunkSize)
+		}
+		body = append(body, frame.Body...)
+	}
+	end := nextTestFrame(t, writer.frames)
+	if end.Kind != protocol.KindEnd || end.ID != 2 {
+		t.Fatalf("end frame = %+v", end)
+	}
+	var endMeta protocol.EndMeta
+	if err := protocol.DecodeObject(end.Meta, &endMeta); err != nil {
+		t.Fatal(err)
+	}
+	if endMeta.BytesRead != 20 || endMeta.BytesWritten != 0 {
+		t.Fatalf("end metadata = %+v", endMeta)
+	}
+	if !bytes.Equal(body, []byte{
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+		10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+	}) {
+		t.Fatalf("stream body = %v", body)
 	}
 	assertNoTestFrame(t, writer.frames)
 }
@@ -302,6 +428,85 @@ func TestDebugStreamCreditsAndCounters(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoTestFrame(t, writer.frames)
+}
+
+func TestMalformedLiveControlsRejectConnectionWithoutBusyTerminal(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame protocol.Frame
+	}{
+		{
+			name: "cancel metadata",
+			frame: protocol.Frame{
+				Kind: protocol.KindCancel,
+				ID:   1,
+				Meta: []byte(`[]`),
+			},
+		},
+		{
+			name: "cancel body",
+			frame: protocol.Frame{
+				Kind: protocol.KindCancel,
+				ID:   1,
+				Meta: []byte(`{}`),
+				Body: []byte{1},
+			},
+		},
+		{
+			name: "ack metadata",
+			frame: protocol.Frame{
+				Kind: protocol.KindAck,
+				ID:   1,
+				Meta: []byte(`[]`),
+			},
+		},
+		{
+			name: "ack body",
+			frame: protocol.Frame{
+				Kind: protocol.KindAck,
+				ID:   1,
+				Meta: []byte(`{"bytes":1}`),
+				Body: []byte{1},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dispatcher, writer := newTestDispatcher()
+			defer dispatcher.stop()
+
+			sleepMeta, err := protocol.EncodeMeta(protocol.DebugSleepMeta{Ms: 1000})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := dispatcher.dispatch(protocol.Frame{
+				Kind: protocol.KindDebugSleep,
+				ID:   1,
+				Meta: sleepMeta,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := dispatcher.dispatch(test.frame); !errors.Is(err, protocol.ErrProtocol) {
+				t.Fatalf("dispatch error = %v, want protocol violation", err)
+			}
+			assertNoTestFrame(t, writer.frames)
+
+			dispatcher.stop()
+			terminal := nextTestFrame(t, writer.frames)
+			if terminal.Kind != protocol.KindError || terminal.ID != 1 {
+				t.Fatalf("terminal = %+v", terminal)
+			}
+			var errorMeta protocol.ErrorMeta
+			if err := protocol.DecodeObject(terminal.Meta, &errorMeta); err != nil {
+				t.Fatal(err)
+			}
+			if errorMeta.Kind != protocol.ErrorKindCancelled {
+				t.Fatalf("error kind = %q, want %q", errorMeta.Kind, protocol.ErrorKindCancelled)
+			}
+			assertNoTestFrame(t, writer.frames)
+		})
+	}
 }
 
 func TestConcurrentDebugOperationsKeepTheirIds(t *testing.T) {

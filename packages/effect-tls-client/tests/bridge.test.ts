@@ -1,7 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { ConfigProvider, Duration, Effect, Fiber, Layer, Stream } from "effect";
 import { NodeServices } from "@effect/platform-node";
-import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/internal/Bridge.js";
 import { FrameKind } from "../src/internal/Frame.js";
@@ -17,14 +16,8 @@ const delayedStderrFixturePath = fileURLToPath(
 const silentFixturePath = fileURLToPath(
   new URL("./fixtures/bridge-silent-fixture.mjs", import.meta.url),
 );
-const realBridgePath =
-  process.env["TLS_CLIENT_BRIDGE_TEST_PATH"] ??
-  fileURLToPath(
-    new URL(
-      "../../../packages/bridge-darwin-arm64/bin/bridge",
-      import.meta.url,
-    ),
-  );
+const configuredBridgePath = process.env["TLS_CLIENT_BRIDGE_PATH"];
+const realBridgePath = configuredBridgePath ?? "";
 
 const withClientAt = <A, E>(
   path: string,
@@ -210,9 +203,8 @@ describe("Bridge lifecycle", () => {
   );
 });
 
-const describeRealBridge = existsSync(realBridgePath)
-  ? describe
-  : describe.skip;
+const describeRealBridge =
+  configuredBridgePath === undefined ? describe.skip : describe;
 
 describeRealBridge("Real Bridge debug operations", () => {
   it.live("cancels sleep and keeps the Bridge usable", () =>
@@ -225,6 +217,25 @@ describeRealBridge("Real Bridge debug operations", () => {
           .pipe(Effect.forkChild);
         yield* Effect.sleep(Duration.millis(10));
         yield* Fiber.interrupt(fiber);
+        const ping = yield* bridge.call(FrameKind.debugPing);
+        expect(ping.kind).toBe(FrameKind.ok);
+      }),
+    ),
+  );
+
+  it.live("does not leak interrupted call or stream setup", () =>
+    withBridgeAt(
+      realBridgePath,
+      Effect.gen(function* () {
+        const bridge = yield* Bridge;
+        const callFiber = yield* bridge
+          .call(FrameKind.debugSleep, { ms: 10_000 })
+          .pipe(Effect.forkChild);
+        yield* Fiber.interrupt(callFiber);
+        const streamFiber = yield* bridge
+          .stream(FrameKind.debugStream, { chunks: 2, size: 1024 * 1024 })
+          .pipe(Stream.runCollect, Effect.forkChild);
+        yield* Fiber.interrupt(streamFiber);
         const ping = yield* bridge.call(FrameKind.debugPing);
         expect(ping.kind).toBe(FrameKind.ok);
       }),
