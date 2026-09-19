@@ -1,5 +1,16 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Duration, Effect, Layer, Queue, Stream } from "effect";
+import {
+  Channel,
+  ConfigProvider,
+  Duration,
+  Effect,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  Schedule,
+  Stream,
+} from "effect";
 import type { Scope } from "effect";
 import * as Socket from "effect/unstable/socket/Socket";
 import { createHash } from "node:crypto";
@@ -85,13 +96,20 @@ const frame = (opcode: number, body: Uint8Array): Buffer => {
   return Buffer.concat([header, Buffer.from(body)]);
 };
 
-const startWebSocketServer = async (): Promise<TestWebSocketServer> => {
+const startWebSocketServer = async (
+  closeFirstConnectionAfterEcho = false,
+): Promise<TestWebSocketServer> => {
+  let firstConnection = true;
   const headers = new Map<string, string>();
   const clients = new Set<NetSocket>();
   const server: Server = createServer((socket) => {
     clients.add(socket);
+    const closeAfterFirstEcho =
+      closeFirstConnectionAfterEcho && firstConnection;
+    firstConnection = false;
     let input = Buffer.alloc(0);
     let handshaken = false;
+    let echoed = false;
 
     const send = (opcode: number, body: Uint8Array) => {
       if (!socket.destroyed) socket.write(frame(opcode, body));
@@ -135,6 +153,13 @@ const startWebSocketServer = async (): Promise<TestWebSocketServer> => {
           send(10, decoded);
         } else if (opcode === 1 || opcode === 2) {
           send(opcode, decoded);
+          if (closeAfterFirstEcho && !echoed) {
+            echoed = true;
+            const closeBody = Buffer.alloc(2);
+            closeBody.writeUInt16BE(1000, 0);
+            send(8, closeBody);
+            socket.end();
+          }
         }
       }
     };
@@ -337,6 +362,77 @@ describeReal("Real Bridge WebSockets", () => {
             expect(server.headers.get("x-identity")).toBe("yes");
             expect(server.headers.get("x-request")).toBe("yes");
             yield* writer.write(new Socket.CloseEvent(1000, "done"));
+          }).pipe(
+            Effect.provide(
+              TlsClient.layer.pipe(
+                Layer.provide(
+                  Layer.mergeAll(
+                    NodeServices.layer,
+                    ConfigProvider.layer(
+                      ConfigProvider.fromUnknown({
+                        TLS_CLIENT_BRIDGE_PATH: configuredBridgePath,
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    } finally {
+      await server.close();
+    }
+  }, 30_000);
+
+  it("supports Socket streams, channels, and retry reconnects", async () => {
+    const server = await startWebSocketServer(true);
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const client = yield* TlsClient;
+            const session = yield* client.session({ profile: "chrome_146" });
+            let attempts = 0;
+
+            const retried = yield* Effect.gen(function* () {
+              attempts += 1;
+              const socket = yield* session.webSocket(server.url);
+              const reader = yield* socket.reader;
+              const writer = yield* socket.writer;
+              yield* writer.write("retry");
+              const echoed = yield* reader.pull;
+              expect(echoed).toEqual(["retry"]);
+              if (attempts === 1) {
+                yield* reader.pull;
+              }
+              return echoed;
+            }).pipe(Effect.scoped, Effect.retry(Schedule.recurs(1)));
+            expect(attempts).toBe(2);
+            expect(retried).toEqual(["retry"]);
+
+            const streamSocket = yield* session.webSocket(server.url);
+            const streamFiber = yield* Stream.runCollect(
+              Socket.toStream(streamSocket).pipe(Stream.take(1)),
+            ).pipe(Effect.forkScoped);
+            const streamWriter = yield* streamSocket.writer;
+            yield* streamWriter.write("stream");
+            const streamed = yield* Fiber.join(streamFiber);
+            expect(streamed).toHaveLength(1);
+            expect(new TextDecoder().decode(streamed[0])).toBe("stream");
+
+            const channelSocket = yield* session.webSocket(server.url);
+            const channel = Channel.pipeTo(
+              Channel.fromIterable([
+                [new TextEncoder().encode("channel")] as const,
+              ]),
+              Socket.toChannel(channelSocket),
+            );
+            const head = yield* Channel.runHead(channel);
+            expect(Option.isSome(head)).toBe(true);
+            if (Option.isSome(head)) {
+              expect(new TextDecoder().decode(head.value[0])).toBe("channel");
+            }
           }).pipe(
             Effect.provide(
               TlsClient.layer.pipe(

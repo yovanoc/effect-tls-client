@@ -413,18 +413,11 @@ const makeWebSocketSocket = (
           }),
         );
     });
-  const writer: Socket.Socket["writer"] = Effect.acquireRelease(
-    Effect.succeed({
-      write,
-      writeAll: (chunks: ReadonlyArray<Uint8Array | string>) =>
-        Effect.forEach(chunks, (chunk) => write(chunk), { discard: true }),
-    }),
-    () =>
-      Effect.suspend(() => {
-        const active = connection;
-        return active === undefined ? Effect.void : closeConnection(active);
-      }),
-  );
+  const writer: Socket.Socket["writer"] = Effect.succeed({
+    write,
+    writeAll: (chunks: ReadonlyArray<Uint8Array | string>) =>
+      Effect.forEach(chunks, (chunk) => write(chunk), { discard: true }),
+  });
 
   return {
     socket: Socket.make({ reader, writer }),

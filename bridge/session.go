@@ -693,11 +693,14 @@ func (s *tlsSession) setProxy(ctx context.Context, proxyURL string) error {
 	}
 	if err := s.redirectClient.SetProxy(proxyURL); err != nil {
 		_ = s.client.SetProxy(previous)
+		_ = s.redirectClient.SetProxy(previous)
+		_ = s.wsClient.SetProxy(previous)
 		return err
 	}
 	if err := s.wsClient.SetProxy(proxyURL); err != nil {
 		_ = s.client.SetProxy(previous)
 		_ = s.redirectClient.SetProxy(previous)
+		_ = s.wsClient.SetProxy(previous)
 		return err
 	}
 	s.client.CloseIdleConnections()
