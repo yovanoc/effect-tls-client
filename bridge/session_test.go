@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -177,6 +178,65 @@ func TestTrackedRequestsSerializeSnapshotsPerClient(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("second request did not acquire the bandwidth tracker")
 	}
+}
+
+func TestRequestUploadStreamsThroughPipeAndAcksConsumedBytes(t *testing.T) {
+	dispatcher, writer := newTestDispatcher()
+	defer dispatcher.stop()
+
+	upload := newRequestUpload(context.Background(), dispatcher.writer, 7, 12, 4)
+	readDone := make(chan []byte, 1)
+	go func() {
+		body, err := io.ReadAll(upload.reader)
+		if err != nil {
+			t.Errorf("read upload: %v", err)
+		}
+		readDone <- body
+	}()
+	if err := upload.accept([]byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := upload.accept([]byte{5, 6}); err != nil {
+		t.Fatal(err)
+	}
+	if err := upload.end(); err != nil {
+		t.Fatal(err)
+	}
+
+	body := <-readDone
+	upload.close()
+	if !bytes.Equal(body, []byte{1, 2, 3, 4, 5, 6}) {
+		t.Fatalf("uploaded body = %v", body)
+	}
+	firstAck := nextTestFrame(t, writer.frames)
+	secondAck := nextTestFrame(t, writer.frames)
+	for index, frame := range []protocol.Frame{firstAck, secondAck} {
+		if frame.Kind != protocol.KindBodyAck || frame.ID != 7 {
+			t.Fatalf("ack %d = %+v", index, frame)
+		}
+		var meta protocol.AckMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			t.Fatal(err)
+		}
+		if meta.Bytes == 0 {
+			t.Fatalf("ack %d was empty", index)
+		}
+	}
+	assertNoTestFrame(t, writer.frames)
+}
+
+func TestRequestUploadRejectsBytesBeyondWindow(t *testing.T) {
+	dispatcher, _ := newTestDispatcher()
+	defer dispatcher.stop()
+
+	upload := newRequestUpload(context.Background(), dispatcher.writer, 8, 4, 4)
+	if err := upload.accept([]byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := upload.accept([]byte{5}); !errors.Is(err, protocol.ErrProtocol) {
+		t.Fatalf("second upload chunk error = %v, want protocol violation", err)
+	}
+	upload.close()
 }
 
 func TestIntegrationLocalHTTP1(t *testing.T) {

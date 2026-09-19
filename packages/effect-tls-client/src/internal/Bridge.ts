@@ -33,6 +33,8 @@ import {
 } from "./Frame.js";
 import {
   AckMeta,
+  BodyChunkMeta,
+  BodyEndMeta,
   CancelMeta,
   ChunkMeta,
   DEFAULT_CHUNK_SIZE,
@@ -89,7 +91,29 @@ interface PendingStream {
   readonly headers: Deferred.Deferred<ResponseHeadersMeta, BridgeError>;
   readonly end: Deferred.Deferred<EndMeta, BridgeError>;
   readonly expectsHeaders: boolean;
+  readonly upload?: UploadState;
   headersSeen: boolean;
+}
+
+interface UploadState {
+  readonly body: Stream.Stream<Uint8Array, unknown, never>;
+  readonly stop: Deferred.Deferred<void>;
+  readonly done: Deferred.Deferred<void>;
+  wake: Deferred.Deferred<void>;
+  sent: number;
+  acked: number;
+  stopped: boolean;
+  bodyEndSent: boolean;
+}
+
+export type RequestBody = Stream.Stream<Uint8Array, unknown, never>;
+
+class UploadStopped extends Error {
+  readonly _tag = "UploadStopped" as const;
+
+  constructor() {
+    super("request upload stopped");
+  }
 }
 
 type Pending = PendingDeferred | PendingStream;
@@ -107,6 +131,7 @@ interface State {
   nextId: number;
   stderrTail: Uint8Array;
   chunkSize: number;
+  window: number;
 }
 
 export interface BridgeService {
@@ -121,6 +146,7 @@ export interface BridgeService {
   ) => Stream.Stream<Uint8Array, BridgeError>;
   readonly request: (
     meta: unknown,
+    body?: RequestBody,
   ) => Effect.Effect<BridgeResponse, BridgeError>;
   readonly version: Effect.Effect<BridgeVersion, BridgeError>;
 }
@@ -204,11 +230,19 @@ const makeBridge = Effect.gen(function* () {
     nextId: 1,
     stderrTail: new Uint8Array(0),
     chunkSize: DEFAULT_CHUNK_SIZE,
+    window: DEFAULT_WINDOW,
   };
   const decoder = new FrameDecoder();
   const getDead = (): BridgeError | undefined =>
     state.dead ??
     (state.closing ? makeBridgeExited(state, null, null) : undefined);
+
+  const stopUpload = (operation: PendingStream): void => {
+    const upload = operation.upload;
+    if (upload === undefined || upload.stopped) return;
+    upload.stopped = true;
+    Deferred.doneUnsafe(upload.stop, Effect.succeed(undefined));
+  };
 
   const markDead = (error: BridgeError): void => {
     if (state.dead !== undefined) return;
@@ -217,6 +251,7 @@ const makeBridge = Effect.gen(function* () {
     pending.clear();
     for (const operation of operations) {
       if (operation._tag === "stream") {
+        stopUpload(operation);
         Queue.failCauseUnsafe(operation.queue, Cause.fail(error));
         Deferred.doneUnsafe(operation.headers, Effect.fail(error));
         Deferred.doneUnsafe(operation.end, Effect.fail(error));
@@ -289,6 +324,7 @@ const makeBridge = Effect.gen(function* () {
   const completeStream = (id: number, result: EndMeta | BridgeError): void => {
     const operation = pending.get(id);
     if (operation === undefined || operation._tag !== "stream") return;
+    stopUpload(operation);
     pending.delete(id);
     if ("_tag" in result) {
       Queue.failCauseUnsafe(operation.queue, Cause.fail(result));
@@ -369,12 +405,30 @@ const makeBridge = Effect.gen(function* () {
       return handleErrorFrame(frame, operation);
     }
     try {
+      if (frame.kind === FrameKind.bodyAck) {
+        if (frame.body.byteLength !== 0 || operation.upload === undefined) {
+          throw failProtocol("unexpected body acknowledgement");
+        }
+        const meta = decodeMeta(AckMeta, frame.meta);
+        const upload = operation.upload;
+        const outstanding = upload.sent - upload.acked;
+        if (meta.bytes > outstanding) {
+          throw failProtocol("body acknowledgement exceeds sent bytes");
+        }
+        if (meta.bytes > 0) {
+          upload.acked += meta.bytes;
+          Deferred.doneUnsafe(upload.wake, Effect.succeed(undefined));
+          upload.wake = Deferred.makeUnsafe<void>();
+        }
+        return undefined;
+      }
       if (operation.expectsHeaders && !operation.headersSeen) {
         if (frame.kind !== FrameKind.headers || frame.body.byteLength !== 0) {
           throw failProtocol("expected response headers before body chunks");
         }
         const headers = decodeMeta(ResponseHeadersMeta, frame.meta);
         operation.headersSeen = true;
+        stopUpload(operation);
         Deferred.doneUnsafe(operation.headers, Effect.succeed(headers));
         return undefined;
       }
@@ -602,6 +656,10 @@ const makeBridge = Effect.gen(function* () {
     hello.chunkSize === undefined || hello.chunkSize === 0
       ? DEFAULT_CHUNK_SIZE
       : hello.chunkSize;
+  state.window =
+    hello.window === undefined || hello.window === 0
+      ? DEFAULT_WINDOW
+      : hello.window;
 
   const allocateId = (): number => {
     for (;;) {
@@ -804,7 +862,12 @@ const makeBridge = Effect.gen(function* () {
       }),
     );
 
-  const request = Effect.fnUntraced(function* (meta: unknown) {
+  const uploadStopped = new UploadStopped();
+
+  const request = Effect.fnUntraced(function* (
+    meta: unknown,
+    body?: RequestBody,
+  ) {
     const initialDead = getDead();
     if (initialDead !== undefined) return yield* initialDead;
     const requestMeta = yield* Schema.decodeUnknownEffect(RequestMeta)(
@@ -818,6 +881,11 @@ const makeBridge = Effect.gen(function* () {
           }),
       ),
     );
+    if (body !== undefined && !requestMeta.hasBody) {
+      return yield* new BridgeProtocolError({
+        message: "request body supplied with hasBody=false",
+      });
+    }
     const frameMeta = encodeMeta(RequestMeta, requestMeta);
     const queue = yield* Queue.unbounded<
       Uint8Array,
@@ -827,6 +895,18 @@ const makeBridge = Effect.gen(function* () {
     const headers = Deferred.makeUnsafe<ResponseHeadersMeta, BridgeError>();
     const end = Deferred.makeUnsafe<EndMeta, BridgeError>();
     const id = allocateId();
+    const upload = requestMeta.hasBody
+      ? {
+          body: body ?? Stream.empty,
+          stop: Deferred.makeUnsafe<void>(),
+          done: Deferred.makeUnsafe<void>(),
+          wake: Deferred.makeUnsafe<void>(),
+          sent: 0,
+          acked: 0,
+          stopped: false,
+          bodyEndSent: false,
+        }
+      : undefined;
     const operation: PendingStream = {
       _tag: "stream",
       queue,
@@ -835,7 +915,109 @@ const makeBridge = Effect.gen(function* () {
       end,
       expectsHeaders: true,
       headersSeen: false,
+      ...(upload === undefined ? {} : { upload }),
     };
+
+    const sendUploadChunk = (
+      bytes: Uint8Array,
+    ): Effect.Effect<void, BridgeError | UploadStopped> => {
+      if (upload === undefined) return Effect.void;
+      const size = bytes.byteLength;
+      if (size === 0) return Effect.void;
+      const waitForCredit = (): Effect.Effect<
+        void,
+        BridgeError | UploadStopped
+      > =>
+        Effect.suspend(() => {
+          if (upload.stopped) return Effect.fail(uploadStopped);
+          const outstanding = upload.sent - upload.acked;
+          if (size <= state.window - outstanding) {
+            upload.sent += size;
+            return writeFrame({
+              kind: FrameKind.bodyChunk,
+              id,
+              meta: encodeMeta(BodyChunkMeta, {}),
+              body: bytes,
+            });
+          }
+          const wake = upload.wake;
+          return Effect.raceFirst(
+            Deferred.await(wake),
+            Deferred.await(upload.stop),
+          ).pipe(Effect.flatMap(waitForCredit));
+        });
+      return waitForCredit();
+    };
+
+    const sendUploadEnd = (): Effect.Effect<void, BridgeError> =>
+      Effect.suspend(() => {
+        if (
+          upload === undefined ||
+          upload.bodyEndSent ||
+          pending.get(id) !== operation ||
+          state.dead !== undefined
+        ) {
+          return Effect.void;
+        }
+        upload.bodyEndSent = true;
+        return writeFrame({
+          kind: FrameKind.bodyEnd,
+          id,
+          meta: encodeMeta(BodyEndMeta, {}),
+        });
+      });
+
+    let uploadStarted = false;
+    const runUpload =
+      upload === undefined
+        ? Effect.void
+        : Effect.gen(function* () {
+            const maxChunk = Math.min(state.chunkSize, state.window);
+            const sendChunk = (chunk: Uint8Array) =>
+              Effect.gen(function* () {
+                if (!(chunk instanceof Uint8Array)) {
+                  return yield* Effect.fail(
+                    new TlsRequestError({
+                      kind: "Body",
+                      message: "request body stream emitted a non-Uint8Array",
+                      isTransient: false,
+                    }),
+                  );
+                }
+                for (let offset = 0; offset < chunk.byteLength;) {
+                  const end = Math.min(offset + maxChunk, chunk.byteLength);
+                  yield* sendUploadChunk(chunk.subarray(offset, end));
+                  offset = end;
+                }
+              });
+            const pump = upload.body.pipe(
+              Stream.mapError(
+                (cause) =>
+                  new TlsRequestError({
+                    kind: "Body",
+                    message: errorMessage(cause),
+                    isTransient: false,
+                    cause,
+                  }),
+              ),
+              Stream.runForEach(sendChunk),
+            );
+            yield* Effect.raceFirst(pump, Deferred.await(upload.stop)).pipe(
+              Effect.catchTag("UploadStopped", () => Effect.void),
+              Effect.catchCause(() =>
+                Effect.sync(() => (upload.stopped = true)).pipe(
+                  Effect.flatMap(() => sendCancel(id).pipe(Effect.ignore)),
+                ),
+              ),
+            );
+            yield* sendUploadEnd().pipe(Effect.ignore);
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => Deferred.doneUnsafe(upload!.done, Effect.void)),
+            ),
+            Effect.ignore,
+          );
+
     let requestSent = false;
     const cleanup = () =>
       Effect.uninterruptible(
@@ -843,6 +1025,10 @@ const makeBridge = Effect.gen(function* () {
           if (!requestSent) {
             if (pending.get(id) === operation) pending.delete(id);
             return;
+          }
+          stopUpload(operation);
+          if (uploadStarted && upload !== undefined) {
+            yield* Deferred.await(upload.done).pipe(Effect.ignore);
           }
           yield* sendCancel(id).pipe(Effect.ignore);
           if (pending.get(id) === operation) {
@@ -861,6 +1047,17 @@ const makeBridge = Effect.gen(function* () {
                 meta: frameMeta,
               }).pipe(
                 Effect.tap(() => Effect.sync(() => (requestSent = true))),
+                Effect.tap(() =>
+                  upload === undefined
+                    ? Effect.void
+                    : runUpload.pipe(
+                        Effect.forkChild,
+                        Effect.tap(() =>
+                          Effect.sync(() => (uploadStarted = true)),
+                        ),
+                        Effect.asVoid,
+                      ),
+                ),
               ),
             ),
             Effect.tapError(() =>

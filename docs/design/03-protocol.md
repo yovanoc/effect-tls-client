@@ -64,7 +64,7 @@ Go → JS
 | 0xA0 | `ws.open` | `{ status, headers: Pair[] }` | – | – |
 | 0xA1 | `ws.frame` | `{ opcode: 1 \| 2 }` | ✔ | credited |
 | 0xA2 | `ws.closed` | `{ code, reason, initiator: "local" \| "remote" }` | – | terminal for `ws.connect` |
-| 0xC1 | `ack` | `{ bytes }` | – | credits for JS→Go body chunks |
+| 0xC1 | `body.ack` | `{ bytes }` | – | credits for JS→Go body chunks |
 
 ## 3. Invariants
 
@@ -121,11 +121,12 @@ Go validates strictly: exactly one of `profile`/`customProfile`, unknown profile
 ```ts
 {
   sessionId?: string                      // absent → ephemeral client built from `config`
-  config?: SessionConfig                  // only when sessionId absent (sessionId field ignored)
+  config?: SessionConfig                  // only when sessionId is absent
   url: string; method: string
   headers: Pair[]                         // merged over identity.headers; order = array order
   headerOrder?: string[]                  // overrides identity.headerOrder
   hasBody: boolean                        // true → Go waits for body.chunk* + body.end (io.Pipe into Do)
+  contentLength?: number                  // known body length; omitted for an unknown stream
   timeoutMs?: number                      // per-request override; 0 = no timeout
   followRedirects?: boolean               // per-request override
   hostOverride?: string

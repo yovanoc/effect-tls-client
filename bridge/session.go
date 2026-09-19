@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,169 @@ type tlsSession struct {
 	identity              protocol.IdentityMeta
 	clientBandwidthGate   chan struct{}
 	redirectBandwidthGate chan struct{}
+}
+
+type uploadCredits struct {
+	mu       sync.Mutex
+	window   uint64
+	received uint64
+	acked    uint64
+}
+
+func (c *uploadCredits) reserve(size uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	outstanding := c.received - c.acked
+	if size > c.window-outstanding {
+		return false
+	}
+	c.received += size
+	return true
+}
+
+func (c *uploadCredits) ack(size uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	outstanding := c.received - c.acked
+	if size > outstanding {
+		size = outstanding
+	}
+	c.acked += size
+}
+
+type requestUpload struct {
+	ctx       context.Context
+	id        uint32
+	reader    *io.PipeReader
+	writer    *io.PipeWriter
+	chunks    chan []byte
+	credits   *uploadCredits
+	chunkSize uint64
+	output    *protocol.Writer
+	done      chan struct{}
+	closeOnce sync.Once
+	stateMu   sync.Mutex
+	ended     bool
+}
+
+func newRequestUpload(ctx context.Context, output *protocol.Writer, id uint32, window, chunkSize uint64) *requestUpload {
+	const maxQueueCapacity = uint64(4096)
+	capacity := maxQueueCapacity
+	if chunkSize != 0 && window/chunkSize < maxQueueCapacity-2 {
+		capacity = window/chunkSize + 2
+	}
+	reader, writer := io.Pipe()
+	upload := &requestUpload{
+		ctx:       ctx,
+		id:        id,
+		reader:    reader,
+		writer:    writer,
+		chunks:    make(chan []byte, int(capacity)),
+		credits:   &uploadCredits{window: window},
+		chunkSize: chunkSize,
+		output:    output,
+		done:      make(chan struct{}),
+	}
+	go upload.watchContext()
+	go upload.run()
+	return upload
+}
+
+func (u *requestUpload) watchContext() {
+	select {
+	case <-u.ctx.Done():
+		_ = u.writer.CloseWithError(u.ctx.Err())
+	case <-u.done:
+	}
+}
+
+func (u *requestUpload) run() {
+	defer close(u.done)
+	for {
+		select {
+		case <-u.ctx.Done():
+			_ = u.writer.CloseWithError(u.ctx.Err())
+			return
+		case chunk := <-u.chunks:
+			if chunk == nil {
+				_ = u.writer.Close()
+				return
+			}
+			written, err := u.writer.Write(chunk)
+			if err != nil {
+				return
+			}
+			if written == 0 {
+				continue
+			}
+			u.credits.ack(uint64(written))
+			meta, metaErr := protocol.EncodeMeta(protocol.AckMeta{Bytes: uint64(written)})
+			if metaErr != nil || u.output.Write(protocol.Frame{
+				Kind: protocol.KindBodyAck,
+				ID:   u.id,
+				Meta: meta,
+			}) != nil {
+				return
+			}
+		}
+	}
+}
+
+func (u *requestUpload) accept(chunk []byte) error {
+	if len(chunk) == 0 {
+		return fmt.Errorf("%w: body.chunk cannot be empty", protocol.ErrProtocol)
+	}
+	if uint64(len(chunk)) > u.chunkSize {
+		return fmt.Errorf("%w: body.chunk exceeds negotiated chunkSize", protocol.ErrProtocol)
+	}
+	if u.ctx.Err() != nil {
+		return nil
+	}
+	u.stateMu.Lock()
+	ended := u.ended
+	u.stateMu.Unlock()
+	if ended {
+		return fmt.Errorf("%w: body.chunk received after body.end", protocol.ErrProtocol)
+	}
+	if !u.credits.reserve(uint64(len(chunk))) {
+		return fmt.Errorf("%w: upload credit window exceeded", protocol.ErrProtocol)
+	}
+	select {
+	case u.chunks <- chunk:
+		return nil
+	case <-u.ctx.Done():
+		return nil
+	default:
+		return fmt.Errorf("%w: upload queue is full", protocol.ErrProtocol)
+	}
+}
+
+func (u *requestUpload) end() error {
+	if u.ctx.Err() != nil {
+		return nil
+	}
+	u.stateMu.Lock()
+	if u.ended {
+		u.stateMu.Unlock()
+		return fmt.Errorf("%w: duplicate body.end", protocol.ErrProtocol)
+	}
+	u.ended = true
+	u.stateMu.Unlock()
+	select {
+	case u.chunks <- nil:
+		return nil
+	case <-u.ctx.Done():
+		return nil
+	default:
+		return fmt.Errorf("%w: upload queue is full", protocol.ErrProtocol)
+	}
+}
+
+func (u *requestUpload) close() {
+	u.closeOnce.Do(func() {
+		_ = u.writer.CloseWithError(io.ErrClosedPipe)
+	})
+	<-u.done
 }
 
 type bandwidthSnapshot struct {
@@ -700,26 +864,105 @@ func classifyRequestError(err error) protocol.ErrorKind {
 	return protocol.ErrorKindUnknown
 }
 
+func closeRequestUpload(op *operation) {
+	if op.upload != nil {
+		op.upload.close()
+	}
+}
+
+func requestCookie(cookie protocol.CookieMeta) (*http.Cookie, error) {
+	if cookie.Name == "" {
+		return nil, errors.New("cookie name is required")
+	}
+	result := &http.Cookie{
+		Name:     cookie.Name,
+		Value:    cookie.Value,
+		Domain:   cookie.Domain,
+		Path:     cookie.Path,
+		Secure:   cookie.Secure,
+		HttpOnly: cookie.HttpOnly,
+	}
+	if cookie.Expires != nil {
+		result.Expires = time.Unix(*cookie.Expires, 0).UTC()
+	}
+	switch cookie.SameSite {
+	case "", "Lax":
+		if cookie.SameSite == "Lax" {
+			result.SameSite = http.SameSiteLaxMode
+		}
+	case "Strict":
+		result.SameSite = http.SameSiteStrictMode
+	case "None":
+		result.SameSite = http.SameSiteNoneMode
+	default:
+		return nil, fmt.Errorf("unknown cookie sameSite %q", cookie.SameSite)
+	}
+	return result, nil
+}
+
+func setRequestCookies(client tlsClient.HttpClient, parsedURL *url.URL, cookies []protocol.CookieMeta) error {
+	if len(cookies) == 0 {
+		return nil
+	}
+	converted := make([]*http.Cookie, 0, len(cookies))
+	for _, cookie := range cookies {
+		convertedCookie, err := requestCookie(cookie)
+		if err != nil {
+			return err
+		}
+		converted = append(converted, convertedCookie)
+	}
+	client.SetCookies(parsedURL, converted)
+	return nil
+}
+
 func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protocol.RequestMeta) {
-	session, ok := d.sessions.get(meta.SessionID)
-	if !ok {
-		_ = d.finishErrorDetail(op, protocol.ErrorKindSessionNotFound, fmt.Sprintf("session %q was not found", meta.SessionID), map[string]interface{}{"sessionId": meta.SessionID})
-		return
+	fail := func(kind protocol.ErrorKind, message string) {
+		closeRequestUpload(op)
+		_ = d.finishError(op, kind, message)
 	}
-	if meta.Method != "GET" && meta.Method != "" {
-		_ = d.finishError(op, protocol.ErrorKindInvalidConfig, "this capability supports GET requests only")
-		return
-	}
-	if meta.HasBody {
-		_ = d.finishError(op, protocol.ErrorKindInvalidConfig, "request bodies are not implemented")
-		return
+
+	var session *tlsSession
+	if meta.SessionID != "" {
+		var ok bool
+		session, ok = d.sessions.get(meta.SessionID)
+		if !ok {
+			fail(protocol.ErrorKindSessionNotFound, fmt.Sprintf("session %q was not found", meta.SessionID))
+			return
+		}
+	} else {
+		if meta.Config == nil {
+			fail(protocol.ErrorKindInvalidConfig, "sessionId or config is required")
+			return
+		}
+		config := *meta.Config
+		config.SessionID = fmt.Sprintf("request-%d", op.id)
+		var err error
+		session, err = buildSession(config)
+		if err != nil {
+			fail(protocol.ErrorKindSessionConfig, err.Error())
+			return
+		}
+		defer session.closeIdleConnections()
 	}
 	if meta.TimeoutMs != nil && *meta.TimeoutMs < 0 {
-		_ = d.finishError(op, protocol.ErrorKindInvalidConfig, "timeoutMs cannot be negative")
+		fail(protocol.ErrorKindInvalidConfig, "timeoutMs cannot be negative")
+		return
+	}
+	if meta.ContentLength != nil && *meta.ContentLength < 0 {
+		fail(protocol.ErrorKindInvalidConfig, "contentLength cannot be negative")
+		return
+	}
+	if !meta.HasBody && meta.ContentLength != nil && *meta.ContentLength != 0 {
+		fail(protocol.ErrorKindInvalidConfig, "contentLength requires a request body")
+		return
+	}
+	if meta.HasBody && op.upload == nil {
+		fail(protocol.ErrorKindInvalidConfig, "request body upload is not initialized")
 		return
 	}
 	if err := validateHeaderPairs(meta.Headers); err != nil {
-		_ = d.finishError(op, protocol.ErrorKindInvalidConfig, err.Error())
+		fail(protocol.ErrorKindInvalidConfig, err.Error())
 		return
 	}
 
@@ -731,7 +974,7 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 	cancel := func() {}
 	if timeoutMs > 0 {
 		if timeoutMs > math.MaxInt64/int64(time.Millisecond) {
-			_ = d.finishError(op, protocol.ErrorKindInvalidConfig, "timeoutMs is outside the supported range")
+			fail(protocol.ErrorKindInvalidConfig, "timeoutMs is outside the supported range")
 			return
 		}
 		requestContext, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
@@ -744,36 +987,70 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		if err != nil {
 			message = err.Error()
 		}
-		_ = d.finishError(op, protocol.ErrorKindInvalidUrl, message)
+		fail(protocol.ErrorKindInvalidUrl, message)
 		return
 	}
-	req, err := http.NewRequestWithContext(requestContext, "GET", parsedURL.String(), nil)
+	method := meta.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	var body io.Reader
+	if op.upload != nil {
+		body = op.upload.reader
+	}
+	req, err := http.NewRequestWithContext(requestContext, method, parsedURL.String(), body)
 	if err != nil {
-		_ = d.finishError(op, protocol.ErrorKindInvalidUrl, err.Error())
+		fail(protocol.ErrorKindInvalidUrl, err.Error())
 		return
+	}
+	if meta.ContentLength != nil {
+		req.ContentLength = *meta.ContentLength
 	}
 	if requestHeaders, headerErr := requestHeaders(session.identity, meta); headerErr != nil {
-		_ = d.finishError(op, protocol.ErrorKindInvalidConfig, headerErr.Error())
+		fail(protocol.ErrorKindInvalidConfig, headerErr.Error())
 		return
 	} else {
 		req.Header = requestHeaders
+	}
+	if contentLengthHeader := req.Header.Get("Content-Length"); contentLengthHeader != "" {
+		contentLength, parseErr := strconv.ParseInt(contentLengthHeader, 10, 64)
+		if parseErr != nil || contentLength < 0 {
+			fail(protocol.ErrorKindInvalidConfig, "content-length must be a non-negative integer")
+			return
+		}
+		if meta.ContentLength != nil && *meta.ContentLength != contentLength {
+			fail(protocol.ErrorKindInvalidConfig, "content-length header does not match contentLength")
+			return
+		}
+		if !meta.HasBody && contentLength != 0 {
+			fail(protocol.ErrorKindInvalidConfig, "content-length requires a request body")
+			return
+		}
+		if meta.ContentLength == nil {
+			req.ContentLength = contentLength
+		}
+		req.Header.Del("Content-Length")
 	}
 	if meta.HostOverride != "" {
 		req.Host = meta.HostOverride
 	}
 	client, bandwidthBefore, releaseBandwidth, acquireErr := session.beginTrackedRequest(requestContext, meta.FollowRedirects)
 	if acquireErr != nil {
-		_ = d.finishError(op, classifyRequestError(acquireErr), acquireErr.Error())
+		fail(classifyRequestError(acquireErr), acquireErr.Error())
 		return
 	}
 	defer releaseBandwidth()
+	if err := setRequestCookies(client, parsedURL, meta.Cookies); err != nil {
+		fail(protocol.ErrorKindInvalidConfig, err.Error())
+		return
+	}
 	response, err := client.Do(req)
 	if err != nil {
 		kind := classifyRequestError(err)
 		if requestContext.Err() != nil {
 			kind = classifyRequestError(requestContext.Err())
 		}
-		_ = d.finishError(op, kind, err.Error())
+		fail(kind, err.Error())
 		return
 	}
 	defer response.Body.Close()
@@ -786,26 +1063,31 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		Protocol: protocolName,
 	})
 	if err != nil {
-		_ = d.finishError(op, protocol.ErrorKindInternal, err.Error())
+		fail(protocol.ErrorKindInternal, err.Error())
 		return
 	}
 	if !d.isCurrent(op) {
+		closeRequestUpload(op)
 		return
 	}
 	if err := d.writer.Write(protocol.Frame{Kind: protocol.KindHeaders, ID: op.id, Meta: headersMeta}); err != nil {
+		closeRequestUpload(op)
 		d.remove(op)
 		return
 	}
 
 	for {
 		if requestErr := requestContext.Err(); requestErr != nil {
-			_ = d.finishError(op, classifyRequestError(requestErr), requestErr.Error())
+			fail(classifyRequestError(requestErr), requestErr.Error())
 			return
 		}
 		requested, allowed := op.credits.reserve(requestContext, d.settings.chunkSize)
 		if !allowed {
 			requestErr := requestContext.Err()
-			_ = d.finishError(op, classifyRequestError(requestErr), requestErr.Error())
+			if requestErr == nil {
+				requestErr = context.Canceled
+			}
+			fail(classifyRequestError(requestErr), requestErr.Error())
 			return
 		}
 		buffer := make([]byte, requested)
@@ -815,6 +1097,7 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		}
 		if read > 0 {
 			if !d.isCurrent(op) {
+				closeRequestUpload(op)
 				return
 			}
 			if err := d.writer.Write(protocol.Frame{
@@ -823,6 +1106,7 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 				Meta: []byte(`{}`),
 				Body: buffer[:read],
 			}); err != nil {
+				closeRequestUpload(op)
 				d.remove(op)
 				return
 			}
@@ -835,11 +1119,12 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 			if requestContext.Err() != nil {
 				kind = classifyRequestError(requestContext.Err())
 			}
-			_ = d.finishError(op, kind, readErr.Error())
+			fail(kind, readErr.Error())
 			return
 		}
 	}
 
+	closeRequestUpload(op)
 	bandwidthAfter := snapshotBandwidth(client)
 	endMeta, err := protocol.EncodeMeta(protocol.EndMeta{
 		Protocol:     protocolName,
@@ -847,7 +1132,7 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		BytesWritten: bandwidthDelta(bandwidthBefore.written, bandwidthAfter.written),
 	})
 	if err != nil {
-		_ = d.finishError(op, protocol.ErrorKindInternal, err.Error())
+		fail(protocol.ErrorKindInternal, err.Error())
 		return
 	}
 	_ = d.finish(op, protocol.Frame{Kind: protocol.KindEnd, ID: op.id, Meta: endMeta})

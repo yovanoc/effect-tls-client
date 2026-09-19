@@ -5,6 +5,7 @@ import {
   Bridge,
   type BridgeResponse,
   type BridgeVersion,
+  type RequestBody as BridgeRequestBody,
 } from "./internal/Bridge.js";
 import {
   SessionConfigError,
@@ -13,7 +14,9 @@ import {
 } from "./internal/Errors.js";
 import { FrameKind } from "./internal/Frame.js";
 import {
+  Cookie as CookieSchema,
   SessionConfig as SessionConfigSchema,
+  type Cookie as WireCookie,
   type Pair,
   type SessionConfig as SessionConfigType,
 } from "./internal/Protocol.js";
@@ -22,7 +25,19 @@ export const SessionConfig = SessionConfigSchema;
 export type { Pair };
 export type SessionConfig = SessionConfigType;
 
+const RequestCookieInputSchema = Schema.Struct({
+  name: Schema.String,
+  value: Schema.String,
+  domain: Schema.optionalKey(Schema.String),
+  path: Schema.optionalKey(Schema.String),
+  expires: Schema.optionalKey(Schema.NullOr(Schema.Int)),
+  secure: Schema.optionalKey(Schema.Boolean),
+  httpOnly: Schema.optionalKey(Schema.Boolean),
+  sameSite: Schema.optionalKey(Schema.Literals(["Strict", "Lax", "None"])),
+});
+
 const RequestOptionsSchema = Schema.Struct({
+  method: Schema.optionalKey(Schema.String),
   headers: Schema.optionalKey(
     Schema.Array(Schema.Tuple([Schema.String, Schema.String])),
   ),
@@ -32,7 +47,26 @@ const RequestOptionsSchema = Schema.Struct({
   ),
   followRedirects: Schema.optionalKey(Schema.Boolean),
   hostOverride: Schema.optionalKey(Schema.String),
+  body: Schema.optionalKey(Schema.Unknown),
+  cookies: Schema.optionalKey(Schema.Unknown),
 });
+
+export interface RequestCookieInput {
+  readonly name: string;
+  readonly value: string;
+  readonly domain?: string;
+  readonly path?: string;
+  readonly expires?: number | null;
+  readonly secure?: boolean;
+  readonly httpOnly?: boolean;
+  readonly sameSite?: "Strict" | "Lax" | "None";
+}
+
+export type RequestBody =
+  | Uint8Array
+  | string
+  | FormData
+  | Stream.Stream<Uint8Array, unknown, never>;
 
 export interface RequestOptions {
   readonly headers?: ReadonlyArray<Pair>;
@@ -40,6 +74,9 @@ export interface RequestOptions {
   readonly timeoutMs?: number;
   readonly followRedirects?: boolean;
   readonly hostOverride?: string;
+  readonly method?: string;
+  readonly body?: RequestBody;
+  readonly cookies?: Cookies.Cookies | ReadonlyArray<RequestCookieInput>;
 }
 
 export type RequestInput = RequestOptions & { readonly url: string };
@@ -72,6 +109,11 @@ export interface TlsClientService {
   readonly session: (
     config: SessionConfigType,
   ) => Effect.Effect<TlsSession, TlsOperationError, Scope.Scope>;
+  readonly request: (
+    config: SessionConfigType,
+    request: string | RequestInput,
+    options?: RequestOptions,
+  ) => Effect.Effect<TlsResponse, TlsOperationError, Scope.Scope>;
 }
 
 const errorMessage = (cause: unknown): string =>
@@ -94,6 +136,224 @@ const requestError = (message: string, cause?: unknown): TlsRequestError =>
     message,
     isTransient: false,
     ...(cause === undefined ? {} : { cause }),
+  });
+
+const requestConfigError = (
+  message: string,
+  cause?: unknown,
+): TlsRequestError =>
+  new TlsRequestError({
+    kind: "InvalidConfig",
+    message,
+    isTransient: false,
+    ...(cause === undefined ? {} : { cause }),
+  });
+
+interface EncodedBody {
+  readonly stream: BridgeRequestBody;
+  readonly length?: number;
+  readonly contentType?: string;
+}
+
+interface NormalizedRequest {
+  readonly meta: {
+    readonly url: string;
+    readonly method: string;
+    readonly headers: ReadonlyArray<Pair>;
+    readonly headerOrder?: ReadonlyArray<string>;
+    readonly hasBody: boolean;
+    readonly contentLength?: number;
+    readonly timeoutMs?: number;
+    readonly followRedirects?: boolean;
+    readonly hostOverride?: string;
+    readonly cookies?: ReadonlyArray<WireCookie>;
+  };
+  readonly body?: BridgeRequestBody;
+}
+
+const isRequestStream = (
+  value: RequestBody,
+): value is Stream.Stream<Uint8Array, unknown, never> => Stream.isStream(value);
+
+const encodeBody = (
+  body: RequestBody | undefined,
+): Effect.Effect<EncodedBody | undefined, TlsRequestError> => {
+  if (body === undefined) return Effect.succeed(undefined);
+  if (body instanceof Uint8Array) {
+    return Effect.succeed({
+      stream: Stream.succeed(body),
+      length: body.byteLength,
+    });
+  }
+  if (typeof body === "string") {
+    const bytes = new TextEncoder().encode(body);
+    return Effect.succeed({
+      stream: Stream.succeed(bytes),
+      length: bytes.byteLength,
+      contentType: "text/plain;charset=UTF-8",
+    });
+  }
+  if (typeof FormData !== "undefined" && body instanceof FormData) {
+    return Effect.tryPromise({
+      try: async () => {
+        const request = new globalThis.Request(
+          "http://effect-tls-client.invalid/",
+          { method: "POST", body },
+        );
+        const bytes = new Uint8Array(await request.arrayBuffer());
+        const contentType = request.headers.get("content-type");
+        return {
+          stream: Stream.succeed(bytes),
+          length: bytes.byteLength,
+          ...(contentType === null ? {} : { contentType }),
+        };
+      },
+      catch: (cause) => requestError("failed to encode FormData", cause),
+    });
+  }
+  if (isRequestStream(body)) return Effect.succeed({ stream: body });
+  return Effect.fail(
+    requestError("request body must be bytes, string, FormData, or Stream"),
+  );
+};
+
+const toWireCookie = (cookie: Cookies.Cookie): WireCookie => ({
+  name: cookie.name,
+  value: cookie.value,
+  domain: cookie.options?.domain ?? "",
+  path: cookie.options?.path ?? "/",
+  expires:
+    cookie.options?.expires === undefined
+      ? null
+      : Math.floor(cookie.options.expires.getTime() / 1000),
+  secure: cookie.options?.secure ?? false,
+  httpOnly: cookie.options?.httpOnly ?? false,
+  ...(cookie.options?.sameSite === undefined
+    ? {}
+    : {
+        sameSite:
+          cookie.options.sameSite === "lax"
+            ? "Lax"
+            : cookie.options.sameSite === "strict"
+              ? "Strict"
+              : "None",
+      }),
+});
+
+const normalizeCookies = (
+  value: Cookies.Cookies | ReadonlyArray<RequestCookieInput> | undefined,
+): Effect.Effect<ReadonlyArray<WireCookie> | undefined, TlsRequestError> => {
+  if (value === undefined) return Effect.succeed(undefined);
+  return Effect.try({
+    try: () => {
+      const cookies = Cookies.isCookies(value)
+        ? Object.values(value.cookies).map(toWireCookie)
+        : Schema.decodeUnknownSync(Schema.Array(RequestCookieInputSchema))(
+            value,
+          ).map((cookie) => ({
+            name: cookie.name,
+            value: cookie.value,
+            domain: cookie.domain ?? "",
+            path: cookie.path ?? "/",
+            expires: cookie.expires ?? null,
+            secure: cookie.secure ?? false,
+            httpOnly: cookie.httpOnly ?? false,
+            ...(cookie.sameSite === undefined
+              ? {}
+              : { sameSite: cookie.sameSite }),
+          }));
+      return Schema.decodeUnknownSync(Schema.Array(CookieSchema))(cookies);
+    },
+    catch: (cause) => requestConfigError("invalid request cookies", cause),
+  });
+};
+
+const headerValue = (
+  headers: ReadonlyArray<Pair>,
+  name: string,
+): string | undefined =>
+  headers.find(([headerName]) => headerName.toLowerCase() === name)?.[1];
+
+const normalizeRequest = (
+  urlOrInput: string | RequestInput,
+  options?: RequestOptions,
+): Effect.Effect<NormalizedRequest, TlsRequestError> =>
+  Effect.gen(function* () {
+    const url = typeof urlOrInput === "string" ? urlOrInput : urlOrInput.url;
+    const optionInput: RequestOptions =
+      typeof urlOrInput === "string" ? (options ?? {}) : urlOrInput;
+    const requestUrl = yield* Schema.decodeEffect(Schema.String)(url).pipe(
+      Effect.mapError(
+        (cause) =>
+          new TlsRequestError({
+            kind: "InvalidUrl",
+            message: errorMessage(cause),
+            isTransient: false,
+          }),
+      ),
+    );
+    const parsed = yield* Schema.decodeUnknownEffect(RequestOptionsSchema)(
+      optionInput,
+    ).pipe(Effect.mapError((cause) => requestConfigError(errorMessage(cause))));
+    const encodedBody = yield* encodeBody(optionInput.body);
+    let headers: Array<Pair> = [...(parsed.headers ?? [])];
+    if (
+      encodedBody?.contentType !== undefined &&
+      headerValue(headers, "content-type") === undefined
+    ) {
+      headers.push(["Content-Type", encodedBody.contentType]);
+    }
+    const declaredLength = headerValue(headers, "content-length");
+    let contentLength = encodedBody?.length;
+    if (declaredLength !== undefined) {
+      const parsedLength = Number(declaredLength);
+      if (!Number.isSafeInteger(parsedLength) || parsedLength < 0) {
+        return yield* requestConfigError(
+          "content-length must be a non-negative integer",
+        );
+      }
+      if (encodedBody === undefined && parsedLength !== 0) {
+        return yield* requestConfigError(
+          "content-length requires a request body",
+        );
+      }
+      if (contentLength !== undefined && parsedLength !== contentLength) {
+        return yield* requestConfigError(
+          `content-length ${parsedLength} does not match request body length ${contentLength}`,
+        );
+      }
+      contentLength = parsedLength;
+    }
+    const cookies = yield* normalizeCookies(optionInput.cookies);
+    const method =
+      parsed.method === undefined || parsed.method === ""
+        ? encodedBody === undefined
+          ? "GET"
+          : "POST"
+        : parsed.method;
+    return {
+      meta: {
+        url: requestUrl,
+        method,
+        headers,
+        hasBody: encodedBody !== undefined,
+        ...(parsed.headerOrder === undefined
+          ? {}
+          : { headerOrder: parsed.headerOrder }),
+        ...(contentLength === undefined ? {} : { contentLength }),
+        ...(parsed.timeoutMs === undefined
+          ? {}
+          : { timeoutMs: parsed.timeoutMs }),
+        ...(parsed.followRedirects === undefined
+          ? {}
+          : { followRedirects: parsed.followRedirects }),
+        ...(parsed.hostOverride === undefined
+          ? {}
+          : { hostOverride: parsed.hostOverride }),
+        ...(cookies === undefined ? {} : { cookies }),
+      },
+      ...(encodedBody === undefined ? {} : { body: encodedBody.stream }),
+    };
   });
 
 const responseFrom = (
@@ -148,6 +408,26 @@ const normalizeConfig = (
     ),
   );
 
+type RequestTarget =
+  | { readonly sessionId: string }
+  | { readonly config: SessionConfigType };
+
+const requestWith = (
+  bridge: Bridge["Service"],
+  target: RequestTarget,
+  urlOrInput: string | RequestInput,
+  options?: RequestOptions,
+): Effect.Effect<TlsResponse, TlsOperationError, Scope.Scope> =>
+  Effect.gen(function* () {
+    const normalized = yield* normalizeRequest(urlOrInput, options);
+    const response = yield* bridge.request(
+      { ...target, ...normalized.meta },
+      normalized.body,
+    );
+    yield* Effect.addFinalizer(() => response.close);
+    return yield* responseFrom(response);
+  });
+
 const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
   Layer.effect(
     service,
@@ -168,6 +448,14 @@ const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
           ).pipe(Effect.asVoid);
         }),
       );
+      const request = Effect.fn("TlsClient.request")(function* (
+        input: SessionConfigType,
+        urlOrInput: string | RequestInput,
+        options?: RequestOptions,
+      ) {
+        const config = yield* normalizeConfig(input);
+        return yield* requestWith(bridge, { config }, urlOrInput, options);
+      });
       const session = Effect.fn("TlsClient.session")(function* (
         input: SessionConfigType,
       ) {
@@ -212,6 +500,7 @@ const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
       return TlsClient.of({
         version: bridge.version,
         session,
+        request,
       });
     }),
   );
@@ -230,62 +519,8 @@ export const makeTlsClientLayer = makeTlsClientLayerInternal(TlsClient);
 const makeSession = (
   bridge: Bridge["Service"],
   sessionId: string,
-): TlsSession => {
-  const request = (
-    urlOrInput: string | RequestInput,
-    options?: RequestOptions,
-  ) =>
-    Effect.gen(function* () {
-      const url = typeof urlOrInput === "string" ? urlOrInput : urlOrInput.url;
-      const optionInput =
-        typeof urlOrInput === "string" ? (options ?? {}) : urlOrInput;
-      const requestUrl = yield* Schema.decodeEffect(Schema.String)(url).pipe(
-        Effect.mapError(
-          (cause) =>
-            new TlsRequestError({
-              kind: "InvalidUrl",
-              message: errorMessage(cause),
-              isTransient: false,
-            }),
-        ),
-      );
-      const parsed = yield* Schema.decodeEffect(RequestOptionsSchema)(
-        optionInput,
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new TlsRequestError({
-              kind: "InvalidConfig",
-              message: errorMessage(cause),
-              isTransient: false,
-            }),
-        ),
-      );
-      const requestMeta = {
-        sessionId,
-        url: requestUrl,
-        method: "GET",
-        headers: parsed.headers ?? [],
-        hasBody: false,
-        ...(parsed.headerOrder === undefined
-          ? {}
-          : { headerOrder: parsed.headerOrder }),
-        ...(parsed.timeoutMs === undefined
-          ? {}
-          : { timeoutMs: parsed.timeoutMs }),
-        ...(parsed.followRedirects === undefined
-          ? {}
-          : { followRedirects: parsed.followRedirects }),
-        ...(parsed.hostOverride === undefined
-          ? {}
-          : { hostOverride: parsed.hostOverride }),
-      };
-      const response = yield* bridge.request(requestMeta);
-      yield* Effect.addFinalizer(() => response.close);
-      return yield* responseFrom(response);
-    });
-  return {
-    id: sessionId,
-    request,
-  };
-};
+): TlsSession => ({
+  id: sessionId,
+  request: (urlOrInput, options) =>
+    requestWith(bridge, { sessionId }, urlOrInput, options),
+});

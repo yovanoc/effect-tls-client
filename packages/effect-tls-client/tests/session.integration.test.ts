@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { ConfigProvider, Effect, Fiber, Layer, Result, Stream } from "effect";
+import { Cookies } from "effect/unstable/http";
 import type { Scope } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import { createServer, type Server } from "node:http";
@@ -94,6 +95,10 @@ const tryPromise = <A>(thunk: () => Promise<A>) => Effect.promise(thunk);
 interface LocalHttp1Server {
   readonly url: string;
   readonly requestHeaders: Promise<ReadonlyArray<readonly [string, string]>>;
+  readonly upload: Promise<{
+    readonly body: Uint8Array;
+    readonly headers: Readonly<Record<string, string | string[] | undefined>>;
+  }>;
   readonly firstChunk: Promise<void>;
   readonly disconnected: Promise<void>;
   readonly close: () => Promise<void>;
@@ -104,6 +109,10 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
     value: ReadonlyArray<readonly [string, string]>,
   ) => void = () => {};
   let resolveFirstChunk: () => void = () => {};
+  let resolveUpload: (value: {
+    readonly body: Uint8Array;
+    readonly headers: Readonly<Record<string, string | string[] | undefined>>;
+  }) => void = () => {};
   let resolveDisconnected: () => void = () => {};
   const requestHeaders = new Promise<ReadonlyArray<readonly [string, string]>>(
     (resolve) => {
@@ -112,6 +121,12 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
   );
   const firstChunk = new Promise<void>((resolve) => {
     resolveFirstChunk = resolve;
+  });
+  const upload = new Promise<{
+    readonly body: Uint8Array;
+    readonly headers: Readonly<Record<string, string | string[] | undefined>>;
+  }>((resolve) => {
+    resolveUpload = resolve;
   });
   const disconnected = new Promise<void>((resolve) => {
     resolveDisconnected = resolve;
@@ -127,6 +142,58 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
 
   const server = createServer((request, response) => {
     const path = new URL(request.url ?? "/", "http://local").pathname;
+    if (path === "/echo" || path === "/count") {
+      const chunks: Array<Buffer> = [];
+      let total = 0;
+      request.on("data", (chunk: Buffer) => {
+        if (path === "/echo") chunks.push(chunk);
+        total += chunk.byteLength;
+      });
+      request.once("end", () => {
+        const body = path === "/echo" ? Buffer.concat(chunks) : Buffer.alloc(0);
+        if (path === "/echo") resolveUpload({ body, headers: request.headers });
+        response.setHeader("Content-Type", "text/plain");
+        response.end(path === "/count" ? String(total) : body);
+      });
+      return;
+    }
+    if (path === "/redirect-a") {
+      response.writeHead(302, { Location: "/redirect-b" });
+      response.end();
+      return;
+    }
+    if (path === "/redirect-b") {
+      response.writeHead(302, { Location: "/redirect-final" });
+      response.end();
+      return;
+    }
+    if (path === "/redirect-final") {
+      response.end("redirect-final");
+      return;
+    }
+    if (path === "/host") {
+      response.end(request.headers.host ?? "");
+      return;
+    }
+    if (path === "/cookie") {
+      response.end(request.headers.cookie ?? "");
+      return;
+    }
+    if (path === "/upload-early") {
+      request.once("data", () => {
+        resolveFirstChunk();
+        response.end("early");
+      });
+      request.once("aborted", reportDisconnect);
+      response.once("close", reportDisconnect);
+      return;
+    }
+    if (path === "/upload-wait") {
+      request.once("data", resolveFirstChunk);
+      request.once("aborted", reportDisconnect);
+      response.once("close", reportDisconnect);
+      return;
+    }
     if (path === "/headers") {
       const names = new Set(["x-first", "x-second", "x-identity", "x-replace"]);
       const pairs: Array<readonly [string, string]> = [];
@@ -206,6 +273,7 @@ const startHttp1Server = async (): Promise<LocalHttp1Server> => {
   return {
     url: `http://127.0.0.1:${port}`,
     requestHeaders,
+    upload,
     firstChunk,
     disconnected,
     close: () => close(server),
@@ -246,6 +314,246 @@ const decodeChunks = (chunks: ReadonlyArray<Uint8Array>): string => {
 };
 
 describeRealIntegration("real Bridge session requests", () => {
+  it.live("uploads a string with request metadata and cookies", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          const response = yield* session.request(`${server.url}/echo`, {
+            method: "POST",
+            headers: [["Content-Length", "12"]],
+            body: "hello upload",
+          });
+          const responseText = yield* response.text;
+          const upload = yield* Effect.promise(() => server.upload);
+          expect(responseText).toBe("hello upload");
+          expect(new TextDecoder().decode(upload.body)).toBe("hello upload");
+          expect(upload.headers["content-type"]).toBe(
+            "text/plain;charset=UTF-8",
+          );
+          expect(upload.headers["content-length"]).toBe("12");
+
+          const cookieResponse = yield* session.request(
+            `${server.url}/cookie`,
+            {
+              cookies: Cookies.fromSetCookie("request-cookie=one; Path=/"),
+            },
+          );
+          expect(yield* cookieResponse.text).toContain("request-cookie=one");
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("uploads bytes with an exact content length", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          const response = yield* session.request(`${server.url}/echo`, {
+            method: "POST",
+            body: new Uint8Array([1, 2, 3, 4]),
+          });
+          expect((yield* response.bytes).length).toBe(4);
+          const upload = yield* Effect.promise(() => server.upload);
+          expect(Array.from(upload.body)).toEqual([1, 2, 3, 4]);
+          expect(upload.headers["content-length"]).toBe("4");
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("interrupts an upload and observes the server disconnect", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          const body = Stream.unfold(0, (index) =>
+            Effect.succeed([new Uint8Array(64 * 1024), index + 1] as const),
+          );
+          const requestFiber = yield* session
+            .request(`${server.url}/upload-wait`, {
+              method: "POST",
+              body,
+            })
+            .pipe(Effect.forkChild);
+          yield* Effect.promise(() => server.firstChunk);
+          yield* Fiber.interrupt(requestFiber);
+          yield* Effect.promise(() => server.disconnected);
+          const followUp = yield* session.request(`${server.url}/headers`);
+          expect(yield* followUp.text).toBe("http/1.1");
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("stops a streamed producer after an early response", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          let pulls = 0;
+          const body = Stream.unfold(0, (index) =>
+            Effect.sync(() => {
+              pulls += 1;
+              return [new Uint8Array(64 * 1024), index + 1] as const;
+            }),
+          );
+          const response = yield* session.request(
+            `${server.url}/upload-early`,
+            {
+              method: "POST",
+              body,
+            },
+          );
+          expect(yield* response.text).toBe("early");
+          expect(pulls).toBeLessThan(100);
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("encodes FormData with a matching content type and length", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const form = new FormData();
+          form.set("field", "value");
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          const response = yield* session.request(`${server.url}/echo`, {
+            method: "POST",
+            body: form,
+          });
+          const responseText = yield* response.text;
+          const upload = yield* Effect.promise(() => server.upload);
+          expect(responseText).toContain('name="field"');
+          expect(responseText).toContain("value");
+          expect(new TextDecoder().decode(upload.body)).toContain(
+            'name="field"',
+          );
+          expect(String(upload.headers["content-type"])).toMatch(
+            /^multipart\/form-data; boundary=/,
+          );
+          expect(upload.headers["content-length"]).toBe(
+            String(upload.body.byteLength),
+          );
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("streams a 100 MiB upload without collecting the source", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            forceHttp1: true,
+          });
+          const chunkSize = 64 * 1024;
+          const chunkCount = (100 * 1024 * 1024) / chunkSize;
+          let pulls = 0;
+          const body = Stream.unfold(0, (index) =>
+            Effect.sync(() => {
+              if (index >= chunkCount) return undefined;
+              pulls += 1;
+              return [new Uint8Array(chunkSize), index + 1] as const;
+            }),
+          );
+          const response = yield* session.request(`${server.url}/count`, {
+            method: "POST",
+            timeoutMs: 0,
+            body,
+          });
+          expect(yield* response.text).toBe(String(100 * 1024 * 1024));
+          expect(pulls).toBe(chunkCount);
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live(
+    "follows redirects or exposes the redirect response per request",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* tryPromise(startHttp1Server);
+        return yield* withClientAt(
+          realBridgePath,
+          Effect.gen(function* () {
+            const client = yield* TlsClient;
+            const session = yield* client.session({
+              profile: "chrome_146",
+              forceHttp1: true,
+            });
+            const followed = yield* session.request(
+              `${server.url}/redirect-a`,
+              {
+                followRedirects: true,
+              },
+            );
+            expect(followed.url).toBe(`${server.url}/redirect-final`);
+            expect(yield* followed.text).toBe("redirect-final");
+            const exposed = yield* session.request(`${server.url}/redirect-a`, {
+              followRedirects: false,
+            });
+            expect(exposed.status).toBe(302);
+            expect(exposed.url).toBe(`${server.url}/redirect-a`);
+          }),
+        ).pipe(Effect.ensuring(Effect.promise(server.close)));
+      }),
+  );
+
+  it.live("applies host overrides and supports an ephemeral request", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp1Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const response = yield* client.request(
+            { profile: "chrome_146", forceHttp1: true },
+            `${server.url}/host`,
+            { hostOverride: "override.test" },
+          );
+          expect(yield* response.text).toBe("override.test");
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
   it.live("runs the public request path over local HTTP/1.1", () =>
     Effect.gen(function* () {
       const server = yield* tryPromise(startHttp1Server);

@@ -10,6 +10,8 @@ export const FrameKind = {
   sessionCreate: 0x10,
   sessionDestroy: 0x11,
   request: 0x20,
+  bodyChunk: 0x21,
+  bodyEnd: 0x22,
   cancel: 0x40,
   ack: 0x41,
   debugPing: 0xf0,
@@ -21,6 +23,7 @@ export const FrameKind = {
   headers: 0x90,
   chunk: 0x91,
   end: 0x92,
+  bodyAck: 0xc1,
 } as const;
 
 export type FrameKind = (typeof FrameKind)[keyof typeof FrameKind];

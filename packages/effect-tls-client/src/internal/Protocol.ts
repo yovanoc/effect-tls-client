@@ -15,6 +15,18 @@ const StringArray = Schema.Array(Schema.String);
 export const Pair = HeaderPair;
 export interface Pair extends Schema.Schema.Type<typeof Pair> {}
 
+export const Cookie = Schema.Struct({
+  name: Schema.String,
+  value: Schema.String,
+  domain: Schema.String,
+  path: Schema.String,
+  expires: Schema.NullOr(Schema.Int),
+  secure: Schema.Boolean,
+  httpOnly: Schema.Boolean,
+  sameSite: Schema.optionalKey(Schema.Literals(["Strict", "Lax", "None"])),
+});
+export interface Cookie extends Schema.Schema.Type<typeof Cookie> {}
+
 export const Identity = Schema.Struct({
   headers: Schema.Array(Pair),
   headerOrder: Schema.optionalKey(StringArray),
@@ -171,17 +183,42 @@ export interface SessionIdMeta extends Schema.Schema.Type<
 > {}
 
 export const RequestMeta = Schema.Struct({
-  sessionId: Schema.String,
+  sessionId: Schema.optionalKey(Schema.String),
+  config: Schema.optionalKey(SessionConfig),
   url: Schema.String,
   method: Schema.String,
   headers: Schema.Array(Pair),
   headerOrder: Schema.optionalKey(StringArray),
   hasBody: Schema.Boolean,
+  contentLength: Schema.optionalKey(NonNegativeInt),
   timeoutMs: Schema.optionalKey(NonNegativeInt),
   followRedirects: Schema.optionalKey(Schema.Boolean),
   hostOverride: Schema.optionalKey(Schema.String),
-});
+  cookies: Schema.optionalKey(Schema.Array(Cookie)),
+}).check(
+  Schema.makeFilter(
+    (value) => {
+      const hasSession = value.sessionId !== undefined;
+      const hasConfig = value.config !== undefined;
+      return hasSession !== hasConfig
+        ? undefined
+        : {
+            path: [],
+            issue: "exactly one of sessionId or config is required",
+          };
+    },
+    { expected: "exactly one of sessionId or config" },
+  ),
+);
 export interface RequestMeta extends Schema.Schema.Type<typeof RequestMeta> {}
+
+export const BodyChunkMeta = Schema.Struct({});
+export interface BodyChunkMeta extends Schema.Schema.Type<
+  typeof BodyChunkMeta
+> {}
+
+export const BodyEndMeta = Schema.Struct({});
+export interface BodyEndMeta extends Schema.Schema.Type<typeof BodyEndMeta> {}
 
 export const ResponseProtocol = Schema.Literals([
   "HTTP/1.1",

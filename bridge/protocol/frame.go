@@ -2,8 +2,8 @@
 // docs/design/03-protocol.md: a hand-rolled, big-endian, length-prefixed
 // binary frame format multiplexed on stdio.
 //
-// Issue #4 adds cancellation and credit flow to the debug operations while
-// keeping the rest of protocol v1 reserved for later stages.
+// The protocol carries cancellation, credit flow, and streamed request bodies
+// over the same multiplexed connection.
 package protocol
 
 import (
@@ -31,6 +31,8 @@ const (
 	KindSessionCreate  Kind = 0x10
 	KindSessionDestroy Kind = 0x11
 	KindRequest        Kind = 0x20
+	KindBodyChunk      Kind = 0x21
+	KindBodyEnd        Kind = 0x22
 	KindCancel         Kind = 0x40
 	KindAck            Kind = 0x41
 	KindDebugPing      Kind = 0xF0
@@ -44,6 +46,7 @@ const (
 	KindHeaders  Kind = 0x90
 	KindChunk    Kind = 0x91
 	KindEnd      Kind = 0x92
+	KindBodyAck  Kind = 0xC1
 )
 
 // ErrProtocol is the sentinel wrapped by frame-level protocol violations.
@@ -61,8 +64,8 @@ type Frame struct {
 func IsKnownKind(kind Kind) bool {
 	switch kind {
 	case KindHello, KindShutdown, KindSessionCreate, KindSessionDestroy, KindRequest,
-		KindCancel, KindAck, KindDebugPing, KindDebugSleep, KindDebugStream,
-		KindHelloAck, KindOk, KindError, KindHeaders, KindChunk, KindEnd:
+		KindBodyChunk, KindBodyEnd, KindCancel, KindAck, KindDebugPing, KindDebugSleep, KindDebugStream,
+		KindHelloAck, KindOk, KindError, KindHeaders, KindChunk, KindEnd, KindBodyAck:
 		return true
 	default:
 		return false

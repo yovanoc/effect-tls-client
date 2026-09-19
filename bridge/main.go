@@ -40,6 +40,7 @@ type operation struct {
 	sessionID string
 	cancel    context.CancelFunc
 	credits   *credits
+	upload    *requestUpload
 }
 
 type credits struct {
@@ -111,6 +112,10 @@ func newDispatcher(writer *protocol.Writer, settings bridgeSettings) *dispatcher
 }
 
 func (d *dispatcher) start(id uint32, credited bool, sessionID string, run func(context.Context, *operation)) error {
+	return d.startWithSetup(id, credited, sessionID, nil, run)
+}
+
+func (d *dispatcher) startWithSetup(id uint32, credited bool, sessionID string, setup func(context.Context, *operation) error, run func(context.Context, *operation)) error {
 	if id == 0 {
 		return fmt.Errorf("operation id 0 is reserved")
 	}
@@ -129,6 +134,17 @@ func (d *dispatcher) start(id uint32, credited bool, sessionID string, run func(
 	d.operations[id] = op
 	d.waitGroup.Add(1)
 	d.mu.Unlock()
+
+	if setup != nil {
+		if err := setup(ctx, op); err != nil {
+			d.mu.Lock()
+			delete(d.operations, id)
+			d.mu.Unlock()
+			cancel()
+			d.waitGroup.Done()
+			return err
+		}
+	}
 
 	go func() {
 		defer d.waitGroup.Done()
@@ -521,12 +537,64 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
 			return false, writeProtocolError(d.writer, frame.ID, err.Error())
 		}
-		if meta.SessionID == "" {
-			return false, writeProtocolError(d.writer, frame.ID, "sessionId is required")
+		if (meta.SessionID == "") == (meta.Config == nil) {
+			return false, writeProtocolError(d.writer, frame.ID, "exactly one of sessionId or config is required")
 		}
-		if err := d.start(frame.ID, true, meta.SessionID, func(ctx context.Context, op *operation) {
+		setup := func(ctx context.Context, op *operation) error {
+			if !meta.HasBody {
+				return nil
+			}
+			upload := newRequestUpload(ctx, d.writer, op.id, d.settings.window, d.settings.chunkSize)
+			op.upload = upload
+			return nil
+		}
+		if err := d.startWithSetup(frame.ID, true, meta.SessionID, setup, func(ctx context.Context, op *operation) {
 			d.runRequest(ctx, op, meta)
 		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindBodyChunk:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "body.chunk id 0 is reserved")
+		}
+		op := d.operation(frame.ID)
+		if op == nil {
+			return false, nil
+		}
+		if len(frame.Body) == 0 {
+			return false, fmt.Errorf("%w: body.chunk cannot be empty", protocol.ErrProtocol)
+		}
+		if err := protocol.DecodeEmpty(frame.Meta); err != nil {
+			return false, err
+		}
+		if op.upload == nil {
+			return false, fmt.Errorf("%w: body.chunk is not valid for this operation", protocol.ErrProtocol)
+		}
+		if err := op.upload.accept(frame.Body); err != nil {
+			return false, err
+		}
+		return false, nil
+
+	case protocol.KindBodyEnd:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "body.end id 0 is reserved")
+		}
+		op := d.operation(frame.ID)
+		if op == nil {
+			return false, nil
+		}
+		if err := protocol.DecodeEmpty(frame.Meta); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, fmt.Errorf("%w: body.end does not accept a body", protocol.ErrProtocol)
+		}
+		if op.upload == nil {
+			return false, fmt.Errorf("%w: body.end is not valid for this operation", protocol.ErrProtocol)
+		}
+		if err := op.upload.end(); err != nil {
 			return false, err
 		}
 		return false, nil

@@ -39,6 +39,18 @@ type EmptyMeta struct{}
 // HeaderPair is one ordered HTTP header name and value.
 type HeaderPair [2]string
 
+// CookieMeta is one cookie supplied with a request.
+type CookieMeta struct {
+	Name     string `json:"name"`
+	Value    string `json:"value"`
+	Domain   string `json:"domain"`
+	Path     string `json:"path"`
+	Expires  *int64 `json:"expires"`
+	Secure   bool   `json:"secure"`
+	HttpOnly bool   `json:"httpOnly"`
+	SameSite string `json:"sameSite,omitempty"`
+}
+
 // IdentityMeta contains the fixed headers attached to every session request.
 type IdentityMeta struct {
 	Headers     []HeaderPair `json:"headers,omitempty"`
@@ -136,16 +148,25 @@ type SessionIDMeta struct {
 
 // RequestMeta is the metadata of a JS -> Go request frame.
 type RequestMeta struct {
-	SessionID       string       `json:"sessionId"`
-	URL             string       `json:"url"`
-	Method          string       `json:"method"`
-	Headers         []HeaderPair `json:"headers,omitempty"`
-	HeaderOrder     []string     `json:"headerOrder,omitempty"`
-	HasBody         bool         `json:"hasBody,omitempty"`
-	TimeoutMs       *int64       `json:"timeoutMs,omitempty"`
-	FollowRedirects *bool        `json:"followRedirects,omitempty"`
-	HostOverride    string       `json:"hostOverride,omitempty"`
+	SessionID       string             `json:"sessionId,omitempty"`
+	Config          *SessionConfigMeta `json:"config,omitempty"`
+	URL             string             `json:"url"`
+	Method          string             `json:"method"`
+	Headers         []HeaderPair       `json:"headers,omitempty"`
+	HeaderOrder     []string           `json:"headerOrder,omitempty"`
+	HasBody         bool               `json:"hasBody,omitempty"`
+	ContentLength   *int64             `json:"contentLength,omitempty"`
+	TimeoutMs       *int64             `json:"timeoutMs,omitempty"`
+	FollowRedirects *bool              `json:"followRedirects,omitempty"`
+	HostOverride    string             `json:"hostOverride,omitempty"`
+	Cookies         []CookieMeta       `json:"cookies,omitempty"`
 }
+
+// BodyChunkMeta is the metadata of a JS -> Go body.chunk frame.
+type BodyChunkMeta struct{}
+
+// BodyEndMeta is the metadata of a JS -> Go body.end frame.
+type BodyEndMeta struct{}
 
 // ResponseHeadersMeta is the first response frame for a request.
 type ResponseHeadersMeta struct {
