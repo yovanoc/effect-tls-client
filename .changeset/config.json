@@ -1,0 +1,23 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@4.0.0/schema.json",
+  "changelog": [
+    "@changesets/changelog-github",
+    { "repo": "yovanoc/effect-tls-client" }
+  ],
+  "commit": false,
+  "fixed": [
+    [
+      "effect-tls-client",
+      "@effect-tls-client/bridge-darwin-arm64",
+      "@effect-tls-client/bridge-darwin-x64",
+      "@effect-tls-client/bridge-linux-arm64",
+      "@effect-tls-client/bridge-linux-x64",
+      "@effect-tls-client/bridge-win32-x64"
+    ]
+  ],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": []
+}

@@ -1,0 +1,26 @@
+{
+  "name": "effect-tls-client-monorepo",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.2",
+  "workspaces": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "@changesets/changelog-github": "1.0.1",
+    "@changesets/cli": "3.0.3",
+    "turbo": "2.11.2"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "format": "turbo run format",
+    "check": "turbo run build test lint format",
+    "release": "changeset publish"
+  },
+  "engines": {
+    "bun": ">=1.4",
+    "node": ">=22"
+  }
+}

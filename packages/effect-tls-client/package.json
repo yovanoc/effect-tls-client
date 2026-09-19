@@ -1,0 +1,72 @@
+{
+  "name": "effect-tls-client",
+  "version": "0.0.0",
+  "description": "Effect-native access to bogdanfinn/tls-client via a Go Bridge sidecar",
+  "keywords": [
+    "effect",
+    "http",
+    "tls",
+    "tls-client"
+  ],
+  "license": "MIT",
+  "author": "yovanoc",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yovanoc/effect-tls-client.git",
+    "directory": "packages/effect-tls-client"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "prepare": "effect-tsgo patch --typescript --oxlint",
+    "build": "tsdown",
+    "test": "vitest run",
+    "dev:test": "vitest",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "format": "oxfmt --check",
+    "format:fix": "oxfmt",
+    "ts:check": "tsc --noEmit",
+    "check": "bun run --parallel format lint ts:check test"
+  },
+  "devDependencies": {
+    "@effect/platform-bun": "4.0.0-rc.116",
+    "@effect/platform-node": "4.0.0-rc.116",
+    "@effect/tsgo": "0.45.0",
+    "@effect/vitest": "4.0.0-rc.116",
+    "@types/bun": "latest",
+    "effect": "4.0.0-rc.116",
+    "oxfmt": "0.68.0",
+    "oxlint": "1.82.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "tsdown": "0.23.0",
+    "typescript": "7.0.2",
+    "vitest": "5.0.1"
+  },
+  "peerDependencies": {
+    "effect": ">=4.0.0-rc.116 || >=4.0.0"
+  },
+  "optionalDependencies": {
+    "@effect-tls-client/bridge-darwin-arm64": "0.0.0",
+    "@effect-tls-client/bridge-darwin-x64": "0.0.0",
+    "@effect-tls-client/bridge-linux-arm64": "0.0.0",
+    "@effect-tls-client/bridge-linux-x64": "0.0.0",
+    "@effect-tls-client/bridge-win32-x64": "0.0.0"
+  },
+  "engines": {
+    "bun": ">=1.4",
+    "node": ">=22"
+  }
+}

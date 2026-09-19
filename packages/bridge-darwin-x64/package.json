@@ -1,0 +1,14 @@
+{
+  "name": "@effect-tls-client/bridge-darwin-x64",
+  "version": "0.0.0",
+  "description": "effect-tls-client Bridge binary for darwin-x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yovanoc/effect-tls-client.git",
+    "directory": "packages/bridge-darwin-x64"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["bin"]
+}

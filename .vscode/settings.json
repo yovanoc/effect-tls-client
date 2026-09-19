@@ -1,0 +1,18 @@
+{
+  "js/ts.experimental.useTsgo": true,
+  "js/ts.tsdk.path": "./packages/effect-tls-client/node_modules/typescript",
+  "js/ts.tsdk.promptToUseWorkspaceVersion": true,
+  "oxc.fmt.configPath": "packages/effect-tls-client/oxfmt.config.ts",
+  "editor.defaultFormatter": "oxc.oxc-vscode",
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.oxc": "explicit"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "oxc.oxc-vscode",
+    "editor.formatOnSave": true
+  },
+  "go.toolsEnvVars": {
+    "GOWORK": "${workspaceFolder}/go.work"
+  }
+}

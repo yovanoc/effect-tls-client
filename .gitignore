@@ -1,6 +1,7 @@
 node_modules/
 dist/
 bridge/out/
+bridge/bridge
 packages/bridge-*/bin/*
 !packages/bridge-*/bin/.gitkeep
 .turbo/

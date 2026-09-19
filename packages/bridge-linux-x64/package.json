@@ -1,0 +1,14 @@
+{
+  "name": "@effect-tls-client/bridge-linux-x64",
+  "version": "0.0.0",
+  "description": "effect-tls-client Bridge binary for linux-x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yovanoc/effect-tls-client.git",
+    "directory": "packages/bridge-linux-x64"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["bin"]
+}
