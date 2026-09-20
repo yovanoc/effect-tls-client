@@ -109,17 +109,6 @@ jobs:
       - name: Install npm trusted-publishing CLI
         run: npm install --global npm@11.5.1
 
-      # NPM_TOKEN is optional for bootstrap/rotation.
-      # Without it, npm uses OIDC.
-      - name: Configure optional npm token
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -n "$NPM_TOKEN" ]; then
-            registry_auth="//registry.npmjs.org/:_authToken=$NPM_TOKEN"
-            printf '%s\n' "$registry_auth" >> "$HOME/.npmrc"
-          fi
-
       - name: Rebuild the packages before publishing
         run: bunx turbo run build
 
