@@ -92,7 +92,18 @@ jobs:
           --filter=@effect-tls-client/bridge-${{ matrix.target }}
 
       - name: Run the integration suite
+        if: matrix.target != 'win32-x64'
         run: bun run --cwd packages/effect-tls-client test
+
+      # Node cannot spawn a shebang .mjs fixture directly on Windows. The real
+      # Bridge integration files exercise the Windows binary without fixtures.
+      - name: Run Windows-compatible real integration suite
+        if: matrix.target == 'win32-x64'
+        run: >-
+          bun run --cwd packages/effect-tls-client test --
+          tests/session.integration.test.ts
+          tests/http-client.integration.test.ts
+          tests/websocket.test.ts
 
       - name: Run the Bun Bridge smoke test
         run: bun run --cwd packages/effect-tls-client test:bun
