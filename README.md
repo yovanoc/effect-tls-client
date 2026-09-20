@@ -257,8 +257,22 @@ example defaults to `wss://ws.postman-echo.com/raw`.
 ```sh
 bun install
 bunx turbo run build test lint format
+bun run check:bun # package checks in parallel with Bun
 bun run scripts/release-pack.ts
+bun run package:size
+
+# The benchmark uses the deterministic fake Bridge fixture.
+bun run benchmark
+bun run benchmark:compare -- main
 ```
+
+`benchmark:compare` builds the current checkout and a temporary worktree at the
+base ref, then compares the fake-Bridge median and compressed npm tarball sizes.
+It reports regressions above 10%; it does not fail on benchmark noise.
+
+Oxlint enables all rule categories plus type-aware Effect diagnostics through the
+shared workspace config. Existing findings are warnings while the baseline is
+migrated incrementally.
 
 Go checks run from the module directory:
 

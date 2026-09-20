@@ -1,19 +1,10 @@
 {
   "name": "effect-tls-client-monorepo",
   "private": true,
-  "type": "module",
-  "packageManager": "bun@1.4.2",
   "workspaces": [
     "packages/*"
   ],
-  "devDependencies": {
-    "@changesets/changelog-github": "1.0.1",
-    "@changesets/cli": "3.0.3",
-    "@effect/platform-bun": "4.0.0-rc.116",
-    "@effect/platform-node": "4.0.0-rc.116",
-    "effect": "4.0.0-rc.116",
-    "turbo": "2.11.2"
-  },
+  "type": "module",
   "scripts": {
     "build": "turbo run build",
     "test": "turbo run test",
@@ -21,10 +12,31 @@
     "format": "turbo run format",
     "check": "turbo run codegen:check build test lint format",
     "release": "changeset publish",
-    "release:pack": "bun scripts/release-pack.ts"
+    "release:pack": "bun scripts/release-pack.ts",
+    "benchmark": "bun scripts/benchmark.ts",
+    "benchmark:compare": "bun scripts/benchmark-compare.ts",
+    "package:size": "bun scripts/package-size.ts",
+    "check:bun": "bun run --cwd packages/effect-tls-client check",
+    "lint:root": "oxlint oxlint.config.ts oxfmt.config.ts scripts",
+    "format:root": "oxfmt --check package.json tsconfig.json turbo.json oxlint.config.ts oxfmt.config.ts scripts"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "1.0.1",
+    "@changesets/cli": "3.0.3",
+    "@effect/platform-bun": "4.0.0-rc.116",
+    "@effect/platform-node": "4.0.0-rc.116",
+    "@mpsuesser/oxlint-plugin-effect": "0.5.0",
+    "@types/bun": "1.4.2",
+    "@types/node": "26.6.2",
+    "effect": "4.0.0-rc.116",
+    "oxfmt": "0.68.0",
+    "oxlint": "1.82.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "turbo": "2.11.2"
   },
   "engines": {
     "bun": ">=1.4",
     "node": ">=22"
-  }
+  },
+  "packageManager": "bun@1.4.2"
 }

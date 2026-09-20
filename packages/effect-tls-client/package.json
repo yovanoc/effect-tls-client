@@ -45,11 +45,14 @@
     "check": "bun run --parallel format lint ts:check test"
   },
   "devDependencies": {
+    "@effect-tls-client/oxfmt-config": "workspace:*",
+    "@effect-tls-client/oxlint-config": "workspace:*",
     "@effect/platform-bun": "4.0.0-rc.116",
     "@effect/platform-node": "4.0.0-rc.116",
     "@effect/tsgo": "0.45.0",
     "@effect/vitest": "4.0.0-rc.116",
-    "@types/bun": "latest",
+    "@mpsuesser/oxlint-plugin-effect": "0.5.0",
+    "@types/bun": "1.4.2",
     "effect": "4.0.0-rc.116",
     "oxfmt": "0.68.0",
     "oxlint": "1.82.0",

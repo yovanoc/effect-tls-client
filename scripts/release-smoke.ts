@@ -32,7 +32,10 @@ const run = (command: Array<string>, cwd: string): void => {
 
 const repositoryRoot = resolve(import.meta.dir, "..");
 const packageJson = parseJson<PackageJson>(
-  readFileSync(join(repositoryRoot, "packages/effect-tls-client/package.json"), "utf8"),
+  readFileSync(
+    join(repositoryRoot, "packages/effect-tls-client/package.json"),
+    "utf8",
+  ),
   "effect-tls-client package metadata",
 );
 const dependencyVersion = (name: string): string => {
@@ -65,10 +68,14 @@ const platformPackages: Readonly<Record<string, string>> = {
 };
 const platformPackage = platformPackages[`${process.platform}-${process.arch}`];
 if (platformPackage === undefined) {
-  throw new Error(`release smoke does not support ${process.platform}-${process.arch}`);
+  throw new Error(
+    `release smoke does not support ${process.platform}-${process.arch}`,
+  );
 }
 
-const projectDirectory = mkdtempSync(join(tmpdir(), "effect-tls-client-smoke-"));
+const projectDirectory = mkdtempSync(
+  join(tmpdir(), "effect-tls-client-smoke-"),
+);
 try {
   writeFileSync(
     join(projectDirectory, "package.json"),

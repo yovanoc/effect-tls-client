@@ -1,0 +1,21 @@
+{
+  "name": "@effect-tls-client/oxfmt-config",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "types": "./base.ts",
+  "exports": {
+    "./base": {
+      "types": "./base.ts",
+      "import": "./base.ts"
+    }
+  },
+  "scripts": {
+    "lint": "oxlint",
+    "format": "oxfmt --check"
+  },
+  "devDependencies": {
+    "oxfmt": "0.68.0",
+    "oxlint": "1.82.0"
+  }
+}

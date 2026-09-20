@@ -66,7 +66,9 @@ const isHostBuild = Bun.argv.includes("--host");
 const packageDirectory = process.cwd();
 const packageJson = readPackage(
   join(
-    isHostBuild ? join(repositoryRoot, "packages", "effect-tls-client") : packageDirectory,
+    isHostBuild
+      ? join(repositoryRoot, "packages", "effect-tls-client")
+      : packageDirectory,
     "package.json",
   ),
 );

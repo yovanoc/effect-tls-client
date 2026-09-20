@@ -1,6 +1,1 @@
-import { defineConfig } from "oxfmt";
-
-export default defineConfig({
-  printWidth: 80,
-  exclude: ["dist"],
-});
+export { baseConfig as default } from "@effect-tls-client/oxfmt-config/base";

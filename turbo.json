@@ -13,12 +13,18 @@
       "dependsOn": ["build"],
       "env": ["TLS_CLIENT_BRIDGE_PATH", "TLS_CLIENT_INTEGRATION"]
     },
-    "lint": {},
-    "format": {},
+    "lint": {
+      "dependsOn": ["//#lint:root"]
+    },
+    "format": {
+      "dependsOn": ["//#format:root"]
+    },
     "codegen:check": {
       "dependsOn": ["bridge#build"],
       "env": ["TLS_CLIENT_BRIDGE_PATH"],
       "outputs": []
-    }
+    },
+    "//#format:root": {},
+    "//#lint:root": {}
   }
 }

@@ -1,4 +1,10 @@
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 
 type PackageJson = {
@@ -15,7 +21,9 @@ type PackResult = {
   readonly files?: ReadonlyArray<PackedFile>;
 };
 
-const repositoryRoot = resolve(import.meta.dir, "..");
+const repositoryRoot = resolve(
+  process.env.RELEASE_PACK_ROOT ?? resolve(import.meta.dir, ".."),
+);
 const packageDirectories = [
   "packages/effect-tls-client",
   "packages/bridge-darwin-arm64",
@@ -24,10 +32,13 @@ const packageDirectories = [
   "packages/bridge-linux-x64",
   "packages/bridge-win32-x64",
 ] as const;
-const outputDirectory = resolve(repositoryRoot, process.env.RELEASE_PACK_DIR ?? "release-packages");
+const outputDirectory = resolve(
+  repositoryRoot,
+  process.env.RELEASE_PACK_DIR ?? "release-packages",
+);
 
-const packageJsonPath = (directory: string): string => join(directory, "package.json");
-
+const packageJsonPath = (directory: string): string =>
+  join(directory, "package.json");
 const parseJson = <T>(text: string, description: string): T => {
   try {
     return JSON.parse(text) as T;
@@ -39,7 +50,8 @@ const parseJson = <T>(text: string, description: string): T => {
 rmSync(outputDirectory, { recursive: true, force: true });
 mkdirSync(outputDirectory, { recursive: true });
 
-const manifest: Array<{ readonly name: string; readonly filename: string }> = [];
+const manifest: Array<{ readonly name: string; readonly filename: string }> =
+  [];
 const versions = new Set<string>();
 
 for (const relativeDirectory of packageDirectories) {
@@ -50,7 +62,14 @@ for (const relativeDirectory of packageDirectories) {
   );
   versions.add(packageJson.version);
   const result = Bun.spawnSync(
-    ["npm", "pack", "--json", "--ignore-scripts", "--pack-destination", outputDirectory],
+    [
+      "npm",
+      "pack",
+      "--json",
+      "--ignore-scripts",
+      "--pack-destination",
+      outputDirectory,
+    ],
     {
       cwd: directory,
       stdout: "pipe",
@@ -71,7 +90,9 @@ for (const relativeDirectory of packageDirectories) {
   }
 
   if (packageJson.name.startsWith("@effect-tls-client/bridge-")) {
-    const expectedBinary = packageJson.name.endsWith("win32-x64") ? "bin/bridge.exe" : "bin/bridge";
+    const expectedBinary = packageJson.name.endsWith("win32-x64")
+      ? "bin/bridge.exe"
+      : "bin/bridge";
     const files = packResult.files ?? [];
     const binaryFiles = files.filter((file) => file.path.startsWith("bin/"));
     if (binaryFiles.length !== 1 || binaryFiles[0]?.path !== expectedBinary) {
@@ -87,8 +108,13 @@ for (const relativeDirectory of packageDirectories) {
 }
 
 if (versions.size !== 1) {
-  throw new Error(`release packages must share one version; got ${[...versions].join(", ")}`);
+  throw new Error(
+    `release packages must share one version; got ${[...versions].join(", ")}`,
+  );
 }
 
-writeFileSync(join(outputDirectory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+writeFileSync(
+  join(outputDirectory, "manifest.json"),
+  `${JSON.stringify(manifest, null, 2)}\n`,
+);
 console.log(`packed ${manifest.length} packages in ${outputDirectory}`);
