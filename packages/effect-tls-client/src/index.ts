@@ -1,4 +1,5 @@
 export { TlsClient, SessionConfig } from "./TlsClient.js";
+export * as TlsHttpClient from "./TlsHttpClient.js";
 export type {
   RequestBody,
   RequestCookieInput,
