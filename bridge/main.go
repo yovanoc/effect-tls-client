@@ -407,7 +407,22 @@ func (d *dispatcher) runStream(ctx context.Context, op *operation, meta protocol
 }
 
 func main() {
-	os.Exit(run(os.Stdin, os.Stdout, os.Stderr))
+	os.Exit(runCommand(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+func runCommand(args []string, input io.Reader, output, diagnostics io.Writer) int {
+	if len(args) == 0 {
+		return run(input, output, diagnostics)
+	}
+	if len(args) == 1 && args[0] == "dump" {
+		if err := writeDump(output); err != nil {
+			_, _ = io.WriteString(diagnostics, "dump: "+err.Error()+"\n")
+			return 1
+		}
+		return 0
+	}
+	_, _ = io.WriteString(diagnostics, "usage: bridge [dump]\n")
+	return 2
 }
 
 func run(input io.Reader, output io.Writer, diagnostics io.Writer) int {

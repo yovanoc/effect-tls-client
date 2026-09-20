@@ -1,4 +1,6 @@
 export { TlsClient, SessionConfig } from "./TlsClient.js";
+export { CustomProfile } from "./generated/CustomProfile.js";
+export { Profile } from "./generated/Profile.js";
 export * as TlsHttpClient from "./TlsHttpClient.js";
 export * as TlsClientMetrics from "./Telemetry.js";
 export type {

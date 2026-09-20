@@ -14,6 +14,11 @@
       "env": ["TLS_CLIENT_BRIDGE_PATH", "TLS_CLIENT_INTEGRATION"]
     },
     "lint": {},
-    "format": {}
+    "format": {},
+    "codegen:check": {
+      "dependsOn": ["bridge#build"],
+      "env": ["TLS_CLIENT_BRIDGE_PATH"],
+      "outputs": []
+    }
   }
 }

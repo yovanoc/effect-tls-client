@@ -32,6 +32,8 @@
   "scripts": {
     "prepare": "effect-tsgo patch --typescript --oxlint",
     "build": "tsdown",
+    "codegen": "bun ../../scripts/codegen.ts",
+    "codegen:check": "bun ../../scripts/codegen.ts --check",
     "test": "vitest run",
     "test:bun": "bun tests/bridge.bun.ts",
     "dev:test": "vitest",

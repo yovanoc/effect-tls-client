@@ -1279,6 +1279,29 @@ func validateCustomProfile(profile protocol.CustomProfileMeta) error {
 			return fmt.Errorf("unknown HTTP/3 setting %q", name)
 		}
 	}
+	if err := validatePinnedEnumValues("keyShareCurves value", profile.KeyShareCurves, pinnedSupportedCurves); err != nil {
+		return err
+	}
+	if err := validatePinnedEnumValues("supportedVersions value", profile.SupportedVersions, pinnedSupportedVersions); err != nil {
+		return err
+	}
+	if err := validatePinnedEnumValues("supportedSignatureAlgorithms value", profile.SupportedSignatureAlgorithms, pinnedSupportedSignatureAlgorithms); err != nil {
+		return err
+	}
+	if err := validatePinnedEnumValues("supportedDelegatedCredentialsAlgorithms value", profile.SupportedDelegatedCredentialsAlgorithms, pinnedSupportedDelegatedCredentialsAlgorithms); err != nil {
+		return err
+	}
+	if err := validatePinnedEnumValues("certCompressionAlgos value", profile.CertCompressionAlgos, pinnedCertCompressionAlgos); err != nil {
+		return err
+	}
+	for _, suite := range profile.ECHCandidateCipherSuites {
+		if !containsPinnedValue(pinnedKDFIDs, suite.KdfID) {
+			return unknownCustomProfileEnum("ECHCandidateCipherSuites.kdfId value", suite.KdfID)
+		}
+		if !containsPinnedValue(pinnedAEADIDs, suite.AeadID) {
+			return unknownCustomProfileEnum("ECHCandidateCipherSuites.aeadId value", suite.AeadID)
+		}
+	}
 	return nil
 }
 

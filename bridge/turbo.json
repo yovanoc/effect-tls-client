@@ -2,6 +2,10 @@
   "$schema": "https://turborepo.dev/schema.json",
   "extends": ["//"],
   "tasks": {
+    "build": {
+      "command": ["go", "build", "-o", "bridge", "."],
+      "outputs": ["bridge"]
+    },
     "test": {
       "command": ["go", "test", "-race", "./..."]
     }

@@ -16,7 +16,7 @@
     "test": "turbo run test",
     "lint": "turbo run lint",
     "format": "turbo run format",
-    "check": "turbo run build test lint format",
+    "check": "turbo run codegen:check build test lint format",
     "release": "changeset publish"
   },
   "engines": {

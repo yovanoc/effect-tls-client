@@ -39,7 +39,7 @@ jobs:
         env:
           TLS_CLIENT_BRIDGE_PATH: ${{ runner.temp }}/effect-tls-client-bridge
           TLS_CLIENT_INTEGRATION: "1"
-        run: bunx turbo run build test lint format
+        run: bunx turbo run codegen:check build test lint format
 
       - name: Test real Bridge with Bun
         env:

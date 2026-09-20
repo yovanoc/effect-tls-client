@@ -1,14 +1,21 @@
 import { Schema } from "effect";
+import {
+  CandidateCipherSuite,
+  CustomProfile,
+  PriorityFrame,
+  PriorityParam,
+} from "../generated/CustomProfile.js";
+import { ErrorKind, Profile } from "../generated/Profile.js";
 import { decodeUtf8 } from "./Frame.js";
+
+export { CandidateCipherSuite, CustomProfile, PriorityFrame, PriorityParam };
+export { ErrorKind, Profile };
 
 export const PROTOCOL_VERSION = 1;
 export const DEFAULT_WINDOW = 1024 * 1024;
 export const DEFAULT_CHUNK_SIZE = 64 * 1024;
 
 const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
-const UInt8 = NonNegativeInt.check(Schema.isLessThanOrEqualTo(0xff));
-const UInt16 = NonNegativeInt.check(Schema.isLessThanOrEqualTo(0xffff));
-const UInt32 = NonNegativeInt.check(Schema.isLessThanOrEqualTo(0xffffffff));
 const HeaderPair = Schema.Tuple([Schema.String, Schema.String]);
 const StringArray = Schema.Array(Schema.String);
 
@@ -38,64 +45,6 @@ export const Identity = Schema.Struct({
 });
 export interface Identity extends Schema.Schema.Type<typeof Identity> {}
 
-export const PriorityParam = Schema.Struct({
-  streamDep: UInt32,
-  exclusive: Schema.Boolean,
-  weight: UInt8,
-});
-export interface PriorityParam extends Schema.Schema.Type<
-  typeof PriorityParam
-> {}
-
-export const PriorityFrame = Schema.Struct({
-  priorityParam: PriorityParam,
-  streamID: UInt32,
-});
-export interface PriorityFrame extends Schema.Schema.Type<
-  typeof PriorityFrame
-> {}
-
-export const CandidateCipherSuite = Schema.Struct({
-  kdfId: Schema.String,
-  aeadId: Schema.String,
-});
-export interface CandidateCipherSuite extends Schema.Schema.Type<
-  typeof CandidateCipherSuite
-> {}
-
-/** Mirrors tls-client's customTlsClient input; Go performs semantic validation. */
-export const CustomProfile = Schema.Struct({
-  h2Settings: Schema.optionalKey(Schema.Record(Schema.String, UInt32)),
-  h2SettingsOrder: Schema.optionalKey(StringArray),
-  h3Settings: Schema.optionalKey(Schema.Record(Schema.String, NonNegativeInt)),
-  h3SettingsOrder: Schema.optionalKey(StringArray),
-  h3PseudoHeaderOrder: Schema.optionalKey(StringArray),
-  headerPriority: Schema.optionalKey(PriorityParam),
-  certCompressionAlgos: Schema.optionalKey(StringArray),
-  ja3String: Schema.optionalKey(Schema.String),
-  keyShareCurves: Schema.optionalKey(StringArray),
-  alpnProtocols: Schema.optionalKey(StringArray),
-  alpsProtocols: Schema.optionalKey(StringArray),
-  ECHCandidatePayloads: Schema.optionalKey(Schema.Array(UInt16)),
-  ECHCandidateCipherSuites: Schema.optionalKey(
-    Schema.Array(CandidateCipherSuite),
-  ),
-  priorityFrames: Schema.optionalKey(Schema.Array(PriorityFrame)),
-  pseudoHeaderOrder: Schema.optionalKey(StringArray),
-  supportedDelegatedCredentialsAlgorithms: Schema.optionalKey(StringArray),
-  supportedSignatureAlgorithms: Schema.optionalKey(StringArray),
-  supportedVersions: Schema.optionalKey(StringArray),
-  connectionFlow: Schema.optionalKey(UInt32),
-  recordSizeLimit: Schema.optionalKey(UInt16),
-  streamId: Schema.optionalKey(UInt32),
-  h3PriorityParam: Schema.optionalKey(UInt32),
-  h3SendGreaseFrames: Schema.optionalKey(Schema.Boolean),
-  allowHttp: Schema.optionalKey(Schema.Boolean),
-});
-export interface CustomProfile extends Schema.Schema.Type<
-  typeof CustomProfile
-> {}
-
 export const TransportOptions = Schema.Struct({
   idleConnTimeoutMs: Schema.optionalKey(NonNegativeInt),
   maxIdleConns: Schema.optionalKey(NonNegativeInt),
@@ -110,9 +59,6 @@ export const TransportOptions = Schema.Struct({
 export interface TransportOptions extends Schema.Schema.Type<
   typeof TransportOptions
 > {}
-
-export const Profile = Schema.String;
-export type Profile = Schema.Schema.Type<typeof Profile>;
 
 const SessionConfigBase = Schema.Struct({
   profile: Schema.optionalKey(Profile),
@@ -400,27 +346,6 @@ export const EndMeta = Schema.Struct({
 });
 export interface EndMeta extends Schema.Schema.Type<typeof EndMeta> {}
 
-export const ErrorKind = Schema.Literals([
-  "InvalidConfig",
-  "InvalidUrl",
-  "Dns",
-  "Connect",
-  "Tls",
-  "Proxy",
-  "Timeout",
-  "Cancelled",
-  "Http",
-  "Body",
-  "Pinning",
-  "SessionNotFound",
-  "SessionConfig",
-  "WsHandshake",
-  "WsRead",
-  "WsWrite",
-  "Protocol",
-  "Internal",
-  "Unknown",
-]);
 export type ErrorKind = Schema.Schema.Type<typeof ErrorKind>;
 
 /** Request error kinds produced by the current GET-only request path. */

@@ -977,6 +977,63 @@ describeRealIntegration("real Bridge session requests", () => {
     }),
   );
 
+  it.live("uses a generated custom profile against local TLS", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp2Server);
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            customProfile: {
+              ja3String:
+                "771,2570-4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,2570-18-5-27-11-0-10-35-16-65037-51-13-23-43-17513-65281-45-2570,2570-25497-29-23-24,0",
+              h2Settings: {
+                HEADER_TABLE_SIZE: 65536,
+                ENABLE_PUSH: 0,
+                INITIAL_WINDOW_SIZE: 6291456,
+                MAX_HEADER_LIST_SIZE: 262144,
+              },
+              h2SettingsOrder: [
+                "HEADER_TABLE_SIZE",
+                "ENABLE_PUSH",
+                "INITIAL_WINDOW_SIZE",
+                "MAX_HEADER_LIST_SIZE",
+              ],
+              pseudoHeaderOrder: [":method", ":authority", ":scheme", ":path"],
+              connectionFlow: 15663105,
+              keyShareCurves: ["GREASE", "X25519Kyber768", "X25519"],
+              supportedVersions: ["GREASE", "1.3", "1.2"],
+              supportedSignatureAlgorithms: [
+                "ECDSAWithP256AndSHA256",
+                "PSSWithSHA256",
+                "PKCS1WithSHA256",
+                "ECDSAWithP384AndSHA384",
+                "PSSWithSHA384",
+                "PKCS1WithSHA384",
+                "PSSWithSHA512",
+                "PKCS1WithSHA512",
+              ],
+              alpnProtocols: ["h2", "http/1.1"],
+              alpsProtocols: ["h2"],
+              ECHCandidateCipherSuites: [
+                { kdfId: "HKDF_SHA256", aeadId: "AEAD_AES_128_GCM" },
+                { kdfId: "HKDF_SHA256", aeadId: "AEAD_CHACHA20_POLY1305" },
+              ],
+              ECHCandidatePayloads: [128, 160, 192, 224],
+              certCompressionAlgos: ["brotli"],
+            },
+            insecureSkipVerify: true,
+            disableHttp3: true,
+          });
+          const response = yield* session.request(`${server.url}/h2`);
+          expect(response.protocol).toBe("HTTP/2.0");
+          expect(yield* response.text).toBe("https/2");
+        }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
   it.live("streams 50 MiB incrementally with bounded chunks", () =>
     Effect.gen(function* () {
       const server = yield* tryPromise(startHttp1Server);

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "Group Go Bridge dependency updates",
+      "matchManagers": ["gomod"],
+      "matchFileNames": ["bridge/go.mod"],
+      "groupName": "bridge Go dependencies"
+    }
+  ]
+}
