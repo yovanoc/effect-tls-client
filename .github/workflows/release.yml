@@ -105,6 +105,19 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
+      # npm 11.5.1+ is required for npm trusted publishing via GitHub OIDC.
+      - name: Install npm trusted-publishing CLI
+        run: npm install --global npm@11.5.1
+
+      # NPM_TOKEN is optional: use it for bootstrap/rotation, otherwise npm uses OIDC.
+      - name: Configure optional npm token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            printf '%s\n' "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> "$HOME/.npmrc"
+          fi
+
       - name: Rebuild the packages before publishing
         run: bunx turbo run build
 
