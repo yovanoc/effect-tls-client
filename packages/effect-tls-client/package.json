@@ -1,6 +1,6 @@
 {
   "name": "effect-tls-client",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Effect-native access to bogdanfinn/tls-client via a Go Bridge sidecar",
   "keywords": [
     "effect",
@@ -62,11 +62,11 @@
     "effect": ">=4.0.0-rc.116 || >=4.0.0"
   },
   "optionalDependencies": {
-    "@effect-tls-client/bridge-darwin-arm64": "0.0.0",
-    "@effect-tls-client/bridge-darwin-x64": "0.0.0",
-    "@effect-tls-client/bridge-linux-arm64": "0.0.0",
-    "@effect-tls-client/bridge-linux-x64": "0.0.0",
-    "@effect-tls-client/bridge-win32-x64": "0.0.0"
+    "@effect-tls-client/bridge-darwin-arm64": "0.1.0",
+    "@effect-tls-client/bridge-darwin-x64": "0.1.0",
+    "@effect-tls-client/bridge-linux-arm64": "0.1.0",
+    "@effect-tls-client/bridge-linux-x64": "0.1.0",
+    "@effect-tls-client/bridge-win32-x64": "0.1.0"
   },
   "engines": {
     "bun": ">=1.4",

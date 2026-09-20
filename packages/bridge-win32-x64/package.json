@@ -1,6 +1,6 @@
 {
   "name": "@effect-tls-client/bridge-win32-x64",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "effect-tls-client Bridge binary for win32-x64",
   "license": "MIT",
   "repository": {
