@@ -1,5 +1,6 @@
 export { TlsClient, SessionConfig } from "./TlsClient.js";
 export * as TlsHttpClient from "./TlsHttpClient.js";
+export * as TlsClientMetrics from "./Telemetry.js";
 export type {
   RequestBody,
   RequestCookieInput,
@@ -9,6 +10,7 @@ export type {
   ProxyInput,
   TlsClientService,
   TlsResponse,
+  Bandwidth,
   TlsSession,
 } from "./TlsClient.js";
 export {

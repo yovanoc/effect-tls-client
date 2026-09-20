@@ -1,5 +1,13 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Deferred, Effect, Fiber, Layer, Stream } from "effect";
+import {
+  ConfigProvider,
+  Deferred,
+  Effect,
+  Fiber,
+  Layer,
+  Metric,
+  Stream,
+} from "effect";
 import type { Scope } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import { fileURLToPath } from "node:url";
@@ -8,6 +16,7 @@ import {
   SessionConfig,
   SessionConfigError,
   TlsClient,
+  TlsClientMetrics,
   TlsRequestError,
   isTransientRequestKind,
 } from "../src/index.js";
@@ -78,6 +87,100 @@ describe("TlsClient sessions", () => {
       }),
     ),
   );
+
+  it.effect("exposes bandwidth totals and active-session telemetry", () => {
+    const registry = new Map();
+    const requests = Effect.gen(function* () {
+      const client = yield* TlsClient;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const session = yield* client.session({ profile: "chrome_146" });
+          expect(
+            (yield* Metric.value(TlsClientMetrics.sessionsActive)).value,
+          ).toBe(1);
+          const response = yield* session.request(
+            "https://fixture.test/telemetry",
+          );
+          yield* response.bytes;
+          expect((yield* session.bandwidth).read).toBeGreaterThan(0);
+          expect((yield* client.bandwidth).read).toBeGreaterThan(0);
+          yield* session.resetBandwidth;
+          expect((yield* session.bandwidth).read).toBe(0);
+        }),
+      );
+      expect((yield* Metric.value(TlsClientMetrics.sessionsActive)).value).toBe(
+        0,
+      );
+      expect((yield* client.bandwidth).read).toBeGreaterThan(0);
+      yield* client.resetBandwidth;
+      expect((yield* client.bandwidth).read).toBe(0);
+    });
+    return withClient(requests).pipe(
+      Effect.provideService(Metric.MetricRegistry, registry),
+    );
+  });
+
+  it.effect("records GET, POST, and unread-response telemetry", () => {
+    const registry = new Map();
+    const requests = Effect.gen(function* () {
+      const client = yield* TlsClient;
+      const config = { profile: "chrome_146" };
+      const get = yield* client.request(
+        config,
+        "https://fixture.test/telemetry-get",
+      );
+      yield* get.bytes;
+      const post = yield* client.request(config, {
+        url: "https://fixture.test/telemetry-post",
+        method: "POST",
+        body: new Uint8Array([1, 2, 3]),
+      });
+      yield* post.bytes;
+      const unread = yield* client.request(
+        config,
+        "https://fixture.test/telemetry-unread",
+      );
+      yield* unread.close;
+    });
+    const requestMetric = Metric.withAttributes(TlsClientMetrics.requests, {
+      profile: "chrome_146",
+      protocol: "HTTP/1.1",
+      error_kind: "none",
+    });
+    return withClient(requests).pipe(
+      Effect.tap(() =>
+        Effect.gen(function* () {
+          expect((yield* Metric.value(requestMetric)).count).toBe(2);
+          expect(
+            (yield* Metric.value(
+              Metric.withAttributes(TlsClientMetrics.requests, {
+                profile: "chrome_146",
+                protocol: "HTTP/1.1",
+                error_kind: "Cancelled",
+              }),
+            )).count,
+          ).toBe(1);
+          expect(
+            (yield* Metric.value(
+              Metric.withAttributes(TlsClientMetrics.bytesRead, {
+                profile: "chrome_146",
+                protocol: "HTTP/1.1",
+              }),
+            )).count,
+          ).toBeGreaterThan(0);
+          expect(
+            (yield* Metric.value(
+              Metric.withAttributes(TlsClientMetrics.bytesWritten, {
+                profile: "chrome_146",
+                protocol: "HTTP/1.1",
+              }),
+            )).count,
+          ).toBeGreaterThan(0);
+        }),
+      ),
+      Effect.provideService(Metric.MetricRegistry, registry),
+    );
+  });
 
   it.effect("rejects mutually exclusive profile configuration", () =>
     Effect.flip(

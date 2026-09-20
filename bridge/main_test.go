@@ -541,3 +541,61 @@ func TestConcurrentDebugOperationsKeepTheirIds(t *testing.T) {
 	}
 	assertNoTestFrame(t, writer.frames)
 }
+
+func TestBandwidthOperations(t *testing.T) {
+	dispatcher, writer := newTestDispatcher()
+	defer dispatcher.stop()
+
+	getMeta, err := protocol.EncodeMeta(protocol.BandwidthMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatchBandwidth := func(id uint32, kind protocol.Kind, meta []byte) protocol.Frame {
+		t.Helper()
+		if _, err := dispatcher.dispatch(protocol.Frame{Kind: kind, ID: id, Meta: meta}); err != nil {
+			t.Fatal(err)
+		}
+		return nextTestFrame(t, writer.frames)
+	}
+
+	dispatcher.retiredBandwidth.add(bandwidthSnapshot{read: 7, written: 11})
+	frame := dispatchBandwidth(1, protocol.KindBandwidthGet, getMeta)
+	if frame.Kind != protocol.KindOk || frame.ID != 1 {
+		t.Fatalf("bandwidth.get frame = %+v", frame)
+	}
+	var result protocol.BandwidthResultMeta
+	if err := protocol.DecodeObject(frame.Meta, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Read != 7 || result.Written != 11 {
+		t.Fatalf("bandwidth.get result = %+v", result)
+	}
+
+	frame = dispatchBandwidth(2, protocol.KindBandwidthReset, getMeta)
+	if frame.Kind != protocol.KindOk || frame.ID != 2 {
+		t.Fatalf("bandwidth.reset frame = %+v", frame)
+	}
+	frame = dispatchBandwidth(3, protocol.KindBandwidthGet, getMeta)
+	if err := protocol.DecodeObject(frame.Meta, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Read != 0 || result.Written != 0 {
+		t.Fatalf("reset bandwidth result = %+v", result)
+	}
+
+	sessionMeta, err := protocol.EncodeMeta(protocol.BandwidthMeta{SessionID: "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame = dispatchBandwidth(4, protocol.KindBandwidthGet, sessionMeta)
+	if frame.Kind != protocol.KindError || frame.ID != 4 {
+		t.Fatalf("missing session bandwidth frame = %+v", frame)
+	}
+	var errorMeta protocol.ErrorMeta
+	if err := protocol.DecodeObject(frame.Meta, &errorMeta); err != nil {
+		t.Fatal(err)
+	}
+	if errorMeta.Kind != protocol.ErrorKindSessionNotFound {
+		t.Fatalf("missing session bandwidth error = %+v", errorMeta)
+	}
+}

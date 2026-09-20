@@ -34,6 +34,7 @@ import {
 } from "./Frame.js";
 import {
   AckMeta,
+  BandwidthMeta,
   BodyChunkMeta,
   BodyEndMeta,
   CancelMeta,
@@ -88,7 +89,9 @@ type CallKind =
   | typeof FrameKind.cookiesGet
   | typeof FrameKind.cookiesSet
   | typeof FrameKind.cookiesExport
-  | typeof FrameKind.cookiesImport;
+  | typeof FrameKind.cookiesImport
+  | typeof FrameKind.bandwidthGet
+  | typeof FrameKind.bandwidthReset;
 
 export interface BridgeVersion {
   readonly packageVersion: string;
@@ -894,9 +897,15 @@ const makeBridge = Effect.gen(function* () {
         Schema.decodeUnknownSync(CookiesExportMeta)(meta ?? {}),
       );
     }
+    if (kind === FrameKind.cookiesImport) {
+      return encodeMeta(
+        CookiesImportMeta,
+        Schema.decodeUnknownSync(CookiesImportMeta)(meta ?? {}),
+      );
+    }
     return encodeMeta(
-      CookiesImportMeta,
-      Schema.decodeUnknownSync(CookiesImportMeta)(meta ?? {}),
+      BandwidthMeta,
+      Schema.decodeUnknownSync(BandwidthMeta)(meta ?? {}),
     );
   };
 

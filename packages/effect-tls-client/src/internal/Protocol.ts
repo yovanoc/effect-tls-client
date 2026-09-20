@@ -234,6 +234,21 @@ export interface CookiesResultMeta extends Schema.Schema.Type<
   typeof CookiesResultMeta
 > {}
 
+export const BandwidthMeta = Schema.Struct({
+  sessionId: Schema.optionalKey(Schema.String),
+});
+export interface BandwidthMeta extends Schema.Schema.Type<
+  typeof BandwidthMeta
+> {}
+
+export const BandwidthResultMeta = Schema.Struct({
+  read: NonNegativeInt,
+  written: NonNegativeInt,
+});
+export interface BandwidthResultMeta extends Schema.Schema.Type<
+  typeof BandwidthResultMeta
+> {}
+
 export const RequestMeta = Schema.Struct({
   sessionId: Schema.optionalKey(Schema.String),
   config: Schema.optionalKey(SessionConfig),

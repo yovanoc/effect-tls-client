@@ -48,6 +48,8 @@ const responseFor = (
   protocol: "HTTP/1.1",
   cookies: Cookies.fromSetCookie(["fixture=1; Path=/"]),
   stream,
+  bytesRead: Effect.succeed(body.byteLength),
+  bytesWritten: Effect.succeed(0),
   bytes: Effect.succeed(body),
   text: Effect.succeed(new TextDecoder().decode(body)),
   json: Effect.succeed({ ok: true }),
@@ -70,6 +72,8 @@ const makeSession = (
   setCookies: () => Effect.die("unused"),
   exportCookies: Effect.die("unused"),
   importCookies: () => Effect.die("unused"),
+  bandwidth: Effect.succeed({ read: 0, written: 0 }),
+  resetBandwidth: Effect.void,
   setProxy: () => Effect.die("unused"),
 });
 

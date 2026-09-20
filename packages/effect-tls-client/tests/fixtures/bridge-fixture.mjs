@@ -7,6 +7,8 @@ const mismatch = process.argv.includes("--mismatch");
 const exitOnPing = process.argv.includes("--exit");
 const delayedStderr = process.argv.includes("--delayed-stderr");
 const sessions = new Set();
+const sessionBandwidth = new Map();
+let processBandwidth = { read: 0, written: 0 };
 let buffer = Buffer.alloc(0);
 const writeFrame = (kind, id, metadata = {}, body = undefined) => {
   const meta = Buffer.from(JSON.stringify(metadata));
@@ -50,12 +52,47 @@ process.stdin.on("data", (chunk) => {
         });
       } else {
         sessions.add(metadata.sessionId);
+        sessionBandwidth.set(metadata.sessionId, { read: 0, written: 0 });
         writeFrame(0x81, id, {});
       }
     } else if (kind === 0x11) {
       const metadata = JSON.parse(frame.subarray(9).toString("utf8"));
       sessions.delete(metadata.sessionId);
+      sessionBandwidth.delete(metadata.sessionId);
       writeFrame(0x81, id, {});
+    } else if (kind === 0x17 || kind === 0x18) {
+      const metadata = JSON.parse(frame.subarray(9).toString("utf8"));
+      const target =
+        metadata.sessionId === undefined
+          ? processBandwidth
+          : sessionBandwidth.get(metadata.sessionId);
+      if (metadata.sessionId !== undefined && target === undefined) {
+        writeFrame(0x82, id, {
+          kind: "SessionNotFound",
+          message: "session not found",
+          detail: { sessionId: metadata.sessionId },
+        });
+      } else if (kind === 0x17) {
+        writeFrame(0x81, id, target);
+      } else {
+        if (metadata.sessionId === undefined) {
+          processBandwidth = { read: 0, written: 0 };
+        } else {
+          sessionBandwidth.set(metadata.sessionId, { read: 0, written: 0 });
+        }
+        writeFrame(0x81, id, {});
+      }
+    } else if (kind === 0x40) {
+      writeFrame(0x82, id, {
+        kind: "Cancelled",
+        message: "cancelled",
+      });
+    } else if (kind === 0x21) {
+      const metadataLength = frame.readUInt32BE(5);
+      const bodyLength = frame.length - 9 - metadataLength;
+      writeFrame(0xc1, id, { bytes: bodyLength });
+    } else if (kind === 0x22) {
+      // The request's response end frame is the terminal acknowledgement.
     } else if (kind === 0x20) {
       const metadata = JSON.parse(frame.subarray(9).toString("utf8"));
       if (metadata.url.endsWith("/connect-error")) {
@@ -68,7 +105,10 @@ process.stdin.on("data", (chunk) => {
           kind: "Internal",
           message: "fixture internal failure",
         });
-      } else if (!sessions.has(metadata.sessionId)) {
+      } else if (
+        metadata.sessionId !== undefined &&
+        !sessions.has(metadata.sessionId)
+      ) {
         writeFrame(0x82, id, {
           kind: "SessionNotFound",
           message: "session not found",
@@ -84,11 +124,23 @@ process.stdin.on("data", (chunk) => {
           ],
           protocol: "HTTP/1.1",
         });
+        if (metadata.url.endsWith("/telemetry-unread")) continue;
         writeFrame(0x91, id, {}, Buffer.from('{"ok":true}'));
+        const bytes = {
+          read: 11,
+          written: metadata.hasBody ? Number(metadata.contentLength ?? 1) : 0,
+        };
+        processBandwidth.read += bytes.read;
+        processBandwidth.written += bytes.written;
+        const current = sessionBandwidth.get(metadata.sessionId);
+        if (current !== undefined) {
+          current.read += bytes.read;
+          current.written += bytes.written;
+        }
         writeFrame(0x92, id, {
           protocol: "HTTP/1.1",
-          bytesRead: 11,
-          bytesWritten: 0,
+          bytesRead: bytes.read,
+          bytesWritten: bytes.written,
         });
       }
     } else if (kind === 0xf0) {

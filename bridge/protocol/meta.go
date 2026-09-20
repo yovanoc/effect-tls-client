@@ -183,6 +183,17 @@ type CookiesResultMeta struct {
 	Cookies []CookieMeta `json:"cookies"`
 }
 
+// BandwidthMeta selects either a session or the process-wide totals.
+type BandwidthMeta struct {
+	SessionID string `json:"sessionId,omitempty"`
+}
+
+// BandwidthResultMeta is the result of a bandwidth.get operation.
+type BandwidthResultMeta struct {
+	Read    uint64 `json:"read"`
+	Written uint64 `json:"written"`
+}
+
 // RequestMeta is the metadata of a JS -> Go request frame.
 type RequestMeta struct {
 	SessionID       string             `json:"sessionId,omitempty"`

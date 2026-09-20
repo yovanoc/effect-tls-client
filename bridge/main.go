@@ -40,6 +40,7 @@ type operation struct {
 	id        uint32
 	sessionID string
 	cancel    context.CancelFunc
+	done      chan struct{}
 	credits   *credits
 	upload    *requestUpload
 	ws        *webSocketState
@@ -52,6 +53,32 @@ type credits struct {
 	sent   uint64
 	acked  uint64
 	wake   chan struct{}
+}
+
+type bandwidthTotals struct {
+	mu      sync.Mutex
+	read    uint64
+	written uint64
+}
+
+func (t *bandwidthTotals) add(snapshot bandwidthSnapshot) {
+	t.mu.Lock()
+	t.read += bandwidthValue(snapshot.read)
+	t.written += bandwidthValue(snapshot.written)
+	t.mu.Unlock()
+}
+
+func (t *bandwidthTotals) snapshot() protocol.BandwidthResultMeta {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return protocol.BandwidthResultMeta{Read: t.read, Written: t.written}
+}
+
+func (t *bandwidthTotals) reset() {
+	t.mu.Lock()
+	t.read = 0
+	t.written = 0
+	t.mu.Unlock()
 }
 
 func newCredits(window uint64) *credits {
@@ -117,12 +144,14 @@ func (c *credits) reserveWhole(ctx context.Context, requested uint64) bool {
 }
 
 type dispatcher struct {
-	writer     *protocol.Writer
-	settings   bridgeSettings
-	sessions   *sessionStore
-	mu         sync.Mutex
-	operations map[uint32]*operation
-	waitGroup  sync.WaitGroup
+	writer           *protocol.Writer
+	settings         bridgeSettings
+	sessions         *sessionStore
+	retiredBandwidth bandwidthTotals
+	bandwidthMu      sync.Mutex
+	mu               sync.Mutex
+	operations       map[uint32]*operation
+	waitGroup        sync.WaitGroup
 }
 
 func newDispatcher(writer *protocol.Writer, settings bridgeSettings) *dispatcher {
@@ -134,6 +163,40 @@ func newDispatcher(writer *protocol.Writer, settings bridgeSettings) *dispatcher
 	}
 }
 
+func (d *dispatcher) retireSession(session *tlsSession) {
+	d.bandwidthMu.Lock()
+	defer d.bandwidthMu.Unlock()
+	d.retiredBandwidth.add(aggregateBandwidth(session.client, session.redirectClient, session.wsClient))
+}
+
+func (d *dispatcher) processBandwidth(ctx context.Context) (protocol.BandwidthResultMeta, error) {
+	d.bandwidthMu.Lock()
+	defer d.bandwidthMu.Unlock()
+	result := d.retiredBandwidth.snapshot()
+	for _, session := range d.sessions.all() {
+		current, err := session.bandwidth(ctx)
+		if err != nil {
+			return protocol.BandwidthResultMeta{}, err
+		}
+		result.Read += current.Read
+		result.Written += current.Written
+	}
+	return result, nil
+}
+
+func (d *dispatcher) resetProcessBandwidth(ctx context.Context) error {
+	sessions := d.sessions.all()
+	for _, session := range sessions {
+		if err := session.resetBandwidth(ctx); err != nil {
+			return err
+		}
+	}
+	d.bandwidthMu.Lock()
+	d.retiredBandwidth.reset()
+	d.bandwidthMu.Unlock()
+	return nil
+}
+
 func (d *dispatcher) start(id uint32, credited bool, sessionID string, run func(context.Context, *operation)) error {
 	return d.startWithSetup(id, credited, sessionID, nil, run)
 }
@@ -143,7 +206,12 @@ func (d *dispatcher) startWithSetup(id uint32, credited bool, sessionID string, 
 		return fmt.Errorf("operation id 0 is reserved")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	op := &operation{id: id, sessionID: sessionID, cancel: cancel}
+	op := &operation{
+		id:        id,
+		sessionID: sessionID,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+	}
 	if credited {
 		op.credits = newCredits(d.settings.window)
 	}
@@ -164,6 +232,7 @@ func (d *dispatcher) startWithSetup(id uint32, credited bool, sessionID string, 
 
 	go func() {
 		defer d.waitGroup.Done()
+		defer close(op.done)
 		run(ctx, op)
 	}()
 	return nil
@@ -213,11 +282,14 @@ func (op *operation) stop() {
 	}
 }
 
-func (d *dispatcher) cancelSession(sessionID string) {
+func (d *dispatcher) cancelSession(
+	sessionID string,
+	current *operation,
+) []*operation {
 	d.mu.Lock()
 	operations := make([]*operation, 0)
 	for _, op := range d.operations {
-		if op.sessionID == sessionID {
+		if op != current && op.sessionID == sessionID {
 			operations = append(operations, op)
 		}
 	}
@@ -225,6 +297,7 @@ func (d *dispatcher) cancelSession(sessionID string) {
 	for _, op := range operations {
 		op.stop()
 	}
+	return operations
 }
 
 func (d *dispatcher) cancelAll() {
@@ -667,6 +740,31 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		}
 		return false, nil
 
+	case protocol.KindBandwidthGet, protocol.KindBandwidthReset:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "bandwidth operation id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "bandwidth operation does not accept a body")
+		}
+		var meta protocol.BandwidthMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			if frame.Kind == protocol.KindBandwidthGet {
+				d.runBandwidthGet(ctx, op, meta)
+			} else {
+				d.runBandwidthReset(ctx, op, meta)
+			}
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
 	case protocol.KindRequest:
 		if frame.ID == 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "request id 0 is reserved")
@@ -791,7 +889,9 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 			return false, writeProtocolError(d.writer, frame.ID, "shutdown does not accept a body")
 		}
 		d.stop()
-		d.sessions.closeAll()
+		for _, session := range d.sessions.closeAll() {
+			d.retireSession(session)
+		}
 		return true, writeEmptyResponse(d.writer, protocol.KindOk, 0)
 
 	case protocol.KindHello:

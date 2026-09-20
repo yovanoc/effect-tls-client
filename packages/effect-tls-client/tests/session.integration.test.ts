@@ -4,6 +4,7 @@ import {
   Effect,
   Fiber,
   Layer,
+  Metric,
   Option,
   Result,
   Stream,
@@ -18,7 +19,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Bridge } from "../src/internal/Bridge.js";
 import { FrameKind } from "../src/internal/Frame.js";
-import { TlsClient } from "../src/index.js";
+import { TlsClient, TlsClientMetrics } from "../src/index.js";
 
 const configuredBridgePath = process.env["TLS_CLIENT_BRIDGE_PATH"];
 const realBridgePath = configuredBridgePath ?? "";
@@ -1095,6 +1096,42 @@ describeRealIntegration("real Bridge session requests", () => {
           const followUp = yield* session.request(`${server.url}/headers`);
           expect(yield* followUp.text).toBe("http/1.1");
         }),
+      ).pipe(Effect.ensuring(Effect.promise(server.close)));
+    }),
+  );
+
+  it.live("exposes public bandwidth and metric totals", () =>
+    Effect.gen(function* () {
+      const server = yield* tryPromise(startHttp2Server);
+      const registry = new Map();
+      return yield* withClientAt(
+        realBridgePath,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({
+            profile: "chrome_146",
+            insecureSkipVerify: true,
+            disableHttp3: true,
+          });
+          const response = yield* session.request(`${server.url}/h2`);
+          expect(yield* response.bytesRead).toBeGreaterThan(0);
+          expect(yield* response.bytesWritten).toBeGreaterThan(0);
+          expect((yield* session.bandwidth).read).toBeGreaterThan(0);
+          expect((yield* client.bandwidth).read).toBeGreaterThan(0);
+          expect(
+            (yield* Metric.value(
+              Metric.withAttributes(TlsClientMetrics.requests, {
+                profile: "chrome_146",
+                protocol: "HTTP/2.0",
+                error_kind: "none",
+              }),
+            )).count,
+          ).toBe(1);
+          yield* session.resetBandwidth;
+          expect((yield* session.bandwidth).read).toBe(0);
+          yield* client.resetBandwidth;
+          expect((yield* client.bandwidth).read).toBe(0);
+        }).pipe(Effect.provideService(Metric.MetricRegistry, registry)),
       ).pipe(Effect.ensuring(Effect.promise(server.close)));
     }),
   );

@@ -4,6 +4,7 @@ import {
   Duration,
   Effect,
   Layer,
+  Metric,
   Result,
   Schema,
   Stream,
@@ -13,7 +14,7 @@ import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import { NodeServices } from "@effect/platform-node";
 import { createServer } from "node:http";
-import { TlsHttpClient } from "../src/index.js";
+import { TlsClientMetrics, TlsHttpClient } from "../src/index.js";
 
 const bridgePath = process.env["TLS_CLIENT_BRIDGE_PATH"];
 const describeRealIntegration =
@@ -103,6 +104,33 @@ const clientLayer = TlsHttpClient.layer({ profile: "chrome_146" }).pipe(
 );
 
 describeRealIntegration("TlsHttpClient real Bridge integration", () => {
+  it.live("records real Bridge GET and POST telemetry", () => {
+    const registry = new Map();
+    return Effect.gen(function* () {
+      const server = yield* Effect.acquireRelease(
+        Effect.promise(startServer),
+        (value) => Effect.promise(value.close),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const client = yield* HttpClient.HttpClient;
+          const get = yield* client.get(`${server.baseUrl}/json`);
+          yield* get.arrayBuffer;
+          const post = yield* client.post(`${server.baseUrl}/json`, {
+            body: HttpBody.uint8Array(new Uint8Array([1, 2, 3])),
+          });
+          yield* post.arrayBuffer;
+        }).pipe(Effect.provide(clientLayer)),
+      );
+      const requestMetric = Metric.withAttributes(TlsClientMetrics.requests, {
+        profile: "chrome_146",
+        protocol: "HTTP/1.1",
+        error_kind: "none",
+      });
+      expect((yield* Metric.value(requestMetric)).count).toBe(2);
+    }).pipe(Effect.provideService(Metric.MetricRegistry, registry));
+  });
+
   it.live(
     "redirects, cancels, closes early streams, and maps upload failures",
     () =>

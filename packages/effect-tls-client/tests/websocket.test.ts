@@ -6,6 +6,7 @@ import {
   Effect,
   Fiber,
   Layer,
+  Metric,
   Option,
   Queue,
   Schedule,
@@ -22,7 +23,7 @@ import {
   type WebSocketFrame,
 } from "../src/internal/Bridge.js";
 import { FrameKind } from "../src/internal/Frame.js";
-import { TlsWebSocketError } from "../src/index.js";
+import { TlsClientMetrics, TlsWebSocketError } from "../src/index.js";
 import { TlsClient } from "../src/TlsClient.js";
 import { makeTlsClientLayer } from "../src/TlsClient.js";
 
@@ -295,6 +296,37 @@ describe("TlsClient WebSockets", () => {
     }),
   );
 
+  it.effect("tracks active WebSocket connections by scope", () => {
+    const registry = new Map();
+    const bridge = fakeBridge(() =>
+      Effect.succeed({
+        open: { status: 101, headers: [] },
+        pull: Effect.never,
+        write: () => Effect.void,
+        close: () => Effect.void,
+      }),
+    );
+    return Effect.gen(function* () {
+      yield* fakeClient(
+        bridge,
+        Effect.gen(function* () {
+          const client = yield* TlsClient;
+          const session = yield* client.session({ profile: "chrome_146" });
+          const socket = yield* session.webSocket("ws://fixture.test/echo");
+          yield* socket.reader;
+          expect(
+            (yield* Metric.value(TlsClientMetrics.webSocketConnectionsActive))
+              .value,
+          ).toBe(1);
+        }),
+      );
+      expect(
+        (yield* Metric.value(TlsClientMetrics.webSocketConnectionsActive))
+          .value,
+      ).toBe(0);
+    }).pipe(Effect.provideService(Metric.MetricRegistry, registry));
+  });
+
   it.effect("maps a remote close to SocketCloseError", () => {
     const bridge = fakeBridge(() =>
       Effect.succeed({
@@ -337,6 +369,7 @@ const describeReal =
 
 describeReal("Real Bridge WebSockets", () => {
   it("echoes text and binary frames through the fingerprinted HTTP/1 dialer", async () => {
+    const registry = new Map();
     const server = await startWebSocketServer();
     try {
       await Effect.runPromise(
@@ -351,6 +384,10 @@ describeReal("Real Bridge WebSockets", () => {
               headers: [["X-Request", "yes"]],
             });
             const reader = yield* socket.reader;
+            expect(
+              (yield* Metric.value(TlsClientMetrics.webSocketConnectionsActive))
+                .value,
+            ).toBe(1);
             const writer = yield* socket.writer;
             yield* writer.write("hello");
             expect(yield* reader.pull).toEqual(["hello"]);
@@ -362,24 +399,34 @@ describeReal("Real Bridge WebSockets", () => {
             expect(server.headers.get("x-identity")).toBe("yes");
             expect(server.headers.get("x-request")).toBe("yes");
             yield* writer.write(new Socket.CloseEvent(1000, "done"));
-          }).pipe(
-            Effect.provide(
-              TlsClient.layer.pipe(
-                Layer.provide(
-                  Layer.mergeAll(
-                    NodeServices.layer,
-                    ConfigProvider.layer(
-                      ConfigProvider.fromUnknown({
-                        TLS_CLIENT_BRIDGE_PATH: configuredBridgePath,
-                      }),
+          })
+            .pipe(
+              Effect.provide(
+                TlsClient.layer.pipe(
+                  Layer.provide(
+                    Layer.mergeAll(
+                      NodeServices.layer,
+                      ConfigProvider.layer(
+                        ConfigProvider.fromUnknown({
+                          TLS_CLIENT_BRIDGE_PATH: configuredBridgePath,
+                        }),
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-          ),
+            )
+            .pipe(Effect.provideService(Metric.MetricRegistry, registry)),
         ),
       );
+      const active = await Effect.runPromise(
+        Effect.provideService(
+          Metric.value(TlsClientMetrics.webSocketConnectionsActive),
+          Metric.MetricRegistry,
+          registry,
+        ),
+      );
+      expect(active.value).toBe(0);
     } finally {
       await server.close();
     }

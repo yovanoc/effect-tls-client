@@ -615,6 +615,30 @@ func snapshotBandwidth(client tlsClient.HttpClient) bandwidthSnapshot {
 	}
 }
 
+func aggregateBandwidth(clients ...tlsClient.HttpClient) bandwidthSnapshot {
+	var result bandwidthSnapshot
+	for _, client := range clients {
+		snapshot := snapshotBandwidth(client)
+		result.read += snapshot.read
+		result.written += snapshot.written
+	}
+	return result
+}
+
+func bandwidthValue(value int64) uint64 {
+	if value <= 0 {
+		return 0
+	}
+	return uint64(value)
+}
+
+func bandwidthResult(snapshot bandwidthSnapshot) protocol.BandwidthResultMeta {
+	return protocol.BandwidthResultMeta{
+		Read:    bandwidthValue(snapshot.read),
+		Written: bandwidthValue(snapshot.written),
+	}
+}
+
 func bandwidthDelta(before, after int64) uint64 {
 	if after <= before {
 		return 0
@@ -670,6 +694,27 @@ func validateProxyURL(proxyURL string) error {
 	default:
 		return fmt.Errorf("unsupported proxy scheme %q", parsed.Scheme)
 	}
+}
+
+func (s *tlsSession) bandwidth(ctx context.Context) (protocol.BandwidthResultMeta, error) {
+	releaseProxy, err := s.proxyGate.acquireRead(ctx)
+	if err != nil {
+		return protocol.BandwidthResultMeta{}, err
+	}
+	defer releaseProxy()
+	return bandwidthResult(aggregateBandwidth(s.client, s.redirectClient, s.wsClient)), nil
+}
+
+func (s *tlsSession) resetBandwidth(ctx context.Context) error {
+	releaseProxy, err := s.proxyGate.acquireWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseProxy()
+	s.client.GetBandwidthTracker().Reset()
+	s.redirectClient.GetBandwidthTracker().Reset()
+	s.wsClient.GetBandwidthTracker().Reset()
+	return nil
 }
 
 func (s *tlsSession) setProxy(ctx context.Context, proxyURL string) error {
@@ -756,7 +801,17 @@ func (s *sessionStore) remove(id string) (*tlsSession, bool) {
 	return session, ok
 }
 
-func (s *sessionStore) closeAll() {
+func (s *sessionStore) all() []*tlsSession {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sessions := make([]*tlsSession, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		sessions = append(sessions, session)
+	}
+	return sessions
+}
+
+func (s *sessionStore) closeAll() []*tlsSession {
 	s.mu.Lock()
 	sessions := make([]*tlsSession, 0, len(s.sessions))
 	for id, session := range s.sessions {
@@ -767,6 +822,7 @@ func (s *sessionStore) closeAll() {
 	for _, session := range sessions {
 		session.closeIdleConnections()
 	}
+	return sessions
 }
 
 func (d *dispatcher) runSessionCreate(_ context.Context, op *operation, config protocol.SessionConfigMeta) {
@@ -789,7 +845,10 @@ func (d *dispatcher) runSessionDestroy(_ context.Context, op *operation, meta pr
 		_ = d.finishErrorDetail(op, protocol.ErrorKindSessionNotFound, fmt.Sprintf("session %q was not found", meta.SessionID), map[string]interface{}{"sessionId": meta.SessionID})
 		return
 	}
-	d.cancelSession(meta.SessionID)
+	for _, operation := range d.cancelSession(meta.SessionID, op) {
+		<-operation.done
+	}
+	d.retireSession(session)
 	session.closeIdleConnections()
 	_ = d.finishOK(op)
 }
@@ -1077,6 +1136,61 @@ func (d *dispatcher) runCookiesImport(ctx context.Context, op *operation, meta p
 		session.client.SetCookies(item.url, []*http.Cookie{item.cookie})
 	}
 	releaseProxy()
+	_ = d.finishOK(op)
+}
+
+func (d *dispatcher) runBandwidthGet(ctx context.Context, op *operation, meta protocol.BandwidthMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	var result protocol.BandwidthResultMeta
+	var err error
+	if meta.SessionID == "" {
+		result, err = d.processBandwidth(ctx)
+	} else {
+		session, ok := d.sessions.get(meta.SessionID)
+		if !ok {
+			sessionNotFound(d, op, meta.SessionID)
+			return
+		}
+		result, err = session.bandwidth(ctx)
+	}
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			_ = d.finishCancelled(op)
+		} else {
+			_ = d.finishError(op, protocol.ErrorKindInternal, err.Error())
+		}
+		return
+	}
+	_ = d.finishResult(op, result)
+}
+
+func (d *dispatcher) runBandwidthReset(ctx context.Context, op *operation, meta protocol.BandwidthMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	var err error
+	if meta.SessionID == "" {
+		err = d.resetProcessBandwidth(ctx)
+	} else {
+		session, ok := d.sessions.get(meta.SessionID)
+		if !ok {
+			sessionNotFound(d, op, meta.SessionID)
+			return
+		}
+		err = session.resetBandwidth(ctx)
+	}
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			_ = d.finishCancelled(op)
+		} else {
+			_ = d.finishError(op, protocol.ErrorKindInternal, err.Error())
+		}
+		return
+	}
 	_ = d.finishOK(op)
 }
 
@@ -1706,12 +1820,20 @@ func setRequestCookies(client tlsClient.HttpClient, parsedURL *url.URL, cookies 
 }
 
 func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protocol.RequestMeta) {
+	var session *tlsSession
+	ephemeral := false
+	retired := false
+	retireEphemeral := func() {
+		if ephemeral && session != nil && !retired {
+			d.retireSession(session)
+			retired = true
+		}
+	}
 	fail := func(kind protocol.ErrorKind, message string) {
 		closeRequestUpload(op)
+		retireEphemeral()
 		_ = d.finishError(op, kind, message)
 	}
-
-	var session *tlsSession
 	if meta.SessionID != "" {
 		var ok bool
 		session, ok = d.sessions.get(meta.SessionID)
@@ -1732,7 +1854,9 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 			fail(protocol.ErrorKindSessionConfig, err.Error())
 			return
 		}
+		ephemeral = true
 		defer session.closeIdleConnections()
+		defer retireEphemeral()
 	}
 	if meta.TimeoutMs != nil && *meta.TimeoutMs < 0 {
 		fail(protocol.ErrorKindInvalidConfig, "timeoutMs cannot be negative")
@@ -1933,5 +2057,6 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		fail(protocol.ErrorKindInternal, err.Error())
 		return
 	}
+	retireEphemeral()
 	_ = d.finish(op, protocol.Frame{Kind: protocol.KindEnd, ID: op.id, Meta: endMeta})
 }

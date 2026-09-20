@@ -35,6 +35,8 @@ const (
 	KindCookiesSet     Kind = 0x14
 	KindCookiesExport  Kind = 0x15
 	KindCookiesImport  Kind = 0x16
+	KindBandwidthGet   Kind = 0x17
+	KindBandwidthReset Kind = 0x18
 	KindRequest        Kind = 0x20
 	KindBodyChunk      Kind = 0x21
 	KindBodyEnd        Kind = 0x22
@@ -75,8 +77,9 @@ type Frame struct {
 func IsKnownKind(kind Kind) bool {
 	switch kind {
 	case KindHello, KindShutdown, KindSessionCreate, KindSessionDestroy, KindSessionProxy,
-		KindCookiesGet, KindCookiesSet, KindCookiesExport, KindCookiesImport, KindRequest,
-		KindBodyChunk, KindBodyEnd, KindWSConnect, KindWSWrite, KindWSClose, KindCancel, KindAck,
+		KindCookiesGet, KindCookiesSet, KindCookiesExport, KindCookiesImport, KindBandwidthGet,
+		KindBandwidthReset, KindRequest, KindBodyChunk, KindBodyEnd, KindWSConnect, KindWSWrite,
+		KindWSClose, KindCancel, KindAck,
 		KindDebugPing, KindDebugSleep, KindDebugStream, KindHelloAck, KindOk, KindError, KindHeaders,
 		KindChunk, KindEnd, KindWSOpen, KindWSFrame, KindWSClosed, KindBodyAck:
 		return true

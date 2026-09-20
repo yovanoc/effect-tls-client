@@ -54,3 +54,25 @@ func TestHelloAckOptionalCreditMetadata(t *testing.T) {
 		t.Fatalf("legacy helloAck = %+v", ack)
 	}
 }
+
+func TestBandwidthMetadataRoundTrip(t *testing.T) {
+	meta, err := EncodeMeta(BandwidthResultMeta{Read: 11, Written: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded BandwidthResultMeta
+	if err := DecodeObject(meta, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Read != 11 || decoded.Written != 7 {
+		t.Fatalf("decoded bandwidth = %+v", decoded)
+	}
+
+	var process BandwidthMeta
+	if err := DecodeObject([]byte(`{}`), &process); err != nil {
+		t.Fatal(err)
+	}
+	if process.SessionID != "" {
+		t.Fatalf("decoded process bandwidth selector = %+v", process)
+	}
+}

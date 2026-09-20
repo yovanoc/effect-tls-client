@@ -4,6 +4,7 @@ import {
   Context,
   Effect,
   Exit,
+  Metric,
   Layer,
   Latch,
   Option,
@@ -26,7 +27,9 @@ import {
   type BridgeError,
 } from "./internal/Errors.js";
 import { FrameKind } from "./internal/Frame.js";
+import * as TlsClientMetrics from "./Telemetry.js";
 import {
+  BandwidthResultMeta,
   Cookie as CookieSchema,
   CookiesJson,
   CookiesResultMeta,
@@ -41,6 +44,7 @@ import {
 export const SessionConfig = SessionConfigSchema;
 export type { Pair };
 export type SessionConfig = SessionConfigType;
+export type Bandwidth = Schema.Schema.Type<typeof BandwidthResultMeta>;
 
 const RequestCookieInputSchema = Schema.Struct({
   name: Schema.String,
@@ -132,6 +136,8 @@ export interface TlsResponse {
   readonly headers: ReadonlyArray<Pair>;
   readonly protocol: "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0";
   readonly cookies: Cookies.Cookies;
+  readonly bytesRead: Effect.Effect<number, TlsOperationError>;
+  readonly bytesWritten: Effect.Effect<number, TlsOperationError>;
   readonly stream: Stream.Stream<Uint8Array, TlsOperationError>;
   readonly bytes: Effect.Effect<Uint8Array, TlsOperationError>;
   readonly text: Effect.Effect<string, TlsOperationError>;
@@ -162,6 +168,8 @@ export interface TlsSession {
   readonly importCookies: (
     json: string,
   ) => Effect.Effect<void, TlsOperationError>;
+  readonly bandwidth: Effect.Effect<Bandwidth, TlsOperationError>;
+  readonly resetBandwidth: Effect.Effect<void, TlsOperationError>;
   readonly setProxy: (
     proxy: ProxyInput,
   ) => Effect.Effect<void, TlsOperationError>;
@@ -177,6 +185,8 @@ export interface TlsClientService {
     request: string | RequestInput,
     options?: RequestOptions,
   ) => Effect.Effect<TlsResponse, TlsOperationError, Scope.Scope>;
+  readonly bandwidth: Effect.Effect<Bandwidth, TlsOperationError>;
+  readonly resetBandwidth: Effect.Effect<void, TlsOperationError>;
 }
 
 const errorMessage = (cause: unknown): string =>
@@ -323,6 +333,7 @@ const makeWebSocketSocket = (
   const latch = Latch.makeUnsafe(false);
   let connection: BridgeWebSocket | undefined;
   let failure: Socket.SocketError | undefined;
+  const countedConnections = new Set<BridgeWebSocket>();
 
   const localCloseError = (code = 1000, reason = "") =>
     new Socket.SocketError({
@@ -343,7 +354,14 @@ const makeWebSocketSocket = (
   ): Effect.Effect<void> => {
     const closeReason = reason ?? "";
     setFailure(localCloseError(code, closeReason));
-    return active.close(code, closeReason).pipe(Effect.ignore);
+    const decrement = Effect.suspend(() =>
+      countedConnections.delete(active)
+        ? Metric.modify(TlsClientMetrics.webSocketConnectionsActive, -1)
+        : Effect.void,
+    );
+    return active
+      .close(code, closeReason)
+      .pipe(Effect.ignore, Effect.ensuring(decrement));
   };
 
   const reader: Socket.Socket["reader"] = Effect.gen(function* () {
@@ -354,8 +372,15 @@ const makeWebSocketSocket = (
       .webSocket({ ...meta, sessionId })
       .pipe(Effect.mapError((error) => socketError("open", error)));
     connection = active;
-    latch.openUnsafe();
     yield* Effect.addFinalizer(() => closeConnection(active));
+    yield* Effect.uninterruptible(
+      Effect.sync(() => countedConnections.add(active)).pipe(
+        Effect.flatMap(() =>
+          Metric.modify(TlsClientMetrics.webSocketConnectionsActive, 1),
+        ),
+      ),
+    );
+    latch.openUnsafe();
 
     const read = Effect.suspend(() => {
       if (connection !== active) {
@@ -598,6 +623,31 @@ const decodeCookieResult = (frame: {
       }),
   });
 
+const decodeBandwidthResult = (frame: {
+  readonly meta: Uint8Array;
+}): Effect.Effect<Bandwidth, BridgeProtocolError> =>
+  Effect.try({
+    try: () => decodeMeta(BandwidthResultMeta, frame.meta),
+    catch: (cause) =>
+      new BridgeProtocolError({
+        message: "invalid bandwidth response metadata",
+        cause,
+      }),
+  });
+
+const requestMetric = (profile: string, protocol: string, errorKind: string) =>
+  Metric.update(
+    Metric.withAttributes(TlsClientMetrics.requests, {
+      profile,
+      protocol,
+      error_kind: errorKind,
+    }),
+    1,
+  );
+
+const requestErrorKind = (error: TlsOperationError): string =>
+  Schema.is(TlsRequestError)(error) ? error.kind : error._tag;
+
 const normalizeProxy = (proxy: ProxyInput): string | null =>
   Option.isOption(proxy) ? Option.getOrNull(proxy) : (proxy ?? null);
 
@@ -691,10 +741,47 @@ const normalizeRequest = (
 
 const responseFrom = (
   response: BridgeResponse,
+  profile: string,
 ): Effect.Effect<TlsResponse, TlsOperationError> =>
   Effect.gen(function* () {
+    const end = yield* Effect.cached(
+      response.end.pipe(
+        Effect.tap((value) =>
+          Effect.all(
+            [
+              Metric.update(
+                Metric.withAttributes(TlsClientMetrics.bytesRead, {
+                  profile,
+                  protocol: value.protocol ?? "unknown",
+                }),
+                value.bytesRead,
+              ),
+              Metric.update(
+                Metric.withAttributes(TlsClientMetrics.bytesWritten, {
+                  profile,
+                  protocol: value.protocol ?? "unknown",
+                }),
+                value.bytesWritten,
+              ),
+              requestMetric(profile, value.protocol ?? "unknown", "none"),
+            ],
+            { discard: true },
+          ),
+        ),
+        Effect.tapError((error) =>
+          requestMetric(
+            profile,
+            response.headers.protocol ?? "unknown",
+            requestErrorKind(error),
+          ),
+        ),
+      ),
+    );
+    const stream = response.stream.pipe(
+      Stream.ensuring(end.pipe(Effect.ignore)),
+    );
     const bytes = yield* Effect.cached(
-      Stream.runCollect(response.stream).pipe(Effect.map(concatenate)),
+      Stream.runCollect(stream).pipe(Effect.map(concatenate)),
     );
     const text = yield* Effect.cached(
       bytes.pipe(Effect.map((value) => new TextDecoder().decode(value))),
@@ -721,11 +808,19 @@ const responseFrom = (
       headers: response.headers.headers,
       protocol: response.headers.protocol,
       cookies: Cookies.fromSetCookie(setCookies),
-      stream: response.stream,
+      bytesRead: bytes.pipe(
+        Effect.flatMap(() => end),
+        Effect.map((value) => value.bytesRead),
+      ),
+      bytesWritten: bytes.pipe(
+        Effect.flatMap(() => end),
+        Effect.map((value) => value.bytesWritten),
+      ),
+      stream,
       bytes,
       text,
       json,
-      close: response.close,
+      close: response.close.pipe(Effect.ensuring(end.pipe(Effect.ignore))),
     };
   });
 
@@ -742,8 +837,8 @@ const normalizeConfig = (
   );
 
 type RequestTarget =
-  | { readonly sessionId: string }
-  | { readonly config: SessionConfigType };
+  | { readonly sessionId: string; readonly profile: string }
+  | { readonly config: SessionConfigType; readonly profile: string };
 
 const requestWith = (
   bridge: Bridge["Service"],
@@ -753,12 +848,19 @@ const requestWith = (
 ): Effect.Effect<TlsResponse, TlsOperationError, Scope.Scope> =>
   Effect.gen(function* () {
     const normalized = yield* normalizeRequest(urlOrInput, options);
-    const response = yield* bridge.request(
-      { ...target, ...normalized.meta },
-      normalized.body,
+    const { profile, ...requestTarget } = target;
+    const response = yield* bridge
+      .request({ ...requestTarget, ...normalized.meta }, normalized.body)
+      .pipe(
+        Effect.tapError((error) =>
+          requestMetric(profile, "unknown", requestErrorKind(error)),
+        ),
+      );
+    const tlsResponse = yield* responseFrom(response, target.profile).pipe(
+      Effect.tapError(() => response.close),
     );
-    yield* Effect.addFinalizer(() => response.close);
-    return yield* responseFrom(response);
+    yield* Effect.addFinalizer(() => tlsResponse.close);
+    return tlsResponse;
   });
 
 const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
@@ -766,19 +868,14 @@ const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
     service,
     Effect.gen(function* () {
       const bridge = yield* Bridge;
-      const activeSessionIds = new Set<string>();
+      const activeSessions = new Map<string, Effect.Effect<void>>();
       yield* Effect.addFinalizer(() =>
         Effect.suspend(() => {
-          const sessionIds = Array.from(activeSessionIds);
-          activeSessionIds.clear();
-          return Effect.forEach(
-            sessionIds,
-            (sessionId) =>
-              bridge
-                .call(FrameKind.sessionDestroy, { sessionId })
-                .pipe(Effect.ignore),
-            { discard: true },
-          ).pipe(Effect.asVoid);
+          const destroyers = Array.from(activeSessions.values());
+          activeSessions.clear();
+          return Effect.forEach(destroyers, (destroy) => destroy, {
+            discard: true,
+          }).pipe(Effect.asVoid);
         }),
       );
       const request = Effect.fn("TlsClient.request")(function* (
@@ -787,21 +884,46 @@ const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
         options?: RequestOptions,
       ) {
         const config = yield* normalizeConfig(input);
-        return yield* requestWith(bridge, { config }, urlOrInput, options);
+        return yield* requestWith(
+          bridge,
+          { config, profile: config.profile ?? "custom" },
+          urlOrInput,
+          options,
+        );
       });
+      const bandwidth = Effect.gen(function* () {
+        const frame = yield* bridge.call(
+          FrameKind.bandwidthGet,
+          {},
+          undefined,
+          BandwidthResultMeta,
+        );
+        return yield* decodeBandwidthResult(frame);
+      });
+      const resetBandwidth = bridge
+        .call(FrameKind.bandwidthReset, {})
+        .pipe(Effect.asVoid);
       const session = Effect.fn("TlsClient.session")(function* (
         input: SessionConfigType,
       ) {
         const config = yield* normalizeConfig(input);
         const sessionId = globalThis.crypto.randomUUID();
         let destroySent = false;
+        let sessionActive = false;
         const destroySession = Effect.suspend(() => {
           if (destroySent) return Effect.void;
           destroySent = true;
-          activeSessionIds.delete(sessionId);
+          activeSessions.delete(sessionId);
           return bridge
             .call(FrameKind.sessionDestroy, { sessionId })
-            .pipe(Effect.ignore);
+            .pipe(
+              Effect.ignore,
+              Effect.ensuring(
+                sessionActive
+                  ? Metric.modify(TlsClientMetrics.sessionsActive, -1)
+                  : Effect.void,
+              ),
+            );
         });
         const acquire = Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
@@ -819,9 +941,13 @@ const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
               yield* destroySession;
               return yield* Effect.failCause(created.cause);
             }
-            activeSessionIds.add(sessionId);
+            activeSessions.set(sessionId, destroySession);
+            sessionActive = true;
+            yield* Metric.modify(TlsClientMetrics.sessionsActive, 1);
             return yield* Effect.acquireRelease(
-              Effect.succeed(makeSession(bridge, sessionId)),
+              Effect.succeed(
+                makeSession(bridge, sessionId, config.profile ?? "custom"),
+              ),
               () => destroySession,
             );
           }),
@@ -834,6 +960,8 @@ const makeTlsClientLayerInternal = (service: typeof TlsClient) =>
         version: bridge.version,
         session,
         request,
+        bandwidth,
+        resetBandwidth,
       });
     }),
   );
@@ -852,6 +980,7 @@ export const makeTlsClientLayer = makeTlsClientLayerInternal(TlsClient);
 const makeSession = (
   bridge: Bridge["Service"],
   sessionId: string,
+  profile: string,
 ): TlsSession => {
   const cookies = Effect.fn("TlsSession.cookies")(function* (url: string) {
     const frame = yield* bridge.call(
@@ -905,6 +1034,18 @@ const makeSession = (
       .call(FrameKind.cookiesImport, { sessionId, cookies: values })
       .pipe(Effect.asVoid);
   });
+  const bandwidth = Effect.gen(function* () {
+    const frame = yield* bridge.call(
+      FrameKind.bandwidthGet,
+      { sessionId },
+      undefined,
+      BandwidthResultMeta,
+    );
+    return yield* decodeBandwidthResult(frame);
+  });
+  const resetBandwidth = bridge
+    .call(FrameKind.bandwidthReset, { sessionId })
+    .pipe(Effect.asVoid);
   const setProxy = Effect.fn("TlsSession.setProxy")(function* (
     proxy: ProxyInput,
   ) {
@@ -928,8 +1069,10 @@ const makeSession = (
   return {
     id: sessionId,
     request: (urlOrInput, options) =>
-      requestWith(bridge, { sessionId }, urlOrInput, options),
+      requestWith(bridge, { sessionId, profile }, urlOrInput, options),
     webSocket,
+    bandwidth,
+    resetBandwidth,
     cookies,
     setCookies,
     exportCookies,
