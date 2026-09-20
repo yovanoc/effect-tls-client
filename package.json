@@ -9,6 +9,9 @@
   "devDependencies": {
     "@changesets/changelog-github": "1.0.1",
     "@changesets/cli": "3.0.3",
+    "@effect/platform-bun": "4.0.0-rc.116",
+    "@effect/platform-node": "4.0.0-rc.116",
+    "effect": "4.0.0-rc.116",
     "turbo": "2.11.2"
   },
   "scripts": {
@@ -17,7 +20,8 @@
     "lint": "turbo run lint",
     "format": "turbo run format",
     "check": "turbo run codegen:check build test lint format",
-    "release": "changeset publish"
+    "release": "changeset publish",
+    "release:pack": "bun scripts/release-pack.ts"
   },
   "engines": {
     "bun": ">=1.4",

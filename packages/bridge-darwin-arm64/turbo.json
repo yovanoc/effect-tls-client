@@ -1,0 +1,23 @@
+{
+  "$schema": "https://turborepo.dev/schema.json",
+  "extends": [
+    "//"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": [
+        "bridge#build"
+      ],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/bridge/**/*.go",
+        "$TURBO_ROOT$/bridge/go.mod",
+        "$TURBO_ROOT$/bridge/go.sum",
+        "$TURBO_ROOT$/scripts/build-bridge.ts"
+      ],
+      "outputs": [
+        "bin/**"
+      ]
+    }
+  }
+}

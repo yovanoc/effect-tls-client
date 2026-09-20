@@ -1,13 +1,29 @@
 {
   "$schema": "https://turborepo.dev/schema.json",
-  "extends": ["//"],
+  "extends": [
+    "//"
+  ],
   "tasks": {
     "build": {
-      "command": ["go", "build", "-o", "bridge", "."],
-      "outputs": ["bridge"]
+      "command": [
+        "bun",
+        "../scripts/build-bridge.ts",
+        "--host"
+      ],
+      "outputs": [
+        "bridge"
+      ],
+      "inputs": [
+        "$TURBO_ROOT$/scripts/build-bridge.ts"
+      ]
     },
     "test": {
-      "command": ["go", "test", "-race", "./..."]
+      "command": [
+        "go",
+        "test",
+        "-race",
+        "./..."
+      ]
     }
   }
 }

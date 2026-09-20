@@ -10,5 +10,8 @@
   },
   "os": ["darwin"],
   "cpu": ["arm64"],
-  "files": ["bin"]
+  "files": ["bin"],
+  "scripts": {
+    "build": "bun ../../scripts/build-bridge.ts"
+  }
 }

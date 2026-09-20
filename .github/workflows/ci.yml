@@ -11,42 +11,96 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version: "1.27.1"
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: latest
 
       - run: bun install --frozen-lockfile
 
       - name: Build Bridge for integration tests
-        run: |
-          package_version="$(
-            bun -e 'console.log(
-              (await Bun.file("packages/effect-tls-client/package.json").json())
-                .version
-            )'
-          )"
-          go build -C bridge \
-            -ldflags "-X main.version=$package_version" \
-            -o "$RUNNER_TEMP/effect-tls-client-bridge" .
+        run: bun scripts/build-bridge.ts --host
 
       - name: Run Turbo checks with the built Bridge
         env:
-          TLS_CLIENT_BRIDGE_PATH: ${{ runner.temp }}/effect-tls-client-bridge
+          TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/bridge/bridge
           TLS_CLIENT_INTEGRATION: "1"
         run: bunx turbo run codegen:check build test lint format
 
       - name: Test real Bridge with Bun
         env:
-          TLS_CLIENT_BRIDGE_PATH: ${{ runner.temp }}/effect-tls-client-bridge
+          TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/bridge/bridge
         run: bun run --cwd packages/effect-tls-client test:bun
 
       - name: Test real Bridge with Node
         env:
-          TLS_CLIENT_BRIDGE_PATH: ${{ runner.temp }}/effect-tls-client-bridge
+          TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/bridge/bridge
         run: node packages/effect-tls-client/tests/bridge.node.mjs
+
+  integration:
+    name: integration (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-14
+            bridge_path: packages/bridge-darwin-arm64/bin/bridge
+            experimental: false
+          - target: darwin-x64
+            runner: macos-15-intel
+            bridge_path: packages/bridge-darwin-x64/bin/bridge
+            experimental: true
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            bridge_path: packages/bridge-linux-arm64/bin/bridge
+            experimental: true
+          - target: linux-x64
+            runner: ubuntu-latest
+            bridge_path: packages/bridge-linux-x64/bin/bridge
+            experimental: false
+          - target: win32-x64
+            runner: windows-latest
+            bridge_path: packages/bridge-win32-x64/bin/bridge.exe
+            experimental: false
+    continue-on-error: ${{ matrix.experimental }}
+    env:
+      TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/${{ matrix.bridge_path }}
+      TLS_CLIENT_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: "1.27.1"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build the selected Bridge package
+        run: >-
+          bunx turbo run build
+          --filter=@effect-tls-client/bridge-${{ matrix.target }}
+
+      - name: Run the integration suite
+        run: bun run --cwd packages/effect-tls-client test
+
+      - name: Run the Bun Bridge smoke test
+        run: bun run --cwd packages/effect-tls-client test:bun
+
+      - name: Public fingerprint echo (opt-in)
+        if: matrix.target == 'linux-x64' && vars.TLS_CLIENT_PUBLIC_ECHO == '1'
+        env:
+          TLS_CLIENT_PUBLIC_ECHO: "1"
+        run: >-
+          bun run --cwd packages/effect-tls-client test --
+          tests/public-fingerprint.integration.test.ts

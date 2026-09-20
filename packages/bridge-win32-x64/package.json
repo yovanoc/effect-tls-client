@@ -10,5 +10,8 @@
   },
   "os": ["win32"],
   "cpu": ["x64"],
-  "files": ["bin"]
+  "files": ["bin"],
+  "scripts": {
+    "build": "bun ../../scripts/build-bridge.ts"
+  }
 }

@@ -37,3 +37,12 @@ _Avoid_: headless browser, Chromium, CDP
 **Challenge**:
 A response that is an anti-bot interstitial rather than the requested resource. A **ChallengeHandler** recognises a Challenge and returns a **Resolution** (state to plant + retry, or a final response) or declines.
 _Avoid_: captcha (only one kind of Challenge), block page, solver (that's an implementation of a handler)
+
+**Platform package**:
+An optional OS/architecture package that supplies the Bridge executable matching a
+release. It is a distribution artifact, not a second transport or client.
+
+**Public fingerprint echo**:
+An opt-in external service check that observes the TLS and HTTP/2 traits presented
+by a named Profile. It validates a release integration path; it is not a runtime
+dependency or an authentication mechanism.

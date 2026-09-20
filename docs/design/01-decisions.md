@@ -115,7 +115,7 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 
 ## D16 — Runtimes, Effect version, test tiers
 
-**Decision:** Node ≥ 22 and Bun current, both first-class; the package has no runtime-specific code (needs only `ChildProcessSpawner` from the user's `NodeServices`/`BunServices`). Effect: track the newest 4.0 pre-release channel — currently the `rc` dist-tag (`effect@4.0.0-rc.116`, `beta` tag is the older 107 line) — peer range `>=4.0.0-rc.116 || >=4.0.0`. Tests: (1) Go `go test -race` against local httptest servers (codec, dispatcher, streaming, cancel, WS, flow control); (2) TS `@effect/vitest` unit against an in-process fake Bridge (Sink/Stream pair speaking the protocol); (3) TS integration (opt-in, CI after Go build on 5 targets): real Bridge + local Effect HttpServer/TLS server, env-gated smoke against a public fingerprint echo.
+**Decision:** Node ≥ 22 and Bun current, both first-class; the package has no runtime-specific code (needs only `ChildProcessSpawner` from the user's `NodeServices`/`BunServices`). Effect: track the newest 4.0 pre-release channel — currently the `rc` dist-tag (`effect@4.0.0-rc.116`, `beta` tag is the older 107 line) — peer range `>=4.0.0-rc.116 || >=4.0.0`. Tests: (1) Go `go test -race` against local httptest servers (codec, dispatcher, streaming, cancel, WS, flow control); (2) TS `@effect/vitest` unit against an in-process fake Bridge (Sink/Stream pair speaking the protocol); (3) TS integration (opt-in, CI on native darwin-arm64, linux-x64, and win32-x64 runners): real Bridge + local Effect HttpServer/TLS server, with an env-gated smoke against a public fingerprint echo; release builds validate all 5 target binaries.
 
 **Why:** FFI removal leaves no reason for runtime asymmetry; fake-Bridge tier gives fast iteration, Go tier owns protocol correctness, network stays opt-in.
 
@@ -135,3 +135,20 @@ Turbo tasks: `bridge#build/test/vet` (Go), `bridge-*#build` dependsOn `bridge#bu
 ## D18 — Protocol implementation: hand-rolled header, Effect Schema for meta, golden fixtures for conformance
 
 **Decision:** Frame header encoded/decoded by hand (TS `DataView`, Go `encoding/binary`). Meta JSON validated on the TS side with Effect `Schema` (per-kind structs, `Schema.fromJsonString`, failure → `BridgeProtocolError`); the same schemas serve as public config types. Go uses plain structs with `json` tags, ignoring unknown fields. Conformance = golden frames in `bridge/testdata/protocol/` produced by Go tests and decoded/re-encoded byte-identically by TS tests (and vice versa). No meta codegen until drift is observed; `SchemaBinary`/`@effect/rpc` serialization rejected (no Go implementation).
+
+## D19 — Documentation, examples, and integration matrix
+
+**Decision:** `README.md` is the public usage contract for Node/Bun setup, the
+`HttpClient` projection, session/config tiers, cookies, proxies, WebSockets,
+typed errors/retry, telemetry, Bridge overrides, and lockstep versioning. The
+three runnable examples are small `.mjs` programs that import the built package
+and select `NodeServices` or `BunServices` from the current runtime. CI runs the
+real Bridge integration suite on native macOS arm64, Linux x64, and Windows x64
+runners, with optional macOS x64 and Linux arm64 jobs when hosted labels exist;
+the public fingerprint echo remains disabled unless explicitly opted in by
+`TLS_CLIENT_PUBLIC_ECHO=1`.
+
+**Why:** users need one runtime-neutral path from installation to a real request,
+and platform-specific process behavior must be exercised where the binary runs.
+An external service is useful as a fingerprint regression signal but must never
+make ordinary CI, local development, or package installation network-dependent.

@@ -46,8 +46,15 @@ Shared contract for parallel Go/TS work: the protocol spec (Stage 1 artifact `03
 - Go subcommand `bridge dump` → JSON (profiles, `customTlsClient` field list, H2/H3 setting names, kinds) → `scripts/codegen.ts` writes `src/generated/Profile.ts` (`Known` union) and `CustomProfile.ts` schema; `codegen:check` fails on drift (turbo task dependsOn `bridge#build`).
 - Turbo tasks: `bridge-*#build` cross-compiles (`GOOS/GOARCH`, `CGO_ENABLED=0`, `-trimpath -ldflags=-s -w -X main.version=...`) into each stub's `bin/`; version stamp = package version; TS handshake enforces equality.
 - Release: changesets fixed group; `release.yml` builds 5 binaries, publishes six packages with provenance. Renovate for `bridge/go.mod` (+ codegen check catches new profiles).
-- README (quickstart Node + Bun, `HttpClient` swap-in, sessions, WS, errors), `examples/` (basic, http-client-layer, websocket).
-- **Check:** `npm pack` of each stub contains exactly one binary; fresh `bun add effect-tls-client` in a temp project on macOS runs the basic example; CI matrix runs Stage 2/4/5 integration on the 5 targets (or the 3 with runners: darwin-arm64, linux-x64, win32-x64) using the built binary.
+- README (Node + Bun install, `HttpClient` swap-in, sessions, cookies/proxies,
+  WebSockets, errors/retry, telemetry, Bridge paths, and versioning), runnable
+  `examples/basic-request.mjs`, `examples/http-client.mjs`, and
+  `examples/websocket.mjs`.
+- **Check:** `npm pack` of each stub contains exactly one binary; fresh `bun add
+  effect-tls-client` in a temp project on macOS runs the basic example; CI runs
+  Stage 2/4/5 integration on the required native targets (darwin-arm64,
+  linux-x64, win32-x64) and attempts darwin-x64/linux-arm64 when hosted runner
+  labels are available, using the built binary.
 
 ## Stage 7 — Browser module (separate grilling round first)
 
