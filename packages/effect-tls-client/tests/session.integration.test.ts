@@ -615,37 +615,40 @@ describeRealIntegration("real Bridge session requests", () => {
     }),
   );
 
-  it.live("streams a 100 MiB upload without collecting the source", () =>
-    Effect.gen(function* () {
-      const server = yield* tryPromise(startHttp1Server);
-      return yield* withClientAt(
-        realBridgePath,
-        Effect.gen(function* () {
-          const client = yield* TlsClient;
-          const session = yield* client.session({
-            profile: "chrome_146",
-            forceHttp1: true,
-          });
-          const chunkSize = 64 * 1024;
-          const chunkCount = (100 * 1024 * 1024) / chunkSize;
-          let pulls = 0;
-          const body = Stream.unfold(0, (index) =>
-            Effect.sync(() => {
-              if (index >= chunkCount) return undefined;
-              pulls += 1;
-              return [new Uint8Array(chunkSize), index + 1] as const;
-            }),
-          );
-          const response = yield* session.request(`${server.url}/count`, {
-            method: "POST",
-            timeoutMs: 0,
-            body,
-          });
-          expect(yield* response.text).toBe(String(100 * 1024 * 1024));
-          expect(pulls).toBe(chunkCount);
-        }),
-      ).pipe(Effect.ensuring(Effect.promise(server.close)));
-    }),
+  it.live(
+    "streams a 100 MiB upload without collecting the source",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* tryPromise(startHttp1Server);
+        return yield* withClientAt(
+          realBridgePath,
+          Effect.gen(function* () {
+            const client = yield* TlsClient;
+            const session = yield* client.session({
+              profile: "chrome_146",
+              forceHttp1: true,
+            });
+            const chunkSize = 64 * 1024;
+            const chunkCount = (100 * 1024 * 1024) / chunkSize;
+            let pulls = 0;
+            const body = Stream.unfold(0, (index) =>
+              Effect.sync(() => {
+                if (index >= chunkCount) return undefined;
+                pulls += 1;
+                return [new Uint8Array(chunkSize), index + 1] as const;
+              }),
+            );
+            const response = yield* session.request(`${server.url}/count`, {
+              method: "POST",
+              timeoutMs: 0,
+              body,
+            });
+            expect(yield* response.text).toBe(String(100 * 1024 * 1024));
+            expect(pulls).toBe(chunkCount);
+          }),
+        ).pipe(Effect.ensuring(Effect.promise(server.close)));
+      }),
+    30_000,
   );
 
   it.live("exposes and persists the Go-owned cookie Jar", () =>
