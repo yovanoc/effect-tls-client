@@ -11,6 +11,9 @@
   "os": ["darwin"],
   "cpu": ["arm64"],
   "files": ["bin"],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "bun ../../scripts/build-bridge.ts"
   }
