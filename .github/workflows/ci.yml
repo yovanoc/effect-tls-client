@@ -34,11 +34,30 @@ jobs:
           TLS_CLIENT_INTEGRATION: "1"
         run: bunx turbo run codegen:check build
 
+      - name: Set up Node 25 for BrowserMock checks
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "25"
+
       - name: Run Bun checks in parallel
         env:
           TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/bridge/bridge
           TLS_CLIENT_INTEGRATION: "1"
         run: bun run check:bun
+
+      - name: Restore Node 22 for shared checks
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+
+      - name: Test core transport on Node 22
+        env:
+          TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/bridge/bridge
+          TLS_CLIENT_INTEGRATION: "1"
+        run: >-
+          bun run --cwd packages/effect-tls-client test --
+          --exclude tests/browser.test.ts
+          --exclude tests/browser.integration.test.ts
 
       - name: Run shared lint diagnostics
         run: |
@@ -146,9 +165,21 @@ jobs:
           bunx turbo run build
           --filter=@effect-tls-client/bridge-${{ matrix.target }}
 
+      - name: Set up Node 25 for BrowserMock integration tests
+        if: matrix.target != 'win32-x64'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "25"
+
       - name: Run the integration suite
         if: matrix.target != 'win32-x64'
         run: bun run --cwd packages/effect-tls-client test
+
+      - name: Restore Node 22 after BrowserMock integration tests
+        if: matrix.target != 'win32-x64'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
 
       # Node cannot spawn a shebang .mjs fixture directly on Windows. The real
       # Bridge integration files exercise the Windows binary without fixtures.
