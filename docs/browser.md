@@ -62,7 +62,7 @@ correct:
 import { Cookies } from "effect/unstable/http";
 
 yield* browser.transport.setCookies(
-  "https://example.com/",
+  "http://example.test/",
   Cookies.fromSetCookie("consent=yes; Path=/"),
 );
 ```
@@ -76,7 +76,7 @@ CloudFront `403` is exposed through `page.cloudFrontForbidden`; it is not
 reported as a solved challenge.
 
 ```ts
-import { Effect } from "effect";
+import { Effect, Option } from "effect";
 
 const browser = yield* Browser.open(config, {
   challengeHandler: (challenge, context) => {
@@ -86,14 +86,52 @@ const browser = yield* Browser.open(config, {
 });
 ```
 
-`BrowserScriptRuntime` is an optional application-owned seam. `runBoundedScript`
-accepts only string source and limits source and result to 64 KiB. Its two-second
-script timeout and the five-second challenge-handler timeout request cooperative
-Effect interruption; they cannot preempt synchronous code and are not security
-or CPU bounds. The package intentionally does not provide a BrowserMock
-executor, AWS WAF solver, DataDome implementation, browser engine, or `node:vm`
-security sandbox. A challenge handler must not claim success unless its
-integration has actually verified the resulting response.
+`BrowserMock` is an optional process-backed runtime for reviewed challenge
+scripts. It adds only `document.cookie`, a read-only `location.href`, a small
+`navigator`, `console`, and `Promise` to a fresh VM context. URL constructors,
+encoding/timer primitives, `fetch`, XHR, WebSocket, DOM constructors,
+filesystem, and process APIs are intentionally absent; network work stays in
+the host `TlsSession`:
+
+```ts
+const scriptRuntime = yield* Browser.BrowserMock;
+const browser = yield* Browser.open(config, {
+  scriptRuntime,
+  challengeHandler: (_challenge, context) =>
+    Effect.gen(function* () {
+      const result = yield* context.evaluate(
+        'document.cookie = "clearance=ok; Path=/"; return "ready";',
+      );
+      return result === "ready"
+        ? Option.some({ url: "http://example.test/" })
+        : Option.none();
+    }),
+});
+```
+
+The runtime starts a fresh child process for each evaluation and kills it on the
+bounded timeout. It always starts Node with `--permission` and verifies that
+its permission API reports `process.permission.has("net") === false` before
+reading the script. This requires a modern Node release with network permission
+support (Node 25+ currently); Node 22's stable permission model does not deny
+network access and is rejected. Older or incompatible executables fail closed
+rather than falling back to the older experimental flag.
+A Bun host delegates to an available Node executable; configure
+`BrowserMock.layer({ executable: "..." })` when `node` is not on `PATH`.
+
+Script cookie writes are returned as `setCookies` and applied through the
+existing Go jar. HttpOnly cookies are never included in `document.cookie`. Before
+evaluation, all exported HttpOnly cookie names are collected, so a script cannot
+replace one through a different path; the export/evaluate/set sequence is not
+atomic, so concurrent jar changes still have a TOCTOU limitation. This is not a
+malicious-code sandbox: Node's permission model has documented limitations, and
+`node:vm` is only the evaluator context, never the security boundary. Run
+reviewed vendor scripts only; do not pass arbitrary attacker-controlled source.
+There is no guaranteed child memory cap; source/output limits and the timeout do
+not bound allocations. `runBoundedScript` still limits source/result to 64 KiB,
+and the five-second challenge-handler timeout remains cooperative. The package
+does not provide an AWS WAF solver or vendor-specific handler, and a handler
+must not claim success without verifying the follow-up response.
 
 The layer preserves raw transport behavior: callers that do not use the
 browser subpath continue to control redirects, headers, cookies, and response

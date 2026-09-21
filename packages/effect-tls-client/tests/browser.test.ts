@@ -1,8 +1,10 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Stream } from "effect";
+import { Effect, Layer, Stream } from "effect";
+import { NodeServices } from "@effect/platform-node";
 import * as Cookies from "effect/unstable/http/Cookies";
 import type { TlsResponse, TlsSession } from "../src/TlsClient.js";
 import {
+  BrowserMock,
   BrowserSessionError,
   BrowserScriptError,
   Chrome152Identity,
@@ -326,11 +328,14 @@ describe("browser layer", () => {
 
   it.effect("bounds an optional caller-supplied script runtime", () => {
     const runtime = {
-      evaluate: (source: string) => Effect.succeed(source),
+      evaluate: (source: string) =>
+        Effect.succeed({ value: source, setCookies: [] }),
     };
 
     return Effect.gen(function* () {
-      expect(yield* runBoundedScript(runtime, "return 1")).toBe("return 1");
+      expect((yield* runBoundedScript(runtime, "return 1")).value).toBe(
+        "return 1",
+      );
       const error = yield* Effect.flip(
         runBoundedScript(runtime, "x".repeat(64 * 1024 + 1)),
       );
@@ -338,4 +343,74 @@ describe("browser layer", () => {
       expect(error.reason).toContain("64 KiB");
     });
   });
+
+  it.effect("runs the process-backed BrowserMock with only small globals", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runtime.evaluate(
+        'document.cookie = "clearance=ok; Path=/"; document.cookie = "hidden=no; HttpOnly"; return `${document.cookie}|${typeof fetch}|${typeof process}`;',
+        {
+          url: "http://localhost/",
+          cookie: "visible=yes",
+          userAgent: "fixture",
+        },
+      );
+      expect(result.value).toBe(
+        "visible=yes; clearance=ok|undefined|undefined",
+      );
+      expect(result.setCookies).toEqual(["clearance=ok; Path=/"]);
+      const blocked = yield* Effect.flip(
+        runtime.evaluate(
+          'return this.constructor.constructor("return process")().pid;',
+        ),
+      );
+      expect(blocked.reason).toContain("Code generation");
+      const urlEscape = yield* Effect.flip(
+        runtime.evaluate(
+          `try { new URL("invalid"); } catch (error) { return error.constructor.constructor("return process")().version; }`,
+        ),
+      );
+      expect(urlEscape.reason).toContain("Code generation");
+      expect(urlEscape.reason).not.toContain(process.version);
+      const typedArrayEscape = yield* Effect.flip(
+        runtime.evaluate(
+          `try { Uint8Array.from = (value) => value; new TextEncoder().encode("x"); } catch (error) { return error.constructor.constructor("return process")().version; }`,
+        ),
+      );
+      expect(typedArrayEscape.reason).toContain("Code generation");
+      expect(typedArrayEscape.reason).not.toContain(process.version);
+      const functionError = yield* Effect.flip(
+        runtime.evaluate("return Function('return 1')();"),
+      );
+      expect(functionError.reason).toContain("Code generation");
+      const hidden = yield* runtime.evaluate(
+        "return `${typeof __URL}|${typeof __cookieRead}|${typeof URL}|${typeof TextEncoder}|${typeof setTimeout}`;",
+      );
+      expect(hidden.value).toBe(
+        "undefined|undefined|undefined|undefined|undefined",
+      );
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.live(
+    "terminates timed-out scripts and cleans up before the next run",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const error = yield* Effect.flip(runtime.evaluate("while (true) {}"));
+        expect(error.reason).toContain("terminated");
+        const result = yield* runtime.evaluate('return "after-timeout";');
+        expect(result.value).toBe("after-timeout");
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ timeoutMs: 100 }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+  );
 });

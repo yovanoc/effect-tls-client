@@ -3,7 +3,7 @@ import { TlsClient } from "../packages/effect-tls-client/dist/index.mjs";
 import * as Browser from "../packages/effect-tls-client/dist/browser/index.mjs";
 import { platformLayer } from "./runtime.mjs";
 
-const url = process.env.TLS_CLIENT_EXAMPLE_URL ?? "https://example.com/",
+const url = process.env.TLS_CLIENT_EXAMPLE_URL ?? "http://example.test/",
   profile = process.env.TLS_CLIENT_EXAMPLE_PROFILE ?? "chrome_152_PSK",
   identity =
     profile === "chrome_146"
@@ -16,12 +16,20 @@ const url = process.env.TLS_CLIENT_EXAMPLE_URL ?? "https://example.com/",
             );
           })(),
   services = await platformLayer(),
+  browserServices = Layer.mergeAll(
+    services,
+    Browser.BrowserMock.layer().pipe(Layer.provide(services)),
+  ),
   program = Effect.scoped(
     Effect.gen(function* program() {
-      const browser = yield* Browser.open({
-        transport: { profile },
-        identity,
-      });
+      const scriptRuntime = yield* Browser.BrowserMock;
+      const browser = yield* Browser.open(
+        {
+          transport: { profile },
+          identity,
+        },
+        { scriptRuntime },
+      );
       const page = yield* browser.navigate(url);
 
       console.log(`${page.status} ${page.url} (${page.protocol})`);
@@ -34,5 +42,7 @@ const url = process.env.TLS_CLIENT_EXAMPLE_URL ?? "https://example.com/",
   );
 
 await Effect.runPromise(
-  program.pipe(Effect.provide(TlsClient.layer.pipe(Layer.provide(services)))),
+  program.pipe(
+    Effect.provide(TlsClient.layer.pipe(Layer.provide(browserServices))),
+  ),
 );

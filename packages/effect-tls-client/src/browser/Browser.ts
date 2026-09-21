@@ -1,4 +1,5 @@
 import { Effect, Exit, Option, Schema, type Scope } from "effect";
+import * as Cookies from "effect/unstable/http/Cookies";
 import {
   SessionConfig,
   TlsClient,
@@ -8,6 +9,7 @@ import {
   type TlsSession,
 } from "../TlsClient.js";
 import {
+  CookiesJson,
   Identity,
   Pair as PairSchema,
   type SessionConfig as SessionConfigType,
@@ -152,10 +154,10 @@ export interface BrowserChallengeContext {
   readonly transport: TlsSession;
   readonly response: TlsResponse;
   readonly body: string;
-  /** The supplied runtime must cooperate with interruption; this is not a CPU/security bound. */
+  /** The runtime has a hard cutoff; host cookie reads/writes can still fail. */
   readonly evaluate: (
     source: unknown,
-  ) => Effect.Effect<string, BrowserScriptError>;
+  ) => Effect.Effect<string, BrowserOperationError>;
 }
 
 /**
@@ -505,12 +507,57 @@ const makeBrowserSession = (
     "browser identity",
     identity.headers,
   );
-  const evaluate = (source: unknown) =>
-    handlers.scriptRuntime === undefined
-      ? Effect.fail(
-          new BrowserScriptError({ reason: "script runtime unavailable" }),
-        )
-      : runBoundedScript(handlers.scriptRuntime, source);
+  const evaluate = (response: TlsResponse, source: unknown) => {
+    const runtime = handlers.scriptRuntime;
+    if (runtime === undefined) {
+      return Effect.fail(
+        new BrowserScriptError({ reason: "script runtime unavailable" }),
+      );
+    }
+    return Effect.gen(function* () {
+      const cookies = yield* transport.cookies(response.url);
+      const allCookies = yield* Schema.decodeEffect(CookiesJson)(
+        yield* transport.exportCookies,
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new BrowserSessionError({
+              operation: "script cookie protection",
+              kind: "Config",
+              message: "transport returned an invalid cookie export",
+              cause,
+            }),
+        ),
+      );
+      // Conservative by name across all paths; export/read/write is not atomic.
+      const hiddenNames = new Set(
+        allCookies.flatMap((cookie) => (cookie.httpOnly ? [cookie.name] : [])),
+      );
+      const visibleCookie = Object.values(cookies.cookies)
+        .filter((cookie) => cookie.options?.httpOnly !== true)
+        .map((cookie) => `${cookie.name}=${cookie.valueEncoded}`)
+        .join("; ");
+      const result = yield* runBoundedScript(runtime, source, {
+        url: response.url,
+        cookie: visibleCookie,
+        userAgent: headerValue(identity.headers, "user-agent") ?? "",
+      });
+      const setCookies = result.setCookies.filter((value) => {
+        if (/(?:^|;)\s*httponly(?:\s*=|;|$)/i.test(value)) {
+          return false;
+        }
+        const name = /^(?:\s*)([^=;\s]+)=/.exec(value)?.[1];
+        return name === undefined || !hiddenNames.has(name);
+      });
+      if (setCookies.length > 0) {
+        yield* transport.setCookies(
+          response.url,
+          Cookies.fromSetCookie(setCookies),
+        );
+      }
+      return result.value;
+    });
+  };
 
   const get = Effect.fn("BrowserSession.get")(function* (
     url: string,
@@ -636,7 +683,7 @@ const makeBrowserSession = (
               transport,
               response,
               body,
-              evaluate,
+              evaluate: (source) => evaluate(response, source),
             })
             .pipe(
               Effect.timeoutOrElse({

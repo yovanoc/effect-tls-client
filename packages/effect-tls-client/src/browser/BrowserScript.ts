@@ -12,24 +12,47 @@ export class BrowserScriptError extends Schema.TaggedError<BrowserScriptError>()
   },
 ) {}
 
+/** The small, serializable page state visible to a script. */
+export const BrowserScriptContext = Schema.Struct({
+  url: Schema.String,
+  cookie: Schema.String,
+  userAgent: Schema.String,
+});
+export interface BrowserScriptContext extends Schema.Schema.Type<
+  typeof BrowserScriptContext
+> {}
+
+/** A script result and the non-HttpOnly cookie writes it requested. */
+export const BrowserScriptResult = Schema.Struct({
+  value: Schema.String,
+  setCookies: Schema.Array(Schema.String),
+});
+export interface BrowserScriptResult extends Schema.Schema.Type<
+  typeof BrowserScriptResult
+> {}
+
 /**
- * A script evaluator supplied by the application at a trusted sandbox boundary.
- * The runtime must cooperate with Effect interruption; this is not a CPU or
- * security boundary for synchronous evaluators.
+ * An evaluator at a process-backed browser-script boundary, not a malicious-code
+ * sandbox. Implementations must terminate synchronous work rather than relying
+ * on Effect interruption.
  */
 export interface BrowserScriptRuntime {
   readonly evaluate: (
     source: string,
-  ) => Effect.Effect<string, BrowserScriptError>;
+    context?: BrowserScriptContext,
+  ) => Effect.Effect<BrowserScriptResult, BrowserScriptError>;
 }
 
 /**
- * Runs a script through an optional runtime with fixed source/result limits and
- * a cooperative time limit. Synchronous runtime work cannot be preempted.
- * This module deliberately does not provide a Node `vm` or vendor-script executor.
+ * Runs a script through fixed source/result limits and a cooperative outer time
+ * limit. A runtime such as BrowserMock supplies the hard process cutoff.
  */
 export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
-  function* (runtime: BrowserScriptRuntime, input: unknown) {
+  function* (
+    runtime: BrowserScriptRuntime,
+    input: unknown,
+    context?: BrowserScriptContext,
+  ) {
     const source = yield* Schema.decodeUnknownEffect(Schema.String)(input).pipe(
       Effect.mapError(
         (cause) =>
@@ -46,7 +69,7 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
     }
 
     const result = yield* Effect.try({
-      try: () => runtime.evaluate(source),
+      try: () => runtime.evaluate(source, context),
       catch: (cause) =>
         new BrowserScriptError({
           reason: "script runtime threw before evaluation",
@@ -54,7 +77,6 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
         }),
     }).pipe(
       Effect.flatMap((effect) => effect),
-      // This timeout can only interrupt a runtime that cooperates with Effect.
       Effect.timeoutOrElse({
         duration: "2 seconds",
         orElse: () =>
@@ -63,18 +85,29 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
           ),
       }),
     );
-    const output = yield* Schema.decodeEffect(Schema.String)(result).pipe(
+    const output = yield* Schema.decodeEffect(BrowserScriptResult)(result).pipe(
       Effect.mapError(
         (cause) =>
           new BrowserScriptError({
-            reason: "script runtime returned a non-string result",
+            reason: "script runtime returned an invalid result",
             cause,
           }),
       ),
     );
-    if (new TextEncoder().encode(output).byteLength > MAX_RESULT_BYTES) {
+    const encoder = new TextEncoder();
+    if (encoder.encode(output.value).byteLength > MAX_RESULT_BYTES) {
       return yield* new BrowserScriptError({
         reason: "script result exceeds the 64 KiB limit",
+      });
+    }
+    if (
+      output.setCookies.reduce(
+        (bytes, cookie) => bytes + encoder.encode(cookie).byteLength,
+        0,
+      ) > MAX_RESULT_BYTES
+    ) {
+      return yield* new BrowserScriptError({
+        reason: "script cookie output exceeds the 64 KiB limit",
       });
     }
     return output;
