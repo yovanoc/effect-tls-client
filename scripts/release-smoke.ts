@@ -2,28 +2,52 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
-type ManifestEntry = {
+interface ManifestEntry {
   readonly name: string;
   readonly filename: string;
-};
+}
 
-type PackageJson = {
+interface PackageJson {
   readonly devDependencies?: Readonly<Record<string, string>>;
-};
+}
 
-const parseJson = <T>(text: string, description: string): T => {
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const isStringRecord = (
+  value: unknown,
+): value is Readonly<Record<string, string>> =>
+  isRecord(value) &&
+  Object.values(value).every((entry) => typeof entry === "string");
+const isManifestEntry = (value: unknown): value is ManifestEntry =>
+  isRecord(value) &&
+  typeof value.name === "string" &&
+  typeof value.filename === "string";
+const isManifest = (value: unknown): value is readonly ManifestEntry[] =>
+  Array.isArray(value) && value.every(isManifestEntry);
+const isPackageJson = (value: unknown): value is PackageJson =>
+  isRecord(value) &&
+  (!Object.hasOwn(value, "devDependencies") ||
+    isStringRecord(value.devDependencies));
+
+type JsonContainer = object;
+
+const parseJson = (text: string, description: string): JsonContainer => {
   try {
-    return JSON.parse(text) as T;
-  } catch (cause) {
-    throw new Error(`invalid JSON from ${description}`, { cause });
+    const value: unknown = JSON.parse(text);
+    if (typeof value !== "object" || value === null) {
+      throw new Error("JSON value is not an object or array");
+    }
+    return value;
+  } catch (error) {
+    throw new Error(`invalid JSON from ${description}`, { cause: error });
   }
 };
 
-const run = (command: Array<string>, cwd: string): void => {
-  const result = Bun.spawnSync(command, {
+const run = (command: readonly string[], cwd: string): void => {
+  const result = Bun.spawnSync([...command], {
     cwd,
-    stdout: "inherit",
     stderr: "inherit",
+    stdout: "inherit",
   });
   if (result.exitCode !== 0) {
     throw new Error(`${command.join(" ")} failed with ${result.exitCode}`);
@@ -31,32 +55,43 @@ const run = (command: Array<string>, cwd: string): void => {
 };
 
 const repositoryRoot = resolve(import.meta.dir, "..");
-const packageJson = parseJson<PackageJson>(
-  readFileSync(join(repositoryRoot, "packages/effect-tls-client/package.json"), "utf8"),
+const packageJsonValue = parseJson(
+  readFileSync(
+    join(repositoryRoot, "packages/effect-tls-client/package.json"),
+    "utf8",
+  ),
   "effect-tls-client package metadata",
 );
+if (!isPackageJson(packageJsonValue)) {
+  throw new Error("invalid effect-tls-client package metadata");
+}
+const packageJson = packageJsonValue;
 const dependencyVersion = (name: string): string => {
   const version = packageJson.devDependencies?.[name];
-  if (version === undefined) {
+  if (typeof version !== "string") {
     throw new Error(`missing smoke dependency version: ${name}`);
   }
   return version;
 };
 
 const packageDirectory = resolve(process.argv[2] ?? "release-packages");
-const manifest = parseJson<ReadonlyArray<ManifestEntry>>(
+const manifestValue = parseJson(
   readFileSync(join(packageDirectory, "manifest.json"), "utf8"),
   "release package manifest",
 );
+if (!isManifest(manifestValue)) {
+  throw new Error("invalid release package manifest");
+}
+const manifest = manifestValue;
 const tarballFor = (name: string): string => {
   const entry = manifest.find((candidate) => candidate.name === name);
-  if (entry === undefined) {
+  if (!entry) {
     throw new Error(`missing packed package: ${name}`);
   }
   return join(packageDirectory, entry.filename);
 };
 
-const platformPackages: Readonly<Record<string, string>> = {
+const platformPackages: Readonly<Partial<Record<string, string>>> = {
   "darwin-arm64": "@effect-tls-client/bridge-darwin-arm64",
   "darwin-x64": "@effect-tls-client/bridge-darwin-x64",
   "linux-arm64": "@effect-tls-client/bridge-linux-arm64",
@@ -64,11 +99,15 @@ const platformPackages: Readonly<Record<string, string>> = {
   "win32-x64": "@effect-tls-client/bridge-win32-x64",
 };
 const platformPackage = platformPackages[`${process.platform}-${process.arch}`];
-if (platformPackage === undefined) {
-  throw new Error(`release smoke does not support ${process.platform}-${process.arch}`);
+if (!platformPackage) {
+  throw new Error(
+    `release smoke does not support ${process.platform}-${process.arch}`,
+  );
 }
 
-const projectDirectory = mkdtempSync(join(tmpdir(), "effect-tls-client-smoke-"));
+const projectDirectory = mkdtempSync(
+  join(tmpdir(), "effect-tls-client-smoke-"),
+);
 try {
   writeFileSync(
     join(projectDirectory, "package.json"),
@@ -122,5 +161,5 @@ try {
   run(["node", "smoke.mjs", "node"], projectDirectory);
   run(["bun", "smoke.mjs", "bun"], projectDirectory);
 } finally {
-  rmSync(projectDirectory, { recursive: true, force: true });
+  rmSync(projectDirectory, { force: true, recursive: true });
 }

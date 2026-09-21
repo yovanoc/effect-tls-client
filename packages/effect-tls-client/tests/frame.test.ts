@@ -148,6 +148,44 @@ describe("protocol v1 frame codec", () => {
     expect(decodeEmptyMeta(frame.meta)).toEqual({});
   });
 
+  it("owns frames returned from mutable input chunks", () => {
+    const encoded = encodeFrame({
+      kind: FrameKind.chunk,
+      id: 1,
+      body: new Uint8Array([1, 2]),
+    });
+    const decoder = new FrameDecoder();
+    const [frame] = decoder.push(encoded);
+    encoded.fill(0);
+    expect(frame?.body).toEqual(new Uint8Array([1, 2]));
+  });
+
+  it("owns buffered frame prefixes", () => {
+    const encoded = encodeFrame({
+      kind: FrameKind.chunk,
+      id: 1,
+      body: new Uint8Array([1, 2]),
+    });
+    const decoder = new FrameDecoder();
+    const prefix = encoded.slice(0, 5);
+    const suffix = encoded.slice(5);
+    expect(decoder.push(prefix)).toHaveLength(0);
+    prefix.fill(0);
+    const [frame] = decoder.push(suffix);
+    expect(frame?.body).toEqual(new Uint8Array([1, 2]));
+  });
+
+  it("owns direct frame decode output", () => {
+    const encoded = encodeFrame({
+      kind: FrameKind.chunk,
+      id: 1,
+      body: new Uint8Array([1, 2]),
+    });
+    const frame = decodeFrame(encoded);
+    encoded[13] = 9;
+    expectBytes(frame.body, new Uint8Array([1, 2]));
+  });
+
   it("rejects oversized, truncated, and malformed frames", () => {
     const oversized = new Uint8Array(4);
     new DataView(oversized.buffer).setUint32(0, MAX_FRAME_LENGTH + 1, false);

@@ -154,6 +154,32 @@ Use `Effect.retry` around a complete handshake/session operation when a
 reconnect policy is needed. Do not keep a reader or writer after its scope has
 closed.
 
+## Opt-in load benchmark
+
+The repository includes a local, opt-in 1,000-account workload. It starts one
+HTTPS target, one CONNECT proxy listener per account, and exercises one unique
+cookie, durable WebSocket, and HTTP request loop per session:
+
+```sh
+bun run build # also builds bridge/bridge for the host
+TLS_CLIENT_BRIDGE_PATH="$PWD/bridge/bridge" bun run benchmark:load
+```
+
+Set `TLS_CLIENT_LOAD_SESSIONS`, `TLS_CLIENT_LOAD_DURATION_SECONDS`,
+`TLS_CLIENT_LOAD_WS_MESSAGES_PER_SECOND`,
+`TLS_CLIENT_LOAD_HTTP_REQUESTS_PER_SECOND`,
+`TLS_CLIENT_LOAD_OPERATION_TIMEOUT_MS`, and `TLS_CLIENT_LOAD_REPORT` to scale or
+save the JSON report. The defaults are 1,000 sessions, 30 seconds, 10
+WebSocket messages per second, and one HTTP request per second. Results are
+synthetic local-fixture measurements, not a proxy-fleet or production-capacity
+guarantee. Set `TLS_CLIENT_LOAD_HTTP_URL` and `TLS_CLIENT_LOAD_WS_URL` with an
+`{id}` placeholder, plus `TLS_CLIENT_LOAD_PROXY_URLS`, to target externally
+reachable endpoints and provide one unique proxy URL per session.
+`TLS_CLIENT_LOAD_INSECURE_SKIP_VERIFY` defaults to true only for the local
+fixture and must be explicitly enabled for custom self-signed endpoints.
+Reports include latency percentiles, Node CPU/file-descriptor usage, parent
+heap/RSS, and sampled Bridge RSS; Bridge CPU is not included.
+
 ## Errors and retry
 
 Failures are typed rather than inferred from message strings:
@@ -257,8 +283,22 @@ example defaults to `wss://ws.postman-echo.com/raw`.
 ```sh
 bun install
 bunx turbo run build test lint format
+bun run check:bun # package checks in parallel with Bun
 bun run scripts/release-pack.ts
+bun run package:size
+
+# The benchmark uses the deterministic fake Bridge fixture.
+bun run benchmark
+bun run benchmark:compare -- main
 ```
+
+`benchmark:compare` builds the current checkout and a temporary worktree at the
+base ref, then compares the fake-Bridge median and compressed npm tarball sizes.
+It reports regressions above 10%; it does not fail on benchmark noise.
+
+Oxlint enables all rule categories plus type-aware Effect diagnostics through the
+shared workspace config. Existing findings are warnings while the baseline is
+migrated incrementally.
 
 Go checks run from the module directory:
 

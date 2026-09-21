@@ -193,6 +193,10 @@ const errorMessage = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
 
 const concatenate = (chunks: ReadonlyArray<Uint8Array>): Uint8Array => {
+  if (chunks.length === 1) {
+    const only = chunks[0];
+    if (only) return only;
+  }
   const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
   const result = new Uint8Array(length);
   let offset = 0;

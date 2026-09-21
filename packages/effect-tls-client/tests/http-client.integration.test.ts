@@ -68,6 +68,12 @@ const startServer = (): Promise<IntegrationServer> =>
         });
         return;
       }
+      if (path === "/upload") {
+        request.once("aborted", () => response.destroy());
+        request.once("end", () => response.end("ok"));
+        request.resume();
+        return;
+      }
       response.statusCode = 404;
       response.end();
     });

@@ -387,21 +387,46 @@ export const ErrorMeta = Schema.Struct({
 export interface ErrorMeta extends Schema.Schema.Type<typeof ErrorMeta> {}
 
 export type MetaSchema = Schema.Codec<unknown, unknown, never, never>;
-const json = <S extends MetaSchema>(schema: S) => Schema.fromJsonString(schema);
+
+interface JsonCodec {
+  readonly decode: (value: string) => unknown;
+  readonly encode: (value: unknown) => string;
+}
+
+const jsonCodecs = new WeakMap<MetaSchema, JsonCodec>();
+const encoder = new TextEncoder();
+
+const json = (schema: MetaSchema): JsonCodec => {
+  const cached = jsonCodecs.get(schema);
+  if (cached !== undefined) return cached;
+  const encoded = Schema.fromJsonString(schema);
+  const codec = {
+    decode: Schema.decodeSync(encoded),
+    encode: Schema.encodeSync(encoded),
+  };
+  jsonCodecs.set(schema, codec);
+  return codec;
+};
 
 export const decodeMeta = <S extends MetaSchema>(
   schema: S,
   bytes: Uint8Array,
-): S["Type"] => Schema.decodeSync(json(schema))(decodeUtf8(bytes));
+): S["Type"] => {
+  // SAFETY: The codec is cached by the exact schema object passed to this function.
+  // oxlint-disable-next-line effect/casting-awareness
+  return json(schema).decode(decodeUtf8(bytes)) as S["Type"];
+};
 
 export const encodeMeta = <S extends MetaSchema>(
   schema: S,
   value: Schema.Schema.Type<S>,
-): Uint8Array =>
-  new TextEncoder().encode(Schema.encodeSync(json(schema))(value));
+): Uint8Array => encoder.encode(json(schema).encode(value));
 
 export const decodeEmptyMeta = (bytes: Uint8Array): EmptyMeta =>
-  bytes.byteLength === 0 ? {} : decodeMeta(EmptyMeta, bytes);
+  bytes.byteLength === 0 ||
+  (bytes.byteLength === 2 && bytes[0] === 0x7b && bytes[1] === 0x7d)
+    ? {}
+    : decodeMeta(EmptyMeta, bytes);
 
 export const encodeEmptyMeta = (value: unknown = {}): Uint8Array =>
   encodeMeta(EmptyMeta, Schema.decodeUnknownSync(EmptyMeta)(value));

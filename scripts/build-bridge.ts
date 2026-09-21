@@ -1,18 +1,27 @@
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-type Target = {
+interface Target {
   readonly goos: string;
   readonly goarch: string;
   readonly executable: string;
-};
+}
 
-type PackageJson = {
+interface PackageJson {
   readonly name: string;
   readonly version: string;
-};
+}
 
-const targets: Readonly<Record<string, Target>> = {
+const isArray = (value: unknown): value is readonly unknown[] =>
+  Array.isArray(value);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !isArray(value);
+const isPackageJson = (value: unknown): value is PackageJson =>
+  isRecord(value) &&
+  typeof value.name === "string" &&
+  typeof value.version === "string";
+
+const targets: Readonly<Record<string, Target | undefined>> = {
   "@effect-tls-client/bridge-darwin-arm64": {
     goos: "darwin",
     goarch: "arm64",
@@ -44,7 +53,10 @@ const hostTarget = (): Target => {
   const goos = process.platform === "win32" ? "windows" : process.platform;
   const goarch = process.arch === "x64" ? "amd64" : process.arch;
   const target = Object.values(targets).find(
-    (candidate) => candidate.goos === goos && candidate.goarch === goarch,
+    (candidate): candidate is Target =>
+      candidate !== undefined &&
+      candidate.goos === goos &&
+      candidate.goarch === goarch,
   );
   if (target === undefined) {
     throw new Error(`unsupported Bridge host: ${goos}-${goarch}`);
@@ -54,9 +66,15 @@ const hostTarget = (): Target => {
 
 const readPackage = (path: string): PackageJson => {
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as PackageJson;
-  } catch (cause) {
-    throw new Error(`cannot read package metadata at ${path}`, { cause });
+    const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!isPackageJson(value)) {
+      throw new Error("invalid package metadata");
+    }
+    return value;
+  } catch (error) {
+    throw new Error(`cannot read package metadata at ${path}`, {
+      cause: error,
+    });
   }
 };
 
@@ -66,7 +84,9 @@ const isHostBuild = Bun.argv.includes("--host");
 const packageDirectory = process.cwd();
 const packageJson = readPackage(
   join(
-    isHostBuild ? join(repositoryRoot, "packages", "effect-tls-client") : packageDirectory,
+    isHostBuild
+      ? join(repositoryRoot, "packages", "effect-tls-client")
+      : packageDirectory,
     "package.json",
   ),
 );
@@ -109,5 +129,5 @@ const result = Bun.spawnSync(
 );
 
 if (result.exitCode !== 0) {
-  process.exit(result.exitCode ?? 1);
+  process.exit(result.exitCode);
 }
