@@ -5,9 +5,9 @@ Effect-native HTTP, HTTP/2/3, and WebSocket access to
 versioned Go Bridge process. It is for applications that need a pinned TLS
 identity without loading native code into Node or Bun.
 
-The package supports **Node 22+** and **Bun 1.4+**. The browser/challenge layer
-is intentionally not part of this release; use the transport primitives below
-for survey, anti-bot, API, and game-client workloads.
+The package supports **Node 22+** and **Bun 1.4+**. The optional browser layer
+adds browser-shaped headers, bounded navigation, and an application-owned
+challenge seam on top of the same scoped transport session.
 
 ## Install
 
@@ -132,6 +132,38 @@ Use `setCookies` rather than manually adding a `Cookie` header so domain, path,
 expiry, security, and redirect rules remain correct. `cookieJar: "strict"`
 rejects invalid/empty values; `cookieJar: "none"` disables the Jar. Proxy
 failures are typed `TlsRequestError` values with `kind: "Proxy"`.
+
+## Browser layer
+
+Import the optional facade from `effect-tls-client/browser`. It wraps one
+`TlsSession`, stamps navigation or XHR-style headers from a fixed identity, and
+follows bounded `Location` and HTML redirects. The Go-side cookie jar remains
+authoritative; browser requests reject manually supplied `Cookie` headers.
+
+```ts
+import { Effect, Layer } from "effect";
+import { NodeServices } from "@effect/platform-node";
+import { TlsClient } from "effect-tls-client";
+import * as Browser from "effect-tls-client/browser";
+
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const browser = yield* Browser.open({
+      transport: { profile: "chrome_152_PSK" },
+      identity: Browser.Chrome152Identity,
+    });
+    const page = yield* browser.navigate("https://example.com/");
+    console.log(page.status, page.url, page.body.slice(0, 240));
+  }),
+);
+
+await Effect.runPromise(
+  program.pipe(Effect.provide(TlsClient.layer.pipe(Layer.provide(NodeServices.layer)))),
+);
+```
+
+See [docs/browser.md](docs/browser.md) for the runnable Node/Bun example,
+cookie ownership, and challenge limitations.
 
 ### WebSockets
 
@@ -268,6 +300,8 @@ bun run build
 
 node examples/basic-request.mjs
 bun examples/basic-request.mjs
+node examples/browser.mjs
+bun examples/browser.mjs
 node examples/http-client.mjs
 bun examples/http-client.mjs
 node examples/websocket.mjs
