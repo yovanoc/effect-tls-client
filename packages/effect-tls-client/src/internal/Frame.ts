@@ -69,13 +69,14 @@ export class FrameCodecError extends Error {
 }
 
 const encoder = new TextEncoder();
+const EMPTY_BYTES = new Uint8Array(0);
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 const isUint32 = (value: number): boolean =>
   Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
 
 const metadataBytes = (meta: FrameInput["meta"]): Uint8Array => {
-  if (meta === undefined) return new Uint8Array(0);
+  if (meta === undefined) return EMPTY_BYTES;
   if (meta instanceof Uint8Array) return meta;
   if (typeof meta === "string") return encoder.encode(meta);
   try {
@@ -97,7 +98,7 @@ export const encodeFrame = (input: FrameInput): Uint8Array => {
     throw new FrameCodecError(`invalid frame id: ${input.id}`);
 
   const meta = metadataBytes(input.meta);
-  const body = input.body ?? new Uint8Array(0);
+  const body = input.body ?? EMPTY_BYTES;
   const length = FIXED_HEADER_LENGTH + meta.byteLength + body.byteLength;
   if (length > MAX_FRAME_LENGTH) {
     throw new FrameCodecError(
@@ -117,7 +118,7 @@ export const encodeFrame = (input: FrameInput): Uint8Array => {
 };
 
 /** Decodes exactly one complete frame. Extra or truncated bytes are rejected. */
-export const decodeFrame = (encoded: Uint8Array): Frame => {
+const decodeFrameView = (encoded: Uint8Array): Frame => {
   if (encoded.byteLength < LENGTH_PREFIX) {
     throw new FrameCodecError("frame is missing its length prefix");
   }
@@ -160,17 +161,28 @@ export const decodeFrame = (encoded: Uint8Array): Frame => {
   return {
     kind,
     id: view.getUint32(5, false),
-    meta: encoded.slice(metaStart, metaEnd),
-    body: encoded.slice(metaEnd),
+    meta: encoded.subarray(metaStart, metaEnd),
+    body: encoded.subarray(metaEnd),
+  };
+};
+
+/** Decodes exactly one complete frame and owns the returned byte arrays. */
+export const decodeFrame = (encoded: Uint8Array): Frame => {
+  const frame = decodeFrameView(encoded);
+  return {
+    ...frame,
+    meta: frame.meta.slice(),
+    body: frame.body.slice(),
   };
 };
 
 /** Incremental decoder for arbitrary stdout chunk boundaries. */
 export class FrameDecoder {
-  private buffer = new Uint8Array(0);
+  private buffer: Uint8Array = EMPTY_BYTES;
 
   push(chunk: Uint8Array): ReadonlyArray<Frame> {
     if (chunk.byteLength === 0) return [];
+    // Own input chunks before returning subarray-backed frame views.
     const merged = new Uint8Array(this.buffer.byteLength + chunk.byteLength);
     merged.set(this.buffer);
     merged.set(chunk, this.buffer.byteLength);
@@ -195,11 +207,12 @@ export class FrameDecoder {
       }
       const total = LENGTH_PREFIX + length;
       if (merged.byteLength - offset < total) break;
-      frames.push(decodeFrame(merged.slice(offset, offset + total)));
+      frames.push(decodeFrameView(merged.subarray(offset, offset + total)));
       offset += total;
     }
 
-    this.buffer = merged.slice(offset);
+    this.buffer =
+      offset === merged.byteLength ? EMPTY_BYTES : merged.subarray(offset);
     return frames;
   }
 

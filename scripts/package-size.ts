@@ -7,19 +7,35 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 
+type JsonContainer = Record<string, unknown> | readonly unknown[];
+
 const argument = (
-  args: ReadonlyArray<string>,
+  args: readonly string[],
   name: string,
 ): string | undefined => {
   const index = args.indexOf(name);
   return index === -1 ? undefined : args[index + 1];
 };
 
-const parseJson = <T>(path: string): T => {
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const isManifestEntry = (value: unknown): value is ManifestEntry =>
+  isRecord(value) &&
+  typeof value.name === "string" &&
+  typeof value.filename === "string";
+const isManifest = (value: JsonContainer): value is readonly ManifestEntry[] =>
+  Array.isArray(value) && value.every(isManifestEntry);
+
+const parseJson = (path: string): JsonContainer => {
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as T;
-  } catch (cause) {
-    throw new Error(`cannot parse ${path}`, { cause });
+    const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (Array.isArray(value)) return value;
+    if (!isRecord(value)) {
+      throw new Error("JSON value is not an object or array");
+    }
+    return value;
+  } catch (error) {
+    throw new Error(`cannot parse ${path}`, { cause: error });
   }
 };
 
@@ -28,19 +44,19 @@ const writeOutput = (path: string, content: string): void => {
   writeFileSync(path, content);
 };
 
-type ManifestEntry = {
+interface ManifestEntry {
   readonly name: string;
   readonly filename: string;
-};
+}
 
-type PackageSizeReport = {
+interface PackageSizeReport {
   readonly schemaVersion: 1;
-  readonly packages: ReadonlyArray<{
+  readonly packages: readonly {
     readonly name: string;
     readonly filename: string;
     readonly bytes: number;
-  }>;
-};
+  }[];
+}
 
 const args = process.argv.slice(2);
 const packDirectory = resolve(
@@ -58,16 +74,12 @@ if (!existsSync(manifestPath)) {
   );
 }
 
-const manifest = parseJson<ReadonlyArray<ManifestEntry>>(manifestPath)
+const manifestValue = parseJson(manifestPath);
+if (!isManifest(manifestValue)) {
+  throw new Error(`invalid package manifest at ${manifestPath}`);
+}
+const manifest = manifestValue
   .map((entry) => {
-    if (
-      entry === null ||
-      typeof entry !== "object" ||
-      typeof entry.name !== "string" ||
-      typeof entry.filename !== "string"
-    ) {
-      throw new Error(`invalid package entry in ${manifestPath}`);
-    }
     const tarball = resolve(packDirectory, entry.filename);
     const relativeTarball = relative(packDirectory, tarball);
     if (

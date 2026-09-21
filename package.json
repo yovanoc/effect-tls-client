@@ -14,6 +14,7 @@
     "release": "changeset publish",
     "release:pack": "bun scripts/release-pack.ts",
     "benchmark": "bun scripts/benchmark.ts",
+    "benchmark:load": "bun scripts/benchmark-load.ts",
     "benchmark:compare": "bun scripts/benchmark-compare.ts",
     "package:size": "bun scripts/package-size.ts",
     "check:bun": "bun run --cwd packages/effect-tls-client check",

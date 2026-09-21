@@ -8,7 +8,28 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { renderReport, validateReport } from "./performance-report.mjs";
+
+interface PerformanceReportModule {
+  readonly renderReport: (report: unknown) => string;
+  readonly validateReport: (report: unknown) => unknown;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+const isPerformanceReportModule = (
+  value: unknown,
+): value is PerformanceReportModule =>
+  isRecord(value) &&
+  typeof value.renderReport === "function" &&
+  typeof value.validateReport === "function";
+const performanceReportModulePath = "./performance-report.mjs";
+const performanceReportValue: unknown = await import(
+  performanceReportModulePath
+);
+if (!isPerformanceReportModule(performanceReportValue)) {
+  throw new Error("invalid performance report module");
+}
+const { renderReport, validateReport } = performanceReportValue;
 
 const REGRESSION_THRESHOLD_PERCENT = 10;
 const args = process.argv.slice(2);

@@ -38,7 +38,6 @@ import {
   BodyChunkMeta,
   BodyEndMeta,
   CancelMeta,
-  ChunkMeta,
   DEFAULT_CHUNK_SIZE,
   DEFAULT_WINDOW,
   DebugSleepMeta,
@@ -65,6 +64,7 @@ import {
   SessionIdMeta,
   SessionProxyMeta,
   PROTOCOL_VERSION,
+  decodeEmptyMeta,
   decodeMeta,
   encodeEmptyMeta,
   encodeMeta,
@@ -546,7 +546,7 @@ const makeBridge = Effect.gen(function* () {
         if (frame.body.byteLength === 0) {
           throw failProtocol("chunk frame cannot be empty");
         }
-        decodeMeta(ChunkMeta, frame.meta);
+        decodeEmptyMeta(frame.meta);
         if (frame.body.byteLength > state.chunkSize) {
           throw failProtocol(
             `chunk length ${frame.body.byteLength} exceeds negotiated chunkSize ${state.chunkSize}`,
@@ -648,14 +648,6 @@ const makeBridge = Effect.gen(function* () {
   };
 
   const handleFrame = (frame: Frame): BridgeProtocolError | undefined => {
-    if (!Object.values(FrameKind).includes(frame.kind)) {
-      const error = failProtocol(
-        `unknown frame kind 0x${frame.kind.toString(16)}`,
-      );
-      markDead(error);
-      return error;
-    }
-
     const operation = pending.get(frame.id);
     if (operation === undefined) return undefined;
 
