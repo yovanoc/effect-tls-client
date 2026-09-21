@@ -124,13 +124,6 @@ func cookiePath(u *url.URL, cookie *http.Cookie) string {
 	return cookie.Path
 }
 
-func cookieDomain(u *url.URL, cookie *http.Cookie) string {
-	if cookie.Domain == "" {
-		return strings.ToLower(u.Hostname())
-	}
-	return strings.TrimPrefix(strings.ToLower(cookie.Domain), ".")
-}
-
 func cookieKey(cookie *http.Cookie) string {
 	return strings.ToLower(cookie.Domain) + "\x00" + cookie.Path + "\x00" + cookie.Name
 }
@@ -183,18 +176,19 @@ func (j *sessionCookieJar) reconcileLocked() {
 }
 
 func (j *sessionCookieJar) acceptedCookieLocked(u *url.URL, candidate *http.Cookie) (*http.Cookie, bool) {
+	key := scriptCookieKey(u, candidate)
+	if key == "" {
+		return nil, false
+	}
 	path := cookiePath(u, candidate)
 	scheme := u.Scheme
 	if candidate.Secure {
 		scheme = "https"
 	}
 	selected := j.state.jar.Cookies(cookieQueryURL(scheme, u.Host, path))
-	domain := cookieDomain(u, candidate)
 	for _, cookie := range selected {
-		if cookie.Name == candidate.Name &&
+		if cookieKey(cookie) == key &&
 			cookie.Value == candidate.Value &&
-			cookie.Domain == domain &&
-			cookie.Path == path &&
 			cookie.Secure == candidate.Secure &&
 			cookie.HttpOnly == candidate.HttpOnly {
 			return cookie, true
@@ -220,6 +214,110 @@ func (j *sessionCookieJar) cookiesFor(u *url.URL) []*http.Cookie {
 		}
 	}
 	return result
+}
+
+// scriptCookieKey asks fhttp to canonicalize a probe cookie so protection and
+// tracking use the same host, IDNA, domain, and path rules as the real Jar.
+func scriptCookieKey(u *url.URL, cookie *http.Cookie) string {
+	if u == nil || cookie == nil {
+		return ""
+	}
+	canonicalJar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		return ""
+	}
+	probe := cloneCookie(cookie)
+	probe.Value = "__effect_tls_client_cookie_probe__"
+	probe.MaxAge = 0
+	probe.Expires = time.Time{}
+	canonicalJar.SetCookies(u, []*http.Cookie{probe})
+	for _, actual := range canonicalJar.Cookies(cookieQueryURL("https", u.Host, cookiePath(u, cookie))) {
+		if actual.Name == probe.Name && actual.Value == probe.Value {
+			return cookieKey(actual)
+		}
+	}
+	return ""
+}
+
+func cookieHeader(cookies []*http.Cookie) string {
+	values := make([]string, 0, len(cookies))
+	for _, cookie := range cookies {
+		value := (&http.Cookie{Name: cookie.Name, Value: cookie.Value}).String()
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	return strings.Join(values, "; ")
+}
+
+// scriptCookieHeader performs the browser document.cookie read and writes as
+// one Jar-locked operation. Raw writes are parsed by fhttp so URL/domain/path
+// rules stay identical to response Set-Cookie handling.
+func (j *sessionCookieJar) scriptCookieHeader(u *url.URL, setCookies []string) string {
+	if u == nil {
+		return ""
+	}
+	j.state.mu.Lock()
+	defer j.state.mu.Unlock()
+
+	j.reconcileLocked()
+	protected := make(map[string]struct{})
+	secure := make(map[string]struct{})
+	for key, record := range j.state.cookies {
+		if record.cookie.HttpOnly {
+			protected[key] = struct{}{}
+		}
+		if record.cookie.Secure {
+			secure[key] = struct{}{}
+		}
+	}
+	parsed := (&http.Response{Header: http.Header{"Set-Cookie": setCookies}}).Cookies()
+	accepted := make([]*http.Cookie, 0, len(parsed))
+	for _, candidate := range parsed {
+		if candidate.HttpOnly || (j.state.strict && candidate.Value == "") ||
+			(candidate.Secure && !strings.EqualFold(u.Scheme, "https")) {
+			continue
+		}
+		key := scriptCookieKey(u, candidate)
+		if key == "" {
+			continue
+		}
+		if _, blocked := protected[key]; blocked {
+			continue
+		}
+		if !strings.EqualFold(u.Scheme, "https") {
+			if _, blocked := secure[key]; blocked {
+				continue
+			}
+		}
+		accepted = append(accepted, candidate)
+	}
+	if len(accepted) > 0 {
+		j.state.jar.SetCookies(u, accepted)
+		j.reconcileLocked()
+		for _, candidate := range accepted {
+			actual, ok := j.acceptedCookieLocked(u, candidate)
+			if !ok {
+				continue
+			}
+			key := cookieKey(actual)
+			j.state.cookies[key] = trackedCookie{
+				cookie:     actual,
+				origin:     strings.ToLower(u.Hostname()),
+				hostOnly:   candidate.Domain == "",
+				persistent: candidate.MaxAge > 0 || !candidate.Expires.IsZero(),
+				sameSite:   candidate.SameSite,
+			}
+		}
+	}
+
+	visible := make([]*http.Cookie, 0)
+	for _, cookie := range j.state.jar.Cookies(u) {
+		if !cookie.HttpOnly {
+			visible = append(visible, cookie)
+		}
+	}
+	return cookieHeader(visible)
 }
 
 func (j *sessionCookieJar) Cookies(u *url.URL) []*http.Cookie {
@@ -1137,6 +1235,34 @@ func (d *dispatcher) runCookiesImport(ctx context.Context, op *operation, meta p
 	}
 	releaseProxy()
 	_ = d.finishOK(op)
+}
+
+func (d *dispatcher) runCookiesScript(ctx context.Context, op *operation, meta protocol.CookiesScriptMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	session, ok := d.sessions.get(meta.SessionID)
+	if !ok {
+		sessionNotFound(d, op, meta.SessionID)
+		return
+	}
+	parsed, err := parseCookieURL(meta.URL)
+	if err != nil {
+		_ = d.finishError(op, protocol.ErrorKindInvalidUrl, err.Error())
+		return
+	}
+	releaseProxy, acquireErr := session.proxyGate.acquireRead(ctx)
+	if acquireErr != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	cookie := ""
+	if jar, ok := session.client.GetCookieJar().(*sessionCookieJar); ok {
+		cookie = jar.scriptCookieHeader(parsed, meta.SetCookies)
+	}
+	releaseProxy()
+	_ = d.finishResult(op, protocol.CookiesScriptResultMeta{Cookie: cookie})
 }
 
 func (d *dispatcher) runBandwidthGet(ctx context.Context, op *operation, meta protocol.BandwidthMeta) {

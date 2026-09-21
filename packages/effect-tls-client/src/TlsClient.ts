@@ -33,6 +33,7 @@ import {
   Cookie as CookieSchema,
   CookiesJson,
   CookiesResultMeta,
+  CookiesScriptResultMeta,
   SessionConfig as SessionConfigSchema,
   type Cookie as WireCookie,
   type Pair,
@@ -164,6 +165,10 @@ export interface TlsSession {
     url: string,
     cookies: Cookies.Cookies,
   ) => Effect.Effect<void, TlsOperationError>;
+  readonly scriptCookies: (
+    url: string,
+    setCookies?: ReadonlyArray<string>,
+  ) => Effect.Effect<string, TlsOperationError>;
   readonly exportCookies: Effect.Effect<string, TlsOperationError>;
   readonly importCookies: (
     json: string,
@@ -627,6 +632,18 @@ const decodeCookieResult = (frame: {
       }),
   });
 
+const decodeScriptCookieResult = (frame: {
+  readonly meta: Uint8Array;
+}): Effect.Effect<string, BridgeProtocolError> =>
+  Effect.try({
+    try: () => decodeMeta(CookiesScriptResultMeta, frame.meta).cookie,
+    catch: (cause) =>
+      new BridgeProtocolError({
+        message: "invalid script cookie response metadata",
+        cause,
+      }),
+  });
+
 const decodeBandwidthResult = (frame: {
   readonly meta: Uint8Array;
 }): Effect.Effect<Bandwidth, BridgeProtocolError> =>
@@ -1009,6 +1026,22 @@ const makeSession = (
       })
       .pipe(Effect.asVoid);
   });
+  const scriptCookies = Effect.fn("TlsSession.scriptCookies")(function* (
+    url: string,
+    setCookies?: ReadonlyArray<string>,
+  ) {
+    const frame = yield* bridge.call(
+      FrameKind.cookiesScript,
+      {
+        sessionId,
+        url,
+        ...(setCookies === undefined ? {} : { setCookies }),
+      },
+      undefined,
+      CookiesScriptResultMeta,
+    );
+    return yield* decodeScriptCookieResult(frame);
+  });
   const exportCookies = Effect.gen(function* () {
     const frame = yield* bridge.call(
       FrameKind.cookiesExport,
@@ -1079,6 +1112,7 @@ const makeSession = (
     resetBandwidth,
     cookies,
     setCookies,
+    scriptCookies,
     exportCookies,
     importCookies,
     setProxy,

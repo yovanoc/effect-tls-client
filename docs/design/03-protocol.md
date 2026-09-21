@@ -33,6 +33,7 @@ JS → Go
 | 0x16 | `cookies.import` | `{ sessionId, cookies: Cookie[] }` | – | `ok {}` |
 | 0x17 | `bandwidth.get` | `{ sessionId? }` (absent = process total) | – | `ok { read, written }` |
 | 0x18 | `bandwidth.reset` | `{ sessionId? }` | – | `ok {}` |
+| 0x19 | `cookies.script` | `{ sessionId, url, setCookies?: string[] }` | – | `ok { cookie: string }` |
 | 0x20 | `request` | `RequestMeta` (§6) | – | `end` \| `error` |
 | 0x21 | `body.chunk` | `{}` | ✔ | – (part of the `request` op) |
 | 0x22 | `body.end` | `{}` | – | – |
@@ -139,6 +140,8 @@ Sequence: `request` → (`body.chunk`* → `body.end` if `hasBody`) … Go: `hea
 `contentLength` is the normalized request length. TS derives it for bytes, strings, and `FormData`, and validates any explicit `Content-Length` header against it; Go validates the value, sets the request's `ContentLength`, and removes the header before handing the request to the transport. Unknown-length streams omit it unless the caller supplies a valid matching header. `cookies` are inserted into the target session's Go Jar for this URL immediately before the request; they therefore persist in a named session and are scoped to the one ephemeral client for sessionless requests. Cookies rejected by the RFC Jar are ignored and cannot appear in a later export.
 
 The public session API maps `cookies(url)` and `setCookies(url, Cookies.Cookies)` to `cookies.get/set`; an empty Jar is always returned as `cookies: []`. `Max-Age` is exposed as an absolute unix-second `expires` value, including in exports/imports, and expired cookies are pruned. `exportCookies` is an Effect containing Schema-validated JSON for the complete accepted Jar; `importCookies(json)` validates that JSON before sending it to Go. Host-only exported cookies keep their original `domain: ""` and carry an additive `origin` only so they can be restored in a fresh session. An explicit `Cookie` request header replaces automatic Jar injection for that request, unchanged; response `Set-Cookie` headers still update the Jar. Explicit headers are discouraged because they bypass the Jar's domain/path policy.
+
+The additive `cookies.script` operation is only for the browser layer. It reads the URL-selected non-`HttpOnly` cookies as a `Cookie` header and optionally applies raw script `Set-Cookie` values while holding the Go Jar lock. Go's fhttp parser and Jar enforce URL scheme, domain, and path rules; `HttpOnly` writes and writes targeting an existing `HttpOnly` name/domain/path tuple are ignored. This operation does not change the raw public `cookies.get/set` behavior.
 
 `ResponseHeadersMeta`:
 ```ts

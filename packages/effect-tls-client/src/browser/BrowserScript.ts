@@ -22,7 +22,7 @@ export interface BrowserScriptContext extends Schema.Schema.Type<
   typeof BrowserScriptContext
 > {}
 
-/** A script result and the non-HttpOnly cookie writes it requested. */
+/** A script result and the raw cookie writes it requested. */
 export const BrowserScriptResult = Schema.Struct({
   value: Schema.String,
   setCookies: Schema.Array(Schema.String),

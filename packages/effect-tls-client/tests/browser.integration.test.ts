@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
-import { ConfigProvider, Effect, Layer, Option } from "effect";
+import { ConfigProvider, Effect, Layer, Option, Schema } from "effect";
 import { createServer, type Server } from "node:http";
 import * as Browser from "../src/browser/index.js";
 import { TlsClient } from "../src/index.js";
@@ -16,6 +16,17 @@ const close = (server: Server): Promise<void> =>
     server.close((error) => (error === undefined ? resolve() : reject(error)));
   });
 
+const ExportedCookies = Schema.fromJsonString(
+  Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      value: Schema.String,
+      path: Schema.String,
+      httpOnly: Schema.Boolean,
+    }),
+  ),
+);
+
 const startFixture = async (): Promise<{
   readonly url: string;
   readonly cookies: Array<string>;
@@ -28,10 +39,10 @@ const startFixture = async (): Promise<{
     if (path === "/challenge") {
       response.statusCode = 202;
       response.setHeader("x-amzn-waf-action", "challenge");
-      response.setHeader(
-        "set-cookie",
+      response.setHeader("set-cookie", [
         "server-secret=hidden; Path=/private; HttpOnly",
-      );
+        "read-secret=hidden; Path=/; HttpOnly",
+      ]);
       response.end("challenge");
       return;
     }
@@ -92,7 +103,7 @@ describeRealIntegration("real BrowserMock integration", () => {
                 challengeHandler: (_challenge, context) =>
                   Effect.gen(function* () {
                     const value = yield* context.evaluate(
-                      'if (document.cookie.includes("server-secret")) return "leaked"; document.cookie = "server-secret=overwritten; Path=/private"; document.cookie = "clearance=ok; Path=/"; document.cookie = "forbidden=no; HttpOnly; Path=/"; return "ready";',
+                      'if (document.cookie.includes("read-secret")) return "leaked"; document.cookie = "server-secret=overwritten; Path=/private"; document.cookie = "server-secret=allowed; Path=/"; document.cookie = "clearance=ok; Path=/"; document.cookie = "forbidden=no; HttpOnly; Path=/"; return "ready";',
                     );
                     expect(value).toBe("ready");
                     return Option.some({
@@ -102,18 +113,33 @@ describeRealIntegration("real BrowserMock integration", () => {
               },
             );
             const page = yield* browser.navigate(`${fixture.url}/challenge`);
-            const stored = yield* browser.transport.cookies(
-              `${fixture.url}/private/success`,
+            const cookies = yield* Schema.decodeEffect(ExportedCookies)(
+              yield* browser.transport.exportCookies,
             );
-            return { page, stored };
+            return { page, cookies };
           }).pipe(Effect.provide(services)),
         ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
         expect(result.page.status).toBe(200);
         expect(result.page.body).toBe("ok");
-        expect(result.stored.cookies["server-secret"]?.options?.httpOnly).toBe(
-          true,
+        expect(result.cookies).toContainEqual(
+          expect.objectContaining({
+            name: "server-secret",
+            value: "hidden",
+            path: "/private",
+            httpOnly: true,
+          }),
         );
-        expect(result.stored.cookies["forbidden"]).toBeUndefined();
+        expect(result.cookies).toContainEqual(
+          expect.objectContaining({
+            name: "server-secret",
+            value: "allowed",
+            path: "/",
+            httpOnly: false,
+          }),
+        );
+        expect(result.cookies).not.toContainEqual(
+          expect.objectContaining({ name: "forbidden" }),
+        );
         expect(fixture.cookies).toHaveLength(2);
         expect(fixture.cookies[1]).toContain("server-secret=hidden");
         expect(fixture.cookies[1]).not.toContain("server-secret=overwritten");

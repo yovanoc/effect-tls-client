@@ -1,5 +1,4 @@
 import { Effect, Exit, Option, Schema, type Scope } from "effect";
-import * as Cookies from "effect/unstable/http/Cookies";
 import {
   SessionConfig,
   TlsClient,
@@ -9,7 +8,6 @@ import {
   type TlsSession,
 } from "../TlsClient.js";
 import {
-  CookiesJson,
   Identity,
   Pair as PairSchema,
   type SessionConfig as SessionConfigType,
@@ -499,10 +497,17 @@ const makeBrowserSession = (
   identity: BrowserIdentity,
   limits: Pick<BrowserSessionConfig, "maxRedirects" | "maxChallengeRetries">,
   handlers: BrowserHandlers,
+  identityAlreadyConfigured = false,
 ): BrowserSession => {
   const maxRedirects = limits.maxRedirects ?? MAX_REDIRECTS;
   const maxChallengeRetries =
     limits.maxChallengeRetries ?? MAX_CHALLENGE_RETRIES;
+  const requestIdentityHeaders: ReadonlyArray<Pair> = identityAlreadyConfigured
+    ? []
+    : identity.headers;
+  const requestHeaderOrder = identityAlreadyConfigured
+    ? undefined
+    : identity.headerOrder;
   const identityValidation = validateHeaders(
     "browser identity",
     identity.headers,
@@ -515,46 +520,13 @@ const makeBrowserSession = (
       );
     }
     return Effect.gen(function* () {
-      const cookies = yield* transport.cookies(response.url);
-      const allCookies = yield* Schema.decodeEffect(CookiesJson)(
-        yield* transport.exportCookies,
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new BrowserSessionError({
-              operation: "script cookie protection",
-              kind: "Config",
-              message: "transport returned an invalid cookie export",
-              cause,
-            }),
-        ),
-      );
-      // Conservative by name across all paths; export/read/write is not atomic.
-      const hiddenNames = new Set(
-        allCookies.flatMap((cookie) => (cookie.httpOnly ? [cookie.name] : [])),
-      );
-      const visibleCookie = Object.values(cookies.cookies)
-        .filter((cookie) => cookie.options?.httpOnly !== true)
-        .map((cookie) => `${cookie.name}=${cookie.valueEncoded}`)
-        .join("; ");
+      const visibleCookie = yield* transport.scriptCookies(response.url);
       const result = yield* runBoundedScript(runtime, source, {
         url: response.url,
         cookie: visibleCookie,
         userAgent: headerValue(identity.headers, "user-agent") ?? "",
       });
-      const setCookies = result.setCookies.filter((value) => {
-        if (/(?:^|;)\s*httponly(?:\s*=|;|$)/i.test(value)) {
-          return false;
-        }
-        const name = /^(?:\s*)([^=;\s]+)=/.exec(value)?.[1];
-        return name === undefined || !hiddenNames.has(name);
-      });
-      if (setCookies.length > 0) {
-        yield* transport.setCookies(
-          response.url,
-          Cookies.fromSetCookie(setCookies),
-        );
-      }
+      yield* transport.scriptCookies(response.url, result.setCookies);
       return result.value;
     });
   };
@@ -570,15 +542,15 @@ const makeBrowserSession = (
     return yield* transport.request(url, {
       method: "GET",
       headers: xhrHeaders(
-        identity.headers,
+        requestIdentityHeaders,
         url,
         input.referer ?? "",
         input.origin ?? "",
         headers,
       ),
-      ...(identity.headerOrder === undefined
+      ...(requestHeaderOrder === undefined
         ? {}
-        : { headerOrder: identity.headerOrder }),
+        : { headerOrder: requestHeaderOrder }),
       followRedirects: false,
     });
   });
@@ -593,9 +565,14 @@ const makeBrowserSession = (
     yield* validateHeaders("post headers", headers);
     const base =
       input.navigation === true
-        ? navigationHeaders(identity.headers, url, input.referer ?? "", headers)
+        ? navigationHeaders(
+            requestIdentityHeaders,
+            url,
+            input.referer ?? "",
+            headers,
+          )
         : xhrHeaders(
-            identity.headers,
+            requestIdentityHeaders,
             url,
             input.referer ?? "",
             input.origin ?? "",
@@ -610,9 +587,9 @@ const makeBrowserSession = (
     return yield* transport.request(url, {
       method: "POST",
       headers: stamped,
-      ...(identity.headerOrder === undefined
+      ...(requestHeaderOrder === undefined
         ? {}
-        : { headerOrder: identity.headerOrder }),
+        : { headerOrder: requestHeaderOrder }),
       ...(input.body === undefined ? {} : { body: input.body }),
       followRedirects: false,
     });
@@ -641,14 +618,14 @@ const makeBrowserSession = (
         const response = yield* transport.request(input.current, {
           method: "GET",
           headers: navigationHeaders(
-            identity.headers,
+            requestIdentityHeaders,
             input.current,
             input.referer,
             input.extraHeaders,
           ),
-          ...(identity.headerOrder === undefined
+          ...(requestHeaderOrder === undefined
             ? {}
-            : { headerOrder: identity.headerOrder }),
+            : { headerOrder: requestHeaderOrder }),
           followRedirects: false,
         });
         const location = LOCATION_REDIRECT_STATUSES.has(response.status)
@@ -790,5 +767,5 @@ export const open = Effect.fn("BrowserSession.open")(function* (
     identity: config.identity,
   };
   const transport = yield* client.session(transportConfig);
-  return makeBrowserSession(transport, config.identity, config, handlers);
+  return makeBrowserSession(transport, config.identity, config, handlers, true);
 });

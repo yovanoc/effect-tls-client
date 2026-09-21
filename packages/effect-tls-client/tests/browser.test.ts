@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Stream } from "effect";
+import { Context, Effect, Layer, Stream } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import * as Cookies from "effect/unstable/http/Cookies";
 import type { TlsResponse, TlsSession } from "../src/TlsClient.js";
@@ -56,6 +56,7 @@ const session = (
   webSocket: () => Effect.die("unused"),
   cookies: () => Effect.die("unused"),
   setCookies: () => Effect.die("unused"),
+  scriptCookies: () => Effect.die("unused"),
   exportCookies: Effect.die("unused"),
   importCookies: () => Effect.die("unused"),
   bandwidth: Effect.succeed({ read: 0, written: 0 }),
@@ -78,6 +79,25 @@ describe("browser layer", () => {
     expect(
       referer(navigationHeaders([], "http://example.test/next", source)),
     ).toBeUndefined();
+  });
+
+  it.effect("applies fromSession identity headers and order", () => {
+    const calls: Array<Call> = [];
+    const browser = fromSession(
+      session(calls, (url) => response(url, 204, "")),
+      Chrome152Identity,
+    );
+    const userAgent = Chrome152Identity.headers.find(
+      ([name]) => name === "user-agent",
+    );
+
+    return Effect.gen(function* () {
+      yield* browser.get("https://example.test/api");
+      expect(calls[0]?.options?.headers).toContainEqual(userAgent);
+      expect(calls[0]?.options?.headerOrder).toEqual(
+        Chrome152Identity.headerOrder,
+      );
+    });
   });
 
   it.effect(
@@ -400,17 +420,28 @@ describe("browser layer", () => {
     "terminates timed-out scripts and cleans up before the next run",
     () =>
       Effect.gen(function* () {
-        const runtime = yield* BrowserMock;
-        const error = yield* Effect.flip(runtime.evaluate("while (true) {}"));
-        expect(error.reason).toContain("terminated");
-        const result = yield* runtime.evaluate('return "after-timeout";');
-        expect(result.value).toBe("after-timeout");
-      }).pipe(
-        Effect.provide(
+        const scope = yield* Effect.scope;
+        const timeoutContext = yield* Layer.buildWithScope(
           BrowserMock.layer({ timeoutMs: 100 }).pipe(
             Layer.provide(NodeServices.layer),
           ),
-        ),
-      ),
+          scope,
+        );
+        const timeoutRuntime = Context.get(timeoutContext, BrowserMock);
+        const error = yield* Effect.flip(
+          timeoutRuntime.evaluate("while (true) {}"),
+        );
+        expect(error.reason).toContain("terminated");
+
+        const runtimeContext = yield* Layer.buildWithScope(
+          BrowserMock.layer({ timeoutMs: 2_000 }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+          scope,
+        );
+        const runtime = Context.get(runtimeContext, BrowserMock);
+        const result = yield* runtime.evaluate('return "after-timeout";');
+        expect(result.value).toBe("after-timeout");
+      }),
   );
 });

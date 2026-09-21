@@ -119,11 +119,11 @@ rather than falling back to the older experimental flag.
 A Bun host delegates to an available Node executable; configure
 `BrowserMock.layer({ executable: "..." })` when `node` is not on `PATH`.
 
-Script cookie writes are returned as `setCookies` and applied through the
-existing Go jar. HttpOnly cookies are never included in `document.cookie`. Before
-evaluation, all exported HttpOnly cookie names are collected, so a script cannot
-replace one through a different path; the export/evaluate/set sequence is not
-atomic, so concurrent jar changes still have a TOCTOU limitation. This is not a
+Script cookie reads and writes cross the `cookies.script` Bridge operation. Go
+filters `HttpOnly` cookies using the request URL and applies raw script writes
+under the authoritative Jar lock, ignoring `HttpOnly` writes and exact
+name/domain/path overwrites of existing `HttpOnly` cookies. The browser layer
+therefore does not export, mirror, or re-import cookie state. This is not a
 malicious-code sandbox: Node's permission model has documented limitations, and
 `node:vm` is only the evaluator context, never the security boundary. Run
 reviewed vendor scripts only; do not pass arbitrary attacker-controlled source.
