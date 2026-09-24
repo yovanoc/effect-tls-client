@@ -17,7 +17,7 @@ const url = process.env.TLS_CLIENT_EXAMPLE_URL ?? "http://example.test/",
           })(),
   services = await platformLayer(),
   browserServices = Layer.mergeAll(
-    services,
+    TlsClient.layer.pipe(Layer.provide(services)),
     Browser.BrowserMock.layer().pipe(Layer.provide(services)),
   ),
   program = Effect.scoped(
@@ -41,8 +41,4 @@ const url = process.env.TLS_CLIENT_EXAMPLE_URL ?? "http://example.test/",
     }),
   );
 
-await Effect.runPromise(
-  program.pipe(
-    Effect.provide(TlsClient.layer.pipe(Layer.provide(browserServices))),
-  ),
-);
+await Effect.runPromise(program.pipe(Effect.provide(browserServices)));

@@ -1,7 +1,11 @@
 import { describe, expect, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
-import { ConfigProvider, Effect, Layer, Option, Schema } from "effect";
+import { execFile } from "node:child_process";
+import path from "node:path";
 import { createServer, type Server } from "node:http";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { ConfigProvider, Effect, Layer, Option, Schema } from "effect";
 import * as Browser from "../src/browser/index.js";
 import { TlsClient } from "../src/index.js";
 
@@ -15,6 +19,23 @@ const close = (server: Server): Promise<void> =>
   new Promise((resolve, reject) => {
     server.close((error) => (error === undefined ? resolve() : reject(error)));
   });
+
+const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+const examplePath = path.resolve(repositoryRoot, "examples/browser.mjs");
+const exampleExecutables = { bun: "bun", node: process.execPath };
+const execFileAsync = promisify(execFile);
+const runExample = (runtime: "node" | "bun", url: string) =>
+  Effect.promise(() =>
+    execFileAsync(exampleExecutables[runtime], [examplePath], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      env: Object.assign({}, process.env, {
+        TLS_CLIENT_EXAMPLE_PROFILE: "chrome_146",
+        TLS_CLIENT_EXAMPLE_URL: url,
+      }),
+      timeout: 30_000,
+    }),
+  );
 
 const ExportedCookies = Schema.fromJsonString(
   Schema.Array(
@@ -144,6 +165,27 @@ describeRealIntegration("real BrowserMock integration", () => {
         expect(fixture.cookies[1]).toContain("server-secret=hidden");
         expect(fixture.cookies[1]).not.toContain("server-secret=overwritten");
         expect(fixture.cookies[1]).toContain("clearance=ok");
+      }),
+  );
+
+  it.live(
+    "runs the browser example with Node and Bun against the local fixture",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(startFixture);
+        yield* Effect.forEach(
+          ["node", "bun"] as const,
+          (runtime) =>
+            runExample(runtime, `${fixture.url}/challenge`).pipe(
+              Effect.tap((result) =>
+                Effect.sync(() => {
+                  expect(result.stdout).toContain(`${fixture.url}/challenge`);
+                  expect(result.stdout).toContain("Challenge: AwsWaf");
+                }),
+              ),
+            ),
+          { concurrency: 1, discard: true },
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
       }),
   );
 });

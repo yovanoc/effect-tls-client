@@ -137,8 +137,10 @@ failures are typed `TlsRequestError` values with `kind: "Proxy"`.
 
 Import the optional facade from `effect-tls-client/browser`. It wraps one
 `TlsSession`, stamps navigation or XHR-style headers from a fixed identity, and
-follows bounded `Location` and HTML redirects. The Go-side cookie jar remains
-authoritative; browser requests reject manually supplied `Cookie` headers.
+follows bounded `Location` and actual HTML meta-refresh redirects. It does not
+infer redirects from scripts or form fields, or execute page JavaScript
+automatically. The Go-side cookie jar remains authoritative; browser requests
+reject manually supplied `Cookie` headers.
 
 ```ts
 import { Effect, Layer } from "effect";

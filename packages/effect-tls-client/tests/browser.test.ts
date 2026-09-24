@@ -152,6 +152,36 @@ describe("browser layer", () => {
     });
   });
 
+  it.effect(
+    "does not navigate from JavaScript text or hidden form fields",
+    () => {
+      const calls: Array<Call> = [];
+      const html =
+        '<form><input type="hidden" id="hfRedirectURL" value="/unsupported"></form>' +
+        '<script>if (false) { window.location = "/unsupported"; }</script>' +
+        '<!-- window.location = "/comment"; -->' +
+        '<noscript><script>window.location = "/noscript";</script></noscript>';
+      const browser = fromSession(
+        session(calls, (url) =>
+          response(
+            url,
+            200,
+            url.endsWith("/unsupported") ? "unexpected navigation" : html,
+          ),
+        ),
+        Chrome152Identity,
+      );
+
+      return Effect.gen(function* () {
+        const page = yield* browser.navigate("https://example.test/");
+        expect(page.url).toBe("https://example.test/");
+        expect(page.body).toBe(html);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatchObject({ url: "https://example.test/" });
+      });
+    },
+  );
+
   it.effect("closes a response when Location is invalid", () => {
     let closed = 0;
     const browser = fromSession(

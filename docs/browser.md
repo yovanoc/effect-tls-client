@@ -43,10 +43,15 @@ headers with `navigation: true`; `browser.navigate` uses document navigation
 headers.
 
 Navigation follows `Location` only for 301, 302, 303, 307, and 308 responses,
-plus the small HTML redirect patterns used by the reference browser. Referrers
-use strict-origin-when-cross-origin behavior: same-origin URLs keep their path
-and query after credentials and fragments are removed, cross-origin requests
-send only the origin, and HTTPS-to-HTTP downgrades send no referrer.
+plus actual HTML `<meta http-equiv="refresh">` directives. It does not infer
+redirects from JavaScript text or forms/hidden fields, including content in
+comments or `<noscript>`, and it never executes page scripts automatically.
+Reviewed script execution is opt-in: an application-provided challenge handler
+must explicitly call `context.evaluate` with a caller-supplied runtime such as
+`BrowserMock`. Referrers use strict-origin-when-cross-origin behavior:
+same-origin URLs keep their path and query after credentials and fragments are
+removed, cross-origin requests send only the origin, and HTTPS-to-HTTP
+downgrades send no referrer.
 `maxRedirects` and `maxChallengeRetries` are independent bounded configuration
 values. Keep the enclosing `Effect.scoped` alive until the page and response are
 no longer needed.

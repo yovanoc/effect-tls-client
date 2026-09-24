@@ -362,18 +362,22 @@ export const xhrHeaders = (
   ]);
 
 const htmlRedirect = (body: string): Option.Option<string> => {
+  const markup = body
+    .replaceAll(/<!--[\s\S]*?-->/gu, "")
+    .replaceAll(/<script\b[^>]*>[\s\S]*?<\/script\s*>/giu, "")
+    .replaceAll(/<noscript\b[^>]*>[\s\S]*?<\/noscript\s*>/giu, "");
   const meta =
-    /http-equiv=["']?refresh["']?[^>]*content=["'][^"']*url=([^"'>\s]+)/i.exec(
-      body,
+    /<meta\b[^>]*http-equiv=["']?refresh["']?[^>]*content=["'][^"']*url=(?<target>[^"'>\s]+)/iu.exec(
+      markup,
     );
-  const script =
-    /(?:top|window|self)?\.?location(?:\.href)?\s*=\s*["']([^"']+)["']/i.exec(
-      body,
-    );
-  const form = /id=["']hfRedirectURL["'][^>]*value=["']([^"']+)["']/.exec(body);
-  return Option.fromNullishOr(
-    (meta?.[1] ?? script?.[1] ?? form?.[1])?.replaceAll("&amp;", "&"),
-  );
+  if (meta === null || meta.groups === undefined) {
+    return Option.none();
+  }
+  const target = meta.groups["target"];
+  if (target === undefined) {
+    return Option.none();
+  }
+  return Option.some(target.replaceAll("&amp;", "&"));
 };
 
 const absoluteUrl = (
