@@ -996,6 +996,88 @@ func TestSessionCookieJarScriptCookiesDoesNotOverlaySecureFromHTTP(t *testing.T)
 	if got := jar.scriptCookieHeader(httpsURL, nil); got != "secure=hidden; secure=shadow" {
 		t.Fatalf("HTTPS script cookie header after different-path write = %q, want both cookies", got)
 	}
+	if got := jar.scriptCookieHeader(httpsURL, []string{"secure=updated; Path=/private; Secure"}); got != "secure=updated; secure=shadow" {
+		t.Fatalf("HTTPS script cookie header after Secure write = %q, want updated Secure cookie", got)
+	}
+}
+
+func TestSessionCookieJarScriptCookiesBlocksOverlappingSecureCookies(t *testing.T) {
+	tests := []struct {
+		name         string
+		secureURL    string
+		scriptURL    string
+		probeURL     string
+		secureDomain string
+		securePath   string
+		write        string
+		want         string
+	}{
+		{
+			name:       "narrower path",
+			secureURL:  "https://example.test/private/page",
+			scriptURL:  "http://example.test/private/page",
+			probeURL:   "https://example.test/private/nested/page",
+			securePath: "/private",
+			write:      "token=shadow; Path=/private/nested",
+			want:       "token=trusted",
+		},
+		{
+			name:         "secure parent domain and child host-only cookie",
+			secureURL:    "https://example.test/private/page",
+			scriptURL:    "http://sub.example.test/private/page",
+			probeURL:     "https://sub.example.test/private/page",
+			secureDomain: "example.test",
+			securePath:   "/private",
+			write:        "token=shadow; Path=/private",
+			want:         "token=trusted",
+		},
+		{
+			name:       "secure child host-only and parent domain cookie",
+			secureURL:  "https://sub.example.test/private/page",
+			scriptURL:  "http://sub.example.test/private/page",
+			probeURL:   "https://sub.example.test/private/page",
+			securePath: "/private",
+			write:      "token=shadow; Domain=example.test; Path=/private",
+			want:       "token=trusted",
+		},
+		{
+			name:       "non-overlapping path",
+			secureURL:  "https://example.test/private/page",
+			scriptURL:  "http://example.test/private/page",
+			probeURL:   "https://example.test/privateish/page",
+			securePath: "/private",
+			write:      "token=shadow; Path=/privateish",
+			want:       "token=shadow",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			jar, err := newSessionCookieJar(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secureURL, err := url.Parse(test.secureURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jar.SetCookies(secureURL, []*http.Cookie{{
+				Name: "token", Value: "trusted", Domain: test.secureDomain,
+				Path: test.securePath, Secure: true,
+			}})
+			scriptURL, err := url.Parse(test.scriptURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jar.scriptCookieHeader(scriptURL, []string{test.write})
+			probeURL, err := url.Parse(test.probeURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := jar.scriptCookieHeader(probeURL, nil); got != test.want {
+				t.Fatalf("HTTPS cookie header = %q, want %q", got, test.want)
+			}
+		})
+	}
 }
 
 func TestSessionCookieJarScriptCookiesSerializesWithHTTPWrites(t *testing.T) {

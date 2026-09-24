@@ -128,6 +128,20 @@ func cookieKey(cookie *http.Cookie) string {
 	return strings.ToLower(cookie.Domain) + "\x00" + cookie.Path + "\x00" + cookie.Name
 }
 
+func cookiePathMatches(requestPath, cookiePath string) bool {
+	if requestPath == cookiePath {
+		return true
+	}
+	if strings.HasPrefix(requestPath, cookiePath) {
+		return strings.HasSuffix(cookiePath, "/") || requestPath[len(cookiePath)] == '/'
+	}
+	return false
+}
+
+func cookieDomainMatches(host, domain string) bool {
+	return host == domain || (net.ParseIP(host) == nil && strings.HasSuffix(host, "."+domain))
+}
+
 func cookieQueryURL(scheme, host, path string) *url.URL {
 	return &url.URL{Scheme: scheme, Host: host, Path: path}
 }
@@ -262,13 +276,9 @@ func (j *sessionCookieJar) scriptCookieHeader(u *url.URL, setCookies []string) s
 
 	j.reconcileLocked()
 	protected := make(map[string]struct{})
-	secure := make(map[string]struct{})
 	for key, record := range j.state.cookies {
 		if record.cookie.HttpOnly {
 			protected[key] = struct{}{}
-		}
-		if record.cookie.Secure {
-			secure[key] = struct{}{}
 		}
 	}
 	parsed := (&http.Response{Header: http.Header{"Set-Cookie": setCookies}}).Cookies()
@@ -285,8 +295,21 @@ func (j *sessionCookieJar) scriptCookieHeader(u *url.URL, setCookies []string) s
 		if _, blocked := protected[key]; blocked {
 			continue
 		}
-		if !strings.EqualFold(u.Scheme, "https") {
-			if _, blocked := secure[key]; blocked {
+		if !candidate.Secure && !strings.EqualFold(u.Scheme, "https") {
+			candidateDomain, _, _ := strings.Cut(key, "\x00")
+			candidatePath := cookiePath(u, candidate)
+			overlaysSecure := false
+			for _, record := range j.state.cookies {
+				existing := record.cookie
+				// RFC 6265bis step 16 treats the candidate path as the request path.
+				if existing.Secure && existing.Name == candidate.Name &&
+					(cookieDomainMatches(candidateDomain, existing.Domain) || cookieDomainMatches(existing.Domain, candidateDomain)) &&
+					cookiePathMatches(candidatePath, existing.Path) {
+					overlaysSecure = true
+					break
+				}
+			}
+			if overlaysSecure {
 				continue
 			}
 		}
