@@ -160,10 +160,11 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      - name: Build the selected Bridge package
+      - name: Build the selected Bridge and TypeScript packages
         run: >-
           bunx turbo run build
           --filter=@effect-tls-client/bridge-${{ matrix.target }}
+          --filter=effect-tls-client
 
       - name: Set up Node 25 for BrowserMock integration tests
         if: matrix.target != 'win32-x64'
