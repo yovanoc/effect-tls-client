@@ -23,7 +23,8 @@ const close = (server: Server): Promise<void> =>
 
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const examplePath = path.resolve(repositoryRoot, "examples/browser.mjs");
-const exampleExecutables = { bun: "bun", node: process.execPath };
+const exampleExecutables = { bun: "bun", node: "node" };
+const browserExampleTestTimeoutMs = 15_000;
 const execFileAsync = promisify(execFile);
 const runExample = (runtime: "node" | "bun", url: string) =>
   Effect.promise(() =>
@@ -631,5 +632,6 @@ describeRealIntegration("real BrowserMock integration", () => {
           { concurrency: 1, discard: true },
         ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
       }),
+    browserExampleTestTimeoutMs,
   );
 });

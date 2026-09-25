@@ -39,6 +39,15 @@ jobs:
         with:
           node-version: "25"
 
+      - name: Test browser layer with Node 25
+        working-directory: packages/effect-tls-client
+        env:
+          TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/bridge/bridge
+          TLS_CLIENT_INTEGRATION: "1"
+        run: >-
+          node node_modules/vitest/vitest.mjs run
+          tests/browser.test.ts tests/browser.integration.test.ts
+
       - name: Run Bun checks in parallel
         env:
           TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/bridge/bridge
@@ -51,11 +60,12 @@ jobs:
           node-version: "22"
 
       - name: Test core transport on Node 22
+        working-directory: packages/effect-tls-client
         env:
           TLS_CLIENT_BRIDGE_PATH: ${{ github.workspace }}/bridge/bridge
           TLS_CLIENT_INTEGRATION: "1"
         run: >-
-          bun run --cwd packages/effect-tls-client test --
+          node node_modules/vitest/vitest.mjs run
           --exclude tests/browser.test.ts
           --exclude tests/browser.integration.test.ts
 
