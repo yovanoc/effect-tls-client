@@ -57,7 +57,7 @@ const startFixture = async (): Promise<{
   const server = createServer((request, response) => {
     const path = new URL(request.url ?? "/", "http://localhost").pathname;
     cookies.push(request.headers.cookie ?? "");
-    if (path === "/challenge") {
+    if (path === "/challenge" || path.startsWith("/challenge/")) {
       response.statusCode = 202;
       response.setHeader("x-amzn-waf-action", "challenge");
       response.setHeader("set-cookie", [
@@ -75,6 +75,28 @@ const startFixture = async (): Promise<{
         !header.includes("forbidden=no");
       response.statusCode = valid ? 200 : 403;
       response.end(valid ? "ok" : "not-ok");
+      return;
+    }
+    if (path === "/script/redirect-header-count") {
+      response.statusCode = 302;
+      response.setHeader("location", "/script/xhr");
+      response.setHeader(
+        "set-cookie",
+        Array.from({ length: 65 }, (_, index) => `cookie-${index}=one; Path=/`),
+      );
+      response.setHeader(
+        "set-cookie2",
+        Array.from({ length: 65 }, (_, index) => `legacy-${index}=one; Path=/`),
+      );
+      response.end();
+      return;
+    }
+    if (path === "/script/cookie-header-bytes") {
+      response.setHeader(
+        "set-cookie",
+        `quota=${"x".repeat(64 * 1024)}; Path=/`,
+      );
+      response.end("ignored");
       return;
     }
     if (path === "/script.js") {
@@ -251,6 +273,68 @@ describeRealIntegration("real BrowserMock integration", () => {
           { authorization: "", cookie: "" },
         ]);
       }),
+  );
+
+  it.live("enforces raw response header quotas on redirects and cookies", () =>
+    Effect.gen(function* () {
+      const fixture = yield* Effect.promise(startFixture);
+      const platform = Layer.mergeAll(
+        NodeServices.layer,
+        ConfigProvider.layer(
+          ConfigProvider.fromUnknown({ TLS_CLIENT_BRIDGE_PATH: bridgePath }),
+        ),
+      );
+      const services = Layer.mergeAll(
+        TlsClient.layer.pipe(Layer.provide(platform)),
+        Browser.BrowserMock.layer({ allowedOrigins: [fixture.url] }).pipe(
+          Layer.provide(platform),
+        ),
+      );
+      const pages = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* Browser.BrowserMock;
+          const browser = yield* Browser.open(
+            {
+              transport: { profile: "chrome_146", forceHttp1: true },
+              identity: Browser.Chrome146Identity,
+            },
+            {
+              scriptRuntime: runtime,
+              challengeHandler: (challenge, context) =>
+                Effect.gen(function* () {
+                  const countLimit = challenge.url.endsWith("/header-count");
+                  const requestPath = countLimit
+                    ? "/script/redirect-header-count"
+                    : "/script/cookie-header-bytes";
+                  const expectedReason = countLimit
+                    ? "script response exceeds the header-count limit"
+                    : "script response headers exceed the 64 KiB limit";
+                  const evaluation = yield* Effect.result(
+                    context.evaluate(
+                      `await fetch("${fixture.url}${requestPath}"); return "unexpected";`,
+                    ),
+                  );
+                  if (evaluation._tag === "Failure") {
+                    expect(evaluation.failure).toMatchObject({
+                      _tag: "BrowserScriptError",
+                      reason: expectedReason,
+                    });
+                  } else {
+                    expect.fail("script request unexpectedly succeeded");
+                  }
+                  return Option.none();
+                }),
+            },
+          );
+          return yield* Effect.forEach(
+            ["/challenge/header-count", "/challenge/header-bytes"] as const,
+            (route) => browser.navigate(`${fixture.url}${route}`),
+            { concurrency: 1 },
+          );
+        }).pipe(Effect.provide(services)),
+      ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+      expect(pages.map(({ status }) => status)).toEqual([202, 202]);
+    }),
   );
 
   it.live(

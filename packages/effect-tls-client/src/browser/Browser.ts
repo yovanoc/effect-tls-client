@@ -703,34 +703,97 @@ const makeScriptHost = (
                   }),
               ),
             );
-          const location = headerValue(response.headers, "location");
-          if (
-            LOCATION_REDIRECT_STATUSES.has(response.status) &&
-            location !== undefined
-          ) {
-            if (redirect >= MAX_SCRIPT_REDIRECTS) {
-              yield* response.close;
+          const responseResult = yield* Effect.gen(function* () {
+            if (response.headers.length > MAX_SCRIPT_HEADERS) {
               return yield* new BrowserScriptError({
-                reason: `script redirect limit exceeds ${MAX_SCRIPT_REDIRECTS} hops`,
+                reason: "script response exceeds the header-count limit",
               });
             }
-            const next = yield* Effect.try({
-              try: () =>
-                resolveAllowedUrl(location, target.toString(), allowedOrigins),
-              catch: (cause) =>
-                new BrowserScriptError({
-                  reason:
-                    cause instanceof Error
-                      ? cause.message
-                      : "redirect origin is not allowed",
-                  cause,
-                }),
-            }).pipe(Effect.ensuring(response.close));
-            if (target.protocol === "https:" && next.protocol === "http:") {
+            const responseHeaderBytes = response.headers.reduce(
+              (total, [name, value]) =>
+                total + new TextEncoder().encode(name + value).byteLength,
+              0,
+            );
+            if (responseHeaderBytes > MAX_SCRIPT_HEADER_BYTES) {
               return yield* new BrowserScriptError({
-                reason: "script redirect cannot downgrade from HTTPS to HTTP",
+                reason: "script response headers exceed the 64 KiB limit",
               });
             }
+            if (networkBytes + responseHeaderBytes > MAX_SCRIPT_NETWORK_BYTES) {
+              return yield* new BrowserScriptError({
+                reason: "script network byte budget exceeded",
+              });
+            }
+            networkBytes += responseHeaderBytes;
+
+            const location = headerValue(response.headers, "location");
+            if (
+              LOCATION_REDIRECT_STATUSES.has(response.status) &&
+              location !== undefined
+            ) {
+              if (redirect >= MAX_SCRIPT_REDIRECTS) {
+                return yield* new BrowserScriptError({
+                  reason: `script redirect limit exceeds ${MAX_SCRIPT_REDIRECTS} hops`,
+                });
+              }
+              const next = yield* Effect.try({
+                try: () =>
+                  resolveAllowedUrl(
+                    location,
+                    target.toString(),
+                    allowedOrigins,
+                  ),
+                catch: (cause) =>
+                  new BrowserScriptError({
+                    reason:
+                      cause instanceof Error
+                        ? cause.message
+                        : "redirect origin is not allowed",
+                    cause,
+                  }),
+              });
+              if (target.protocol === "https:" && next.protocol === "http:") {
+                return yield* new BrowserScriptError({
+                  reason: "script redirect cannot downgrade from HTTPS to HTTP",
+                });
+              }
+              return { next } as const;
+            }
+
+            const safeHeaders = response.headers.filter(
+              ([name]) =>
+                name.toLowerCase() !== "set-cookie" &&
+                name.toLowerCase() !== "set-cookie2",
+            );
+            const bodyResult = yield* readScriptBody(response);
+            if (networkBytes + bodyResult.bytes > MAX_SCRIPT_NETWORK_BYTES) {
+              return yield* new BrowserScriptError({
+                reason: "script network byte budget exceeded",
+              });
+            }
+            networkBytes += bodyResult.bytes;
+            const cookie = yield* transport.scriptCookies(pageUrl).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new BrowserScriptError({
+                    reason: "failed to read script cookies",
+                    cause,
+                  }),
+              ),
+            );
+            return {
+              result: {
+                status: response.status,
+                url: response.url,
+                headers: safeHeaders,
+                body: bodyResult.text,
+                cookie,
+              } satisfies BrowserScriptNetworkResponse,
+            } as const;
+          }).pipe(Effect.ensuring(response.close));
+
+          if ("next" in responseResult) {
+            const next = responseResult.next;
             if (target.origin !== next.origin) {
               headers = headers.filter(
                 ([name]) =>
@@ -754,56 +817,7 @@ const makeScriptHost = (
             target = next;
             continue;
           }
-
-          const result = yield* Effect.gen(function* () {
-            const safeHeaders = response.headers.filter(
-              ([name]) =>
-                name.toLowerCase() !== "set-cookie" &&
-                name.toLowerCase() !== "set-cookie2",
-            );
-            if (safeHeaders.length > MAX_SCRIPT_HEADERS) {
-              return yield* new BrowserScriptError({
-                reason: "script response exceeds the header-count limit",
-              });
-            }
-            const responseHeaderBytes = safeHeaders.reduce(
-              (total, [name, value]) =>
-                total + new TextEncoder().encode(name + value).byteLength,
-              0,
-            );
-            if (responseHeaderBytes > MAX_SCRIPT_HEADER_BYTES) {
-              return yield* new BrowserScriptError({
-                reason: "script response headers exceed the 64 KiB limit",
-              });
-            }
-            const bodyResult = yield* readScriptBody(response);
-            if (
-              networkBytes + responseHeaderBytes + bodyResult.bytes >
-              MAX_SCRIPT_NETWORK_BYTES
-            ) {
-              return yield* new BrowserScriptError({
-                reason: "script network byte budget exceeded",
-              });
-            }
-            networkBytes += responseHeaderBytes + bodyResult.bytes;
-            const cookie = yield* transport.scriptCookies(pageUrl).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new BrowserScriptError({
-                    reason: "failed to read script cookies",
-                    cause,
-                  }),
-              ),
-            );
-            return {
-              status: response.status,
-              url: response.url,
-              headers: safeHeaders,
-              body: bodyResult.text,
-              cookie,
-            } satisfies BrowserScriptNetworkResponse;
-          }).pipe(Effect.ensuring(response.close));
-          return result;
+          return responseResult.result;
         }
       }),
     );

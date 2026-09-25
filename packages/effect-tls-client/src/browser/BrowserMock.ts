@@ -148,6 +148,7 @@ const lineBytes = (line: string): number =>
 const makeEvaluate = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   options: BrowserMockOptions,
+  hostRequestSemaphore: Semaphore.Semaphore,
 ): BrowserScriptRuntime["evaluate"] =>
   Effect.fn("BrowserMock.evaluate")(function* (
     source: string,
@@ -447,7 +448,7 @@ const makeEvaluate = (
               ),
               Effect.ensuring(Effect.sync(() => (activeRequests -= 1))),
             );
-            yield* Effect.forkScoped(perform);
+            yield* Effect.forkScoped(hostRequestSemaphore.withPermit(perform));
           });
 
         const onLine = (line: string, state: Output) =>
@@ -697,10 +698,17 @@ export class BrowserMock extends Context.Service<
             }),
         });
         const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        // Cookie snapshots have no host revision; serialize requests through reply delivery.
+        // ponytail: host revisions can restore script-request concurrency.
+        const hostRequestSemaphore = yield* Semaphore.make(1);
         return BrowserMock.of({
           allowedOrigins,
           timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-          evaluate: makeEvaluate(spawner, { ...options, allowedOrigins }),
+          evaluate: makeEvaluate(
+            spawner,
+            { ...options, allowedOrigins },
+            hostRequestSemaphore,
+          ),
         });
       }),
     );

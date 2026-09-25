@@ -682,6 +682,7 @@ describe("browser layer", () => {
     Effect.gen(function* () {
       const runtime = yield* BrowserMock;
       const staleRequestStarted = yield* Deferred.make<void>();
+      const cookieWriteApplied = yield* Deferred.make<void>();
       const cookieSyncObserved = yield* Deferred.make<void>();
       const releaseStaleResponse = yield* Deferred.make<void>();
       let cookie = "session=old";
@@ -701,37 +702,31 @@ describe("browser layer", () => {
               };
             });
           }
-          if (request.url.endsWith("/write-cookie.js")) {
+          if (request.url.endsWith("/after-write")) {
             return Effect.gen(function* () {
-              yield* Deferred.await(staleRequestStarted);
+              yield* Deferred.succeed(cookieSyncObserved, undefined);
               return {
                 status: 200,
                 url: request.url,
                 headers: [],
-                body: 'document.cookie = "session=new; Path=/";',
-                cookie: responseCookie,
+                body: "after-write",
+                cookie,
               };
-            });
-          }
-          if (request.url.endsWith("/after-write")) {
-            return Effect.gen(function* () {
-              yield* Deferred.succeed(cookieSyncObserved, undefined);
-              return yield* new BrowserScriptError({
-                reason: "cookie write was acknowledged",
-              });
             });
           }
           return Effect.die(`unexpected script request: ${request.url}`);
         },
         setCookie: (value) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
+            yield* Deferred.await(staleRequestStarted);
             cookie = value.split(";", 1)[0] ?? "";
+            yield* Deferred.succeed(cookieWriteApplied, undefined);
             return cookie;
           }),
       };
       const fiber = yield* runtime
         .evaluate(
-          'const stale = fetch("/stale"); await document.loadScript("/write-cookie.js"); await fetch("/after-write").catch(() => {}); await stale; return document.cookie;',
+          'const stale = fetch("/stale"); await Promise.resolve(); document.cookie = "session=new; Path=/"; await stale; await fetch("/after-write"); return document.cookie;',
           {
             url: "https://allowed.test/page",
             cookie,
@@ -742,8 +737,9 @@ describe("browser layer", () => {
         .pipe(Effect.forkChild);
 
       yield* Deferred.await(staleRequestStarted);
-      yield* Deferred.await(cookieSyncObserved);
+      yield* Deferred.await(cookieWriteApplied);
       yield* Deferred.succeed(releaseStaleResponse, undefined);
+      yield* Deferred.await(cookieSyncObserved);
       expect((yield* Fiber.join(fiber)).value).toBe("session=new");
     }).pipe(
       Effect.provide(
@@ -752,6 +748,118 @@ describe("browser layer", () => {
         ),
       ),
     ),
+  );
+
+  it.live("orders concurrent host cookie snapshots", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const staleRequestStarted = yield* Deferred.make<void>();
+      const releaseStaleResponse = yield* Deferred.make<void>();
+      let cookie = "sid=private";
+      let activeRequests = 0;
+      let maximumConcurrentRequests = 0;
+      const host: BrowserScriptHost = {
+        request: (request) =>
+          Effect.gen(function* () {
+            activeRequests += 1;
+            maximumConcurrentRequests = Math.max(
+              maximumConcurrentRequests,
+              activeRequests,
+            );
+            if (request.url.endsWith("/stale")) {
+              const responseCookie = cookie;
+              yield* Deferred.succeed(staleRequestStarted, undefined);
+              yield* Deferred.await(releaseStaleResponse);
+              return {
+                status: 200,
+                url: request.url,
+                headers: [],
+                body: "stale",
+                cookie: responseCookie,
+              };
+            }
+            cookie = "sid=private; sid=root";
+            return {
+              status: 200,
+              url: request.url,
+              headers: [],
+              body: "latest",
+              cookie,
+            };
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                activeRequests -= 1;
+              }),
+            ),
+          ),
+        setCookie: () => Effect.succeed(cookie),
+      };
+      const fiber = yield* runtime
+        .evaluate(
+          'const stale = fetch("/stale"); const latest = fetch("/latest"); await Promise.all([stale, latest]); return document.cookie;',
+          {
+            url: "https://allowed.test/page",
+            cookie,
+            userAgent: "fixture",
+          },
+          host,
+        )
+        .pipe(Effect.forkChild);
+
+      yield* Deferred.await(staleRequestStarted);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseStaleResponse, undefined);
+      expect((yield* Fiber.join(fiber)).value).toBe("sid=private; sid=root");
+      expect(maximumConcurrentRequests).toBe(1);
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.live(
+    "preserves duplicate authoritative cookies during pending writes",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const writeStarted = yield* Deferred.make<void>();
+        const releaseWrite = yield* Deferred.make<void>();
+        const cookies = "sid=private; sid=root";
+        const host: BrowserScriptHost = {
+          request: () => Effect.die("unused"),
+          setCookie: () =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(writeStarted, undefined);
+              yield* Deferred.await(releaseWrite);
+              return cookies;
+            }),
+        };
+        const fiber = yield* runtime
+          .evaluate(
+            'document.cookie = "sid=changed; Path=/private"; return document.cookie;',
+            {
+              url: "https://allowed.test/page",
+              cookie: cookies,
+              userAgent: "fixture",
+            },
+            host,
+          )
+          .pipe(Effect.forkChild);
+
+        yield* Deferred.await(writeStarted);
+        yield* Deferred.succeed(releaseWrite, undefined);
+        expect((yield* Fiber.join(fiber)).value).toBe(cookies);
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
   );
 
   it.live(

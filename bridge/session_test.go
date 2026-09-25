@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -413,6 +414,84 @@ func TestIntegrationSessionlessRequestDoesNotRetainSession(t *testing.T) {
 	}
 	if _, retained := dispatcher.sessions.sessions["request-12"]; retained {
 		t.Fatal("sessionless request retained its ephemeral session")
+	}
+}
+
+func TestIntegrationOmitCredentialsClearsURLBasicAuth(t *testing.T) {
+	if os.Getenv("TLS_CLIENT_INTEGRATION") != "1" {
+		t.Skip("set TLS_CLIENT_INTEGRATION=1 to run local tls-client integration tests")
+	}
+
+	authorization := make(chan string, 2)
+	server := httptest.NewServer(nethttp.HandlerFunc(func(writer nethttp.ResponseWriter, request *nethttp.Request) {
+		authorization <- request.Header.Get("Authorization")
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	profile := "chrome_146"
+	session, err := buildSession(protocol.SessionConfigMeta{
+		SessionID:  "url-basic-auth",
+		Profile:    &profile,
+		ForceHTTP1: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+
+	dispatcher, writer := newTestDispatcher()
+	defer dispatcher.stop()
+	if err := dispatcher.sessions.add(session); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		id                uint32
+		path              string
+		omitCredentials   bool
+		wantAuthorization string
+	}{
+		{id: 13, path: "/omit", omitCredentials: true},
+		{
+			id:                14,
+			path:              "/keep",
+			wantAuthorization: "Basic " + base64.StdEncoding.EncodeToString([]byte("fixture-user:fixture-pass")),
+		},
+	} {
+		target, err := url.Parse(server.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target.User = url.UserPassword("fixture-user", "fixture-pass")
+		target.Path = test.path
+		meta, err := protocol.EncodeMeta(protocol.RequestMeta{
+			SessionID:       session.id,
+			URL:             target.String(),
+			Method:          "GET",
+			OmitCredentials: test.omitCredentials,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dispatcher.dispatch(protocol.Frame{Kind: protocol.KindRequest, ID: test.id, Meta: meta}); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			frame := nextTestFrame(t, writer.frames)
+			if frame.ID != test.id {
+				t.Fatalf("response frame id = %d, want %d", frame.ID, test.id)
+			}
+			if frame.Kind == protocol.KindError {
+				t.Fatalf("request %d failed: %s", test.id, frame.Meta)
+			}
+			if frame.Kind == protocol.KindEnd {
+				break
+			}
+		}
+		if got := <-authorization; got != test.wantAuthorization {
+			t.Errorf("Authorization with omitCredentials=%t = %q, want %q", test.omitCredentials, got, test.wantAuthorization)
+		}
 	}
 }
 

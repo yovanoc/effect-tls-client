@@ -2127,6 +2127,9 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		fail(protocol.ErrorKindInvalidUrl, message)
 		return
 	}
+	if meta.OmitCredentials {
+		parsedURL.User = nil
+	}
 	method := meta.Method
 	if method == "" {
 		method = http.MethodGet

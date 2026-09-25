@@ -35,7 +35,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     return result;
   };
-  let visibleCookies = cookieMap(__cookie);
+  let visibleCookies = authoritativeCookies ? String(__cookie) : cookieMap(__cookie);
   let cookieVersion = 0;
   let acknowledgedCookieVersion = 0;
   let cookieBytes = 0;
@@ -84,7 +84,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (applied && version >= acknowledgedCookieVersion) {
       acknowledgedCookieVersion = version;
       pendingCookieWrites = pendingCookieWrites.filter((entry) => entry.version > version);
-      visibleCookies = cookieMap(cookie);
+      visibleCookies = authoritativeCookies ? String(cookie) : cookieMap(cookie);
       for (let index = cookieWaiters.length - 1; index >= 0; index -= 1) {
         const waiter = cookieWaiters[index];
         if (waiter.version <= version) {
@@ -292,7 +292,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const document = {};
   Object.defineProperty(document, "cookie", {
     enumerable: true,
-    get: () => Array.from(visibleCookies, ([name, value]) => name + "=" + value).join("; "),
+    get: () => authoritativeCookies ? visibleCookies : Array.from(visibleCookies, ([name, value]) => name + "=" + value).join("; "),
     set: setCookie,
   });
   document.location = Object.freeze({ href: initialUrl });
