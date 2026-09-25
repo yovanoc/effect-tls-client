@@ -1099,7 +1099,7 @@ const hostEncodeBlobText = (text, maxBytes) => {
   } catch { return null; }
 };
 const hostDecodeBlobText = (bytes) => {
-  try { return typeof bytes === "string" ? Buffer.from(bytes, "latin1").toString("utf8") : null; }
+  try { return typeof bytes === "string" ? new TextDecoder().decode(Buffer.from(bytes, "latin1")) : null; }
   catch { return null; }
 };
 const { randomFillSync: hostRandomFillSync } = require("node:crypto");

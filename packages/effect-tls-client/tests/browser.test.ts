@@ -251,6 +251,49 @@ describe("browser layer", () => {
     },
   );
 
+  it.effect("stamps the initiating origin on script POST requests", () => {
+    const calls: Call[] = [],
+      runtime = hostRuntime(["https://challenge.example.test"], (host) =>
+        host
+          .request({
+            body: "payload",
+            bodyBytes: null,
+            headers: [],
+            kind: "fetch",
+            method: "POST",
+            url: "https://challenge.example.test/solution",
+          })
+          .pipe(Effect.as("submitted")),
+      ),
+      browser = fromSession(
+        session(calls, (url) =>
+          response(url, 202, "challenge", [["x-amzn-waf-action", "challenge"]]),
+        ),
+        Chrome152Identity,
+        {
+          challengeHandler: (_challenge, context) =>
+            context
+              .evaluate("submit")
+              .pipe(Effect.flatMap(() => Effect.succeedNone)),
+          scriptRuntime: runtime,
+        },
+      );
+
+    return Effect.gen(function* originHeaderTest() {
+      const page = yield* browser.navigate("https://example.test/challenge"),
+        submit = calls.find(
+          (call) => call.url === "https://challenge.example.test/solution",
+        );
+      yield* page.close;
+      assert.ok(submit);
+      assert.ok(submit.options);
+      expect(submit.options.headers).toContainEqual([
+        "origin",
+        "https://example.test",
+      ]);
+    });
+  });
+
   it.effect("only follows Location from redirect statuses", () => {
     let closed = 0;
     const calls: Array<Call> = [];
@@ -1284,6 +1327,23 @@ describe("browser layer", () => {
           escapesBlocked: true,
           hiddenHostGlobals: true,
         });
+      }),
+    );
+    testEffect("strips a UTF-8 BOM from Blob and FileReader text reads", () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const result = yield* runtime.evaluate(`
+          const expected = '{"value":"café"}';
+          const blob = new Blob([String.fromCharCode(0xfeff) + expected], { type: "application/json" });
+          const reader = new FileReader();
+          const readerText = await new Promise((resolve, reject) => {
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsText(blob);
+          });
+          return String(readerText === expected && await blob.text() === expected);
+        `);
+        expect(result.value).toBe("true");
       }),
     );
     testEffect(

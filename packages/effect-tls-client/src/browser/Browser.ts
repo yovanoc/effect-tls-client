@@ -673,11 +673,15 @@ const makeScriptHost = (
               reason: `script network request budget exceeds ${MAX_SCRIPT_REQUESTS} requests`,
             });
           }
+          const requestOrigin =
+            input.kind === "fetch" && method !== "GET" && method !== "HEAD"
+              ? pageOrigin
+              : "";
           const outgoingHeaders = xhrHeaders(
             identityHeaders,
             target.toString(),
             referer,
-            "",
+            requestOrigin,
             headers,
           );
           const omitCredentials = target.origin !== pageOrigin;
