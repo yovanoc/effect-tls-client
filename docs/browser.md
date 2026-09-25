@@ -95,7 +95,12 @@ const browser = yield* Browser.open(config, {
 scripts. A fresh VM context exposes `document.cookie`, read-only location data,
 a small `navigator` and `console`, and a context-local `performance` with only
 monotonic `now()` and numeric `timeOrigin` backed by the runner's real monotonic
-clock. It synthesizes no browser fingerprint metrics. The context also provides
+clock. It exposes a context-local `crypto.getRandomValues` backed by Node's secure
+`node:crypto` random source through a private serialized-byte closure. It supports
+integer typed arrays (including BigInt), fills only the supplied view, returns the
+same view, and enforces the 65,536-byte per-call limit; floating-point arrays and
+`DataView` reject with context-local errors. `crypto.subtle` is not exposed. It
+synthesizes no browser fingerprint metrics. The context also provides
 Promise-based `fetch`, asynchronous `XMLHttpRequest`, `document.loadScript`,
 bounded timeout/interval APIs
 (`setTimeout`/`clearTimeout` and `setInterval`/`clearInterval`), and small

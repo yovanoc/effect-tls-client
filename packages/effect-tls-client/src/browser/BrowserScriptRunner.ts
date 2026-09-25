@@ -12,6 +12,46 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const bootstrap = String.raw`
 (() => {
   const post = __post;
+  // Keep host randomness private; only primitive bytes cross into the VM.
+  const hostRandomBytes = __randomBytes;
+  const NativeUint8Array = Uint8Array;
+  const NativeError = Error;
+  const NativeTypeError = TypeError;
+  const apply = Reflect.apply;
+  const isView = ArrayBuffer.isView;
+  const typedArrayPrototype = Object.getPrototypeOf(NativeUint8Array.prototype);
+  const typedArrayTag = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag).get;
+  const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, "buffer").get;
+  const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteOffset").get;
+  const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteLength").get;
+  const stringCharCodeAt = String.prototype.charCodeAt;
+  const getRandomValues = (array) => {
+    if (!isView(array)) throw new NativeTypeError("crypto.getRandomValues expects an integer typed array");
+    const tag = apply(typedArrayTag, array, []);
+    if (tag !== "Int8Array" && tag !== "Uint8Array" && tag !== "Uint8ClampedArray" &&
+        tag !== "Int16Array" && tag !== "Uint16Array" && tag !== "Int32Array" &&
+        tag !== "Uint32Array" && tag !== "BigInt64Array" && tag !== "BigUint64Array") {
+      throw new NativeTypeError("crypto.getRandomValues expects an integer typed array");
+    }
+    const byteLength = apply(typedArrayByteLength, array, []);
+    if (byteLength > 65536) {
+      const error = new NativeError("The requested length exceeds 65,536 bytes");
+      error.name = "QuotaExceededError";
+      throw error;
+    }
+    const buffer = apply(typedArrayBuffer, array, []);
+    const byteOffset = apply(typedArrayByteOffset, array, []);
+    const destination = new NativeUint8Array(buffer, byteOffset, byteLength);
+    const bytes = hostRandomBytes(byteLength);
+    if (typeof bytes !== "string" || bytes.length !== byteLength) {
+      throw new NativeError("secure random source failed");
+    }
+    for (let index = 0; index < byteLength; index += 1) {
+      destination[index] = apply(stringCharCodeAt, bytes, [index]);
+    }
+    return array;
+  };
+  const crypto = Object.freeze({ getRandomValues });
   // Keep the host clock closure private; only the local wrapper is script-visible.
   const monotonicNow = __performanceNow;
   const performance = Object.freeze({
@@ -411,7 +451,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location: document.location, navigator, console, performance, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event });
+  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
@@ -429,6 +469,14 @@ const readline = require("node:readline");
 const hostPerformance = require("node:perf_hooks").performance;
 const hostMonotonicNow = () => hostPerformance.now();
 const hostTimeOrigin = hostPerformance.timeOrigin;
+const { randomFillSync: hostRandomFillSync } = require("node:crypto");
+const MAX_RANDOM_BYTES = 65536;
+const hostRandomBytes = (byteLength) => {
+  try {
+    if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > MAX_RANDOM_BYTES) return null;
+    return hostRandomFillSync(Buffer.allocUnsafe(byteLength)).toString("latin1");
+  } catch { return null; }
+};
 const MAX_INPUT_LINE_BYTES = ${limits.maxInputLineBytes};
 const MAX_CONTROL_INPUT_LINE_BYTES = ${limits.maxControlInputLineBytes};
 const MAX_OUTPUT_LINE_BYTES = ${limits.maxOutputLineBytes};
@@ -493,6 +541,7 @@ const start = (input) => {
     __authoritativeCookies: input.authoritativeCookies,
     __performanceNow: hostMonotonicNow,
     __performanceTimeOrigin: hostTimeOrigin,
+    __randomBytes: hostRandomBytes,
   });
   context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
   vm.runInContext(bootstrap, context);
@@ -504,6 +553,7 @@ const start = (input) => {
   delete sandbox.__receive;
   delete sandbox.__performanceNow;
   delete sandbox.__performanceTimeOrigin;
+  delete sandbox.__randomBytes;
   const wrapper = "(async function () {\n" +
     "  const snapshot = __cookieSnapshot; const flush = __cookieFlush; const describe = __safeMessage;\n" +
     "  delete globalThis.__cookieSnapshot; delete globalThis.__cookieFlush; delete globalThis.__safeMessage;\n" +

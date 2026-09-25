@@ -23,6 +23,85 @@ type Call = {
   readonly options: Parameters<TlsSession["request"]>[1];
 };
 
+const cryptoRandomValuesSource = `
+  const localTypeError = (value) => {
+    try {
+      crypto.getRandomValues(value);
+      return false;
+    } catch (error) {
+      return error instanceof TypeError && error.constructor === TypeError &&
+        Object.getPrototypeOf(error) === TypeError.prototype;
+    }
+  };
+  const blocked = (probe) => {
+    try {
+      probe();
+      return false;
+    } catch (error) {
+      return error instanceof EvalError && error.constructor === EvalError &&
+        error.message.includes("Code generation");
+    }
+  };
+  const changed = (array, fill) => {
+    array.fill(fill);
+    return crypto.getRandomValues(array) === array &&
+      Array.from(array).some((value) => value !== fill);
+  };
+  const supported = [
+    changed(new Int8Array(32), -1),
+    changed(new Uint8Array(32), 255),
+    changed(new Uint8ClampedArray(32), 255),
+    changed(new Int16Array(32), -1),
+    changed(new Uint16Array(32), 65535),
+    changed(new Int32Array(32), -1),
+    changed(new Uint32Array(32), 4294967295),
+    changed(new BigInt64Array(32), -1n),
+    changed(new BigUint64Array(32), 18446744073709551615n),
+  ];
+  const floatRejected = localTypeError(new Float32Array(1));
+  const dataViewRejected = localTypeError(new DataView(new ArrayBuffer(4)));
+  let quotaRejected = false;
+  try {
+    crypto.getRandomValues(new Uint8Array(65537));
+  } catch (error) {
+    quotaRejected = error.name === "QuotaExceededError" &&
+      error instanceof Error && error.constructor === Error &&
+      Object.getPrototypeOf(error) === Error.prototype;
+  }
+  const atLimit = new Uint8Array(65536);
+  const limitAccepted = crypto.getRandomValues(atLimit) === atLimit;
+  const backing = new Uint8Array(48);
+  backing.fill(0xa5);
+  const view = new Uint16Array(backing.buffer, 8, 16);
+  const offsetRespected = crypto.getRandomValues(view) === view &&
+    backing.subarray(0, 8).every((byte) => byte === 0xa5) &&
+    backing.subarray(8, 40).some((byte) => byte !== 0xa5) &&
+    backing.subarray(40).every((byte) => byte === 0xa5);
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  const IntrinsicUint8Array = Uint8Array;
+  Object.getPrototypeOf(IntrinsicUint8Array.prototype).set = () => {
+    throw new Error("mutated set was used");
+  };
+  ArrayBuffer.isView = () => false;
+  Uint8Array = () => { throw new Error("mutated constructor was used"); };
+  const afterMutation = new IntrinsicUint8Array(32).fill(255);
+  const capturedIntrinsicsWork = crypto.getRandomValues(afterMutation) === afterMutation &&
+    Array.from(afterMutation).some((byte) => byte !== 255);
+  return [
+    crypto === window.crypto,
+    supported.every(Boolean),
+    floatRejected,
+    dataViewRejected,
+    quotaRejected,
+    limitAccepted,
+    offsetRespected,
+    bytes instanceof IntrinsicUint8Array,
+    blocked(() => crypto.getRandomValues.constructor("return process")()),
+    blocked(() => crypto.constructor.constructor("return process")()),
+    capturedIntrinsicsWork,
+  ].join("|");
+`;
+
 const response = (
   url: string,
   status: number,
@@ -603,10 +682,10 @@ describe("browser layer", () => {
       );
       expect(functionError.reason).toContain("Code generation");
       const hidden = yield* runtime.evaluate(
-        "return `${typeof __URL}|${typeof __cookieRead}|${typeof URL}|${typeof TextEncoder}|${typeof setTimeout}`;",
+        "return `${typeof __URL}|${typeof __cookieRead}|${typeof __randomBytes}|${typeof URL}|${typeof TextEncoder}|${typeof setTimeout}`;",
       );
       expect(hidden.value).toBe(
-        "undefined|undefined|undefined|undefined|function",
+        "undefined|undefined|undefined|undefined|undefined|function",
       );
     }).pipe(
       Effect.provide(
@@ -690,6 +769,23 @@ describe("browser layer", () => {
         BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
       ),
     ),
+  );
+
+  it.layer(BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)), {
+    excludeTestServices: true,
+  })(
+    "provides secure randomness without crossing the VM boundary",
+    ({ effect: testEffect }) => {
+      testEffect("supports Web Crypto integer views and local errors", () =>
+        Effect.gen(function* randomValuesTest() {
+          const runtime = yield* BrowserMock,
+            result = yield* runtime.evaluate(cryptoRandomValuesSource);
+          expect(result.value).toBe(
+            "true|true|true|true|true|true|true|true|true|true|true",
+          );
+        }),
+      );
+    },
   );
 
   it.live("bridges fetch, script loading, cookies, and timers", () =>
