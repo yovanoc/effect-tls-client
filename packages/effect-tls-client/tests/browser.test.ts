@@ -658,6 +658,40 @@ describe("browser layer", () => {
     ),
   );
 
+  it.live("exposes context-local monotonic performance timing", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const timing = yield* runtime.evaluate(`
+        const before = performance.now();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        const after = performance.now();
+        return [
+          typeof before,
+          Number.isFinite(before),
+          after > before,
+          typeof performance.timeOrigin,
+          Number.isFinite(performance.timeOrigin),
+          performance.timeOrigin > 0,
+          Object.getPrototypeOf(performance) === Object.prototype,
+          Object.getPrototypeOf(performance.now) === Function.prototype,
+        ].join("|");
+      `);
+      expect(timing.value).toBe("number|true|true|number|true|true|true|true");
+
+      const hostEscape = yield* Effect.flip(
+        runtime.evaluate(
+          'return performance.now.constructor("return process")().version;',
+        ),
+      );
+      expect(hostEscape.reason).toContain("Code generation");
+      expect(hostEscape.reason).not.toContain(process.version);
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
   it.live("bridges fetch, script loading, cookies, and timers", () =>
     Effect.gen(function* () {
       const runtime = yield* BrowserMock;

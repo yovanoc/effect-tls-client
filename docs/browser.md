@@ -93,8 +93,11 @@ const browser = yield* Browser.open(config, {
 
 `BrowserMock` is an optional process-backed runtime for reviewed challenge
 scripts. A fresh VM context exposes `document.cookie`, read-only location data,
-a small `navigator` and `console`, Promise-based `fetch`, asynchronous
-`XMLHttpRequest`, `document.loadScript`, bounded timeout/interval APIs
+a small `navigator` and `console`, and a context-local `performance` with only
+monotonic `now()` and numeric `timeOrigin` backed by the runner's real monotonic
+clock. It synthesizes no browser fingerprint metrics. The context also provides
+Promise-based `fetch`, asynchronous `XMLHttpRequest`, `document.loadScript`,
+bounded timeout/interval APIs
 (`setTimeout`/`clearTimeout` and `setInterval`/`clearInterval`), and small
 context-local `Event` listeners on `document` and `window`. Listener callbacks run synchronously on the target, with capturing listeners
 first and registration order within each group; duplicate

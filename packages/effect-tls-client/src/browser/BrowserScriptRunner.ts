@@ -12,6 +12,12 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const bootstrap = String.raw`
 (() => {
   const post = __post;
+  // Keep the host clock closure private; only the local wrapper is script-visible.
+  const monotonicNow = __performanceNow;
+  const performance = Object.freeze({
+    timeOrigin: Number(__performanceTimeOrigin),
+    now: () => monotonicNow(),
+  });
   const initialUrl = String(__pageUrl);
   const userAgent = String(__userAgent);
   const authoritativeCookies = Boolean(__authoritativeCookies);
@@ -405,7 +411,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location: document.location, navigator, console, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event });
+  Object.assign(window, { document, location: document.location, navigator, console, performance, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
@@ -420,6 +426,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   return String.raw`
 const vm = require("node:vm");
 const readline = require("node:readline");
+const hostPerformance = require("node:perf_hooks").performance;
+const hostMonotonicNow = () => hostPerformance.now();
+const hostTimeOrigin = hostPerformance.timeOrigin;
 const MAX_INPUT_LINE_BYTES = ${limits.maxInputLineBytes};
 const MAX_CONTROL_INPUT_LINE_BYTES = ${limits.maxControlInputLineBytes};
 const MAX_OUTPUT_LINE_BYTES = ${limits.maxOutputLineBytes};
@@ -482,6 +491,8 @@ const start = (input) => {
     __cookie: String(input.cookie),
     __userAgent: String(input.userAgent),
     __authoritativeCookies: input.authoritativeCookies,
+    __performanceNow: hostMonotonicNow,
+    __performanceTimeOrigin: hostTimeOrigin,
   });
   context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
   vm.runInContext(bootstrap, context);
@@ -491,6 +502,8 @@ const start = (input) => {
   delete sandbox.__cookie;
   delete sandbox.__userAgent;
   delete sandbox.__receive;
+  delete sandbox.__performanceNow;
+  delete sandbox.__performanceTimeOrigin;
   const wrapper = "(async function () {\n" +
     "  const snapshot = __cookieSnapshot; const flush = __cookieFlush; const describe = __safeMessage;\n" +
     "  delete globalThis.__cookieSnapshot; delete globalThis.__cookieFlush; delete globalThis.__safeMessage;\n" +
