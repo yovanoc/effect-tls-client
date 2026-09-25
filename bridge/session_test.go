@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -75,6 +76,57 @@ func TestRequestHeadersPreserveOrderAndOverrideIdentity(t *testing.T) {
 	wantOrder := []string{"x-request", "x-replace", "x-identity"}
 	if got := headers[http.HeaderOrderKey]; !slicesEqual(got, wantOrder) {
 		t.Fatalf("header order = %#v, want %#v", got, wantOrder)
+	}
+}
+
+func TestRequestHeadersOmitCredentials(t *testing.T) {
+	headers, err := requestHeaders(
+		protocol.IdentityMeta{Headers: []protocol.HeaderPair{
+			{"Authorization", "identity-token"},
+			{"Proxy-Authorization", "proxy-token"},
+			{"Cookie", "identity-cookie"},
+			{"X-Identity", "identity"},
+		}},
+		protocol.RequestMeta{
+			OmitCredentials: true,
+			Headers: []protocol.HeaderPair{
+				{"Authorization", "request-token"},
+				{"Cookie", "request-cookie"},
+				{"X-Request", "request"},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie"} {
+		if hasHeader(headers, name) {
+			t.Errorf("credential header %q was not omitted", name)
+		}
+	}
+	if headers.Get("X-Identity") != "identity" || headers.Get("X-Request") != "request" {
+		t.Fatalf("non-credential headers were not preserved: %#v", headers)
+	}
+}
+
+func TestCookieJarOmitsCredentialsInBothDirections(t *testing.T) {
+	jar, err := newSessionCookieJar(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse("https://example.test/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.storeCookies(u, []*http.Cookie{{Name: "session", Value: "kept", Path: "/"}})
+	jar.beginCredentialOmission()
+	if got := jar.Cookies(u); len(got) != 0 {
+		t.Fatalf("outbound cookies = %#v, want none", got)
+	}
+	jar.SetCookies(u, []*http.Cookie{{Name: "response", Value: "ignored", Path: "/"}})
+	jar.endCredentialOmission()
+	if got := jar.cookiesFor(u); len(got) != 1 || got[0].Name != "session" {
+		t.Fatalf("stored cookies = %#v, want only the pre-existing session cookie", got)
 	}
 }
 
@@ -362,6 +414,84 @@ func TestIntegrationSessionlessRequestDoesNotRetainSession(t *testing.T) {
 	}
 	if _, retained := dispatcher.sessions.sessions["request-12"]; retained {
 		t.Fatal("sessionless request retained its ephemeral session")
+	}
+}
+
+func TestIntegrationOmitCredentialsClearsURLBasicAuth(t *testing.T) {
+	if os.Getenv("TLS_CLIENT_INTEGRATION") != "1" {
+		t.Skip("set TLS_CLIENT_INTEGRATION=1 to run local tls-client integration tests")
+	}
+
+	authorization := make(chan string, 2)
+	server := httptest.NewServer(nethttp.HandlerFunc(func(writer nethttp.ResponseWriter, request *nethttp.Request) {
+		authorization <- request.Header.Get("Authorization")
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	profile := "chrome_146"
+	session, err := buildSession(protocol.SessionConfigMeta{
+		SessionID:  "url-basic-auth",
+		Profile:    &profile,
+		ForceHTTP1: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+
+	dispatcher, writer := newTestDispatcher()
+	defer dispatcher.stop()
+	if err := dispatcher.sessions.add(session); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		id                uint32
+		path              string
+		omitCredentials   bool
+		wantAuthorization string
+	}{
+		{id: 13, path: "/omit", omitCredentials: true},
+		{
+			id:                14,
+			path:              "/keep",
+			wantAuthorization: "Basic " + base64.StdEncoding.EncodeToString([]byte("fixture-user:fixture-pass")),
+		},
+	} {
+		target, err := url.Parse(server.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target.User = url.UserPassword("fixture-user", "fixture-pass")
+		target.Path = test.path
+		meta, err := protocol.EncodeMeta(protocol.RequestMeta{
+			SessionID:       session.id,
+			URL:             target.String(),
+			Method:          "GET",
+			OmitCredentials: test.omitCredentials,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dispatcher.dispatch(protocol.Frame{Kind: protocol.KindRequest, ID: test.id, Meta: meta}); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			frame := nextTestFrame(t, writer.frames)
+			if frame.ID != test.id {
+				t.Fatalf("response frame id = %d, want %d", frame.ID, test.id)
+			}
+			if frame.Kind == protocol.KindError {
+				t.Fatalf("request %d failed: %s", test.id, frame.Meta)
+			}
+			if frame.Kind == protocol.KindEnd {
+				break
+			}
+		}
+		if got := <-authorization; got != test.wantAuthorization {
+			t.Errorf("Authorization with omitCredentials=%t = %q, want %q", test.omitCredentials, got, test.wantAuthorization)
+		}
 	}
 }
 
@@ -816,6 +946,338 @@ func TestSessionCookieJarUsesRFCStateForExportAndExpiry(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestSessionCookieJarScriptCookiesProtectsHttpOnlyTuples(t *testing.T) {
+	jar, err := newSessionCookieJar(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateURL, err := url.Parse("https://example.test/private/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootURL, err := url.Parse("https://example.test/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(privateURL, []*http.Cookie{
+		{Name: "protected", Value: "hidden", Path: "/private", HttpOnly: true},
+		{Name: "visible", Value: "one", Path: "/"},
+	})
+	if got := jar.scriptCookieHeader(privateURL, nil); got != "visible=one" {
+		t.Fatalf("script cookie read = %q, want visible=one", got)
+	}
+
+	got := jar.scriptCookieHeader(privateURL, []string{
+		"protected=overwritten; Path=/private",
+		"protected=allowed; Path=/",
+		"script-only=hidden; Path=/; HttpOnly",
+	})
+	if strings.Contains(got, "protected=hidden") || strings.Contains(got, "protected=overwritten") {
+		t.Fatalf("script cookie header = %q, want HttpOnly hidden and overwrite values filtered", got)
+	}
+	if !strings.Contains(got, "protected=allowed") {
+		t.Fatalf("script cookie header = %q, want same-name different-path cookie", got)
+	}
+	if root := jar.scriptCookieHeader(rootURL, nil); !strings.Contains(root, "protected=allowed") {
+		t.Fatalf("root script cookie header = %q, want path-scoped script cookie", root)
+	}
+	var protected, allowed bool
+	for _, cookie := range jar.cookiesFor(privateURL) {
+		if cookie.Name == "protected" && cookie.Path == "/private" {
+			protected = cookie.Value == "hidden" && cookie.HttpOnly
+		}
+		if cookie.Name == "protected" && cookie.Path == "/" {
+			allowed = cookie.Value == "allowed" && !cookie.HttpOnly
+		}
+		if cookie.Name == "script-only" {
+			t.Fatalf("script created an HttpOnly cookie: %#v", cookie)
+		}
+	}
+	if !protected || !allowed {
+		t.Fatalf("protected cookies after script write: protected=%t allowed=%t", protected, allowed)
+	}
+}
+
+func TestSessionCookieJarScriptCookiesHonorsSecureAndDomainRules(t *testing.T) {
+	jar, err := newSessionCookieJar(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secureURL, err := url.Parse("https://example.test/private/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpURL, err := url.Parse("http://example.test/private/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subdomainURL, err := url.Parse("https://sub.example.test/private/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(secureURL, []*http.Cookie{
+		{Name: "secure-protected", Value: "hidden", Path: "/private", Secure: true, HttpOnly: true},
+		{Name: "domain-protected", Value: "hidden", Domain: "example.test", Path: "/private", HttpOnly: true},
+	})
+
+	jar.scriptCookieHeader(httpURL, []string{
+		"secure-protected=overwritten; Path=/private",
+		"new-secure=ignored; Path=/; Secure",
+	})
+	secure := jar.cookiesFor(secureURL)
+	for _, cookie := range secure {
+		if cookie.Name == "secure-protected" && cookie.Value != "hidden" {
+			t.Fatalf("secure HttpOnly cookie was overwritten: %#v", cookie)
+		}
+		if cookie.Name == "new-secure" {
+			t.Fatalf("secure cookie was created from an HTTP script origin: %#v", cookie)
+		}
+	}
+
+	jar.scriptCookieHeader(subdomainURL, []string{
+		"domain-protected=overwritten; Domain=example.test; Path=/private",
+	})
+	for _, cookie := range jar.cookiesFor(secureURL) {
+		if cookie.Name == "domain-protected" && cookie.Value != "hidden" {
+			t.Fatalf("domain HttpOnly cookie was overwritten: %#v", cookie)
+		}
+	}
+}
+
+func TestSessionCookieJarScriptCookiesCanonicalizesTrailingDotAndIDNA(t *testing.T) {
+	jar, err := newSessionCookieJar(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalURL, err := url.Parse("https://example.test/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trailingDotURL, err := url.Parse("https://example.test./")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(canonicalURL, []*http.Cookie{{
+		Name: "secret", Value: "hidden", Path: "/", HttpOnly: true,
+	}})
+	if got := jar.scriptCookieHeader(trailingDotURL, []string{"secret=overwritten; Path=/"}); got != "" {
+		t.Fatalf("trailing-dot script cookie header = %q, want empty", got)
+	}
+	cookies := jar.cookiesFor(canonicalURL)
+	if len(cookies) != 1 || cookies[0].Name != "secret" || cookies[0].Value != "hidden" || !cookies[0].HttpOnly {
+		t.Fatalf("trailing-dot write changed protected cookie: %#v", cookies)
+	}
+
+	idnaURL, err := url.Parse("https://bücher.example.test/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	asciiIDNAURL, err := url.Parse("https://xn--bcher-kva.example.test./")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(idnaURL, []*http.Cookie{{
+		Name: "idna-secret", Value: "hidden", Path: "/", HttpOnly: true,
+	}})
+	if got := jar.scriptCookieHeader(asciiIDNAURL, []string{"idna-secret=overwritten; Path=/"}); got != "" {
+		t.Fatalf("IDNA script cookie header = %q, want empty", got)
+	}
+	cookies = jar.cookiesFor(idnaURL)
+	var found bool
+	for _, cookie := range cookies {
+		if cookie.Name == "idna-secret" {
+			found = cookie.Value == "hidden" && cookie.HttpOnly
+		}
+	}
+	if !found {
+		t.Fatalf("IDNA write changed protected cookie: %#v", cookies)
+	}
+}
+
+func TestSessionCookieJarScriptCookiesDoesNotOverlaySecureFromHTTP(t *testing.T) {
+	jar, err := newSessionCookieJar(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpsURL, err := url.Parse("https://example.test/private/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpURL, err := url.Parse("http://example.test/private/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(httpsURL, []*http.Cookie{{
+		Name: "secure", Value: "hidden", Path: "/private", Secure: true,
+	}})
+	if got := jar.scriptCookieHeader(httpURL, []string{"secure=overwritten; Path=/private"}); got != "" {
+		t.Fatalf("HTTP script cookie header = %q, want empty", got)
+	}
+	if got := jar.scriptCookieHeader(httpsURL, nil); got != "secure=hidden" {
+		t.Fatalf("secure cookie after HTTP script write = %q, want secure=hidden", got)
+	}
+
+	// A different path is a different cookie tuple and remains writable.
+	if got := jar.scriptCookieHeader(httpURL, []string{"secure=shadow; Path=/"}); got != "secure=shadow" {
+		t.Fatalf("HTTP script cookie header for different path = %q, want secure=shadow", got)
+	}
+	if got := jar.scriptCookieHeader(httpsURL, nil); got != "secure=hidden; secure=shadow" {
+		t.Fatalf("HTTPS script cookie header after different-path write = %q, want both cookies", got)
+	}
+	if got := jar.scriptCookieHeader(httpsURL, []string{"secure=updated; Path=/private; Secure"}); got != "secure=updated; secure=shadow" {
+		t.Fatalf("HTTPS script cookie header after Secure write = %q, want updated Secure cookie", got)
+	}
+}
+
+func TestSessionCookieJarScriptCookiesBlocksOverlappingSecureCookies(t *testing.T) {
+	tests := []struct {
+		name         string
+		secureURL    string
+		scriptURL    string
+		probeURL     string
+		secureDomain string
+		securePath   string
+		write        string
+		want         string
+	}{
+		{
+			name:       "narrower path",
+			secureURL:  "https://example.test/private/page",
+			scriptURL:  "http://example.test/private/page",
+			probeURL:   "https://example.test/private/nested/page",
+			securePath: "/private",
+			write:      "token=shadow; Path=/private/nested",
+			want:       "token=trusted",
+		},
+		{
+			name:         "secure parent domain and child host-only cookie",
+			secureURL:    "https://example.test/private/page",
+			scriptURL:    "http://sub.example.test/private/page",
+			probeURL:     "https://sub.example.test/private/page",
+			secureDomain: "example.test",
+			securePath:   "/private",
+			write:        "token=shadow; Path=/private",
+			want:         "token=trusted",
+		},
+		{
+			name:       "secure child host-only and parent domain cookie",
+			secureURL:  "https://sub.example.test/private/page",
+			scriptURL:  "http://sub.example.test/private/page",
+			probeURL:   "https://sub.example.test/private/page",
+			securePath: "/private",
+			write:      "token=shadow; Domain=example.test; Path=/private",
+			want:       "token=trusted",
+		},
+		{
+			name:       "non-overlapping path",
+			secureURL:  "https://example.test/private/page",
+			scriptURL:  "http://example.test/private/page",
+			probeURL:   "https://example.test/privateish/page",
+			securePath: "/private",
+			write:      "token=shadow; Path=/privateish",
+			want:       "token=shadow",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			jar, err := newSessionCookieJar(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secureURL, err := url.Parse(test.secureURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jar.SetCookies(secureURL, []*http.Cookie{{
+				Name: "token", Value: "trusted", Domain: test.secureDomain,
+				Path: test.securePath, Secure: true,
+			}})
+			scriptURL, err := url.Parse(test.scriptURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jar.scriptCookieHeader(scriptURL, []string{test.write})
+			probeURL, err := url.Parse(test.probeURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := jar.scriptCookieHeader(probeURL, nil); got != test.want {
+				t.Fatalf("HTTPS cookie header = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSessionCookieJarScriptCookiesSerializesWithHTTPWrites(t *testing.T) {
+	server := httptest.NewServer(nethttp.HandlerFunc(func(writer nethttp.ResponseWriter, request *nethttp.Request) {
+		writer.Header().Set("Set-Cookie", "protected=server; Path=/private; HttpOnly")
+		_, _ = writer.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	profile := "chrome_146"
+	session, err := buildSession(protocol.SessionConfigMeta{
+		SessionID:  "script-cookie-concurrency",
+		Profile:    &profile,
+		ForceHTTP1: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.closeIdleConnections()
+	cookieURL, err := url.Parse(server.URL + "/private/page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.client.SetCookies(cookieURL, []*http.Cookie{{
+		Name: "protected", Value: "initial", Path: "/private", HttpOnly: true,
+	}})
+	jar, ok := session.client.GetCookieJar().(*sessionCookieJar)
+	if !ok {
+		t.Fatal("session does not use a session cookie jar")
+	}
+
+	const iterations = 32
+	errorsFound := make(chan error, iterations)
+	var wait sync.WaitGroup
+	for index := 0; index < iterations; index++ {
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			request, requestErr := http.NewRequest("GET", server.URL+"/set", nil)
+			if requestErr != nil {
+				errorsFound <- requestErr
+				return
+			}
+			response, requestErr := session.client.Do(request)
+			if requestErr != nil {
+				errorsFound <- requestErr
+				return
+			}
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+		}()
+		go func() {
+			defer wait.Done()
+			jar.scriptCookieHeader(cookieURL, []string{"protected=script; Path=/private"})
+		}()
+	}
+	wait.Wait()
+	close(errorsFound)
+	for requestErr := range errorsFound {
+		t.Fatal(requestErr)
+	}
+	for _, cookie := range jar.cookiesFor(cookieURL) {
+		if cookie.Name == "protected" {
+			if cookie.Value != "server" || !cookie.HttpOnly {
+				t.Fatalf("concurrent script write changed protected cookie: %#v", cookie)
+			}
+			return
+		}
+	}
+	t.Fatal("protected cookie was lost during concurrent HTTP writes")
 }
 
 func TestSessionProxyWaitIsCancellable(t *testing.T) {
