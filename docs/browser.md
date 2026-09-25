@@ -94,9 +94,17 @@ const browser = yield* Browser.open(config, {
 `BrowserMock` is an optional process-backed runtime for reviewed challenge
 scripts. A fresh VM context exposes `document.cookie`, read-only location data,
 a small `navigator` and `console`, Promise-based `fetch`, asynchronous
-`XMLHttpRequest`, `document.loadScript`, and bounded timeout/interval APIs
-(`setTimeout`/`clearTimeout` and `setInterval`/`clearInterval`). It does not
-expose `process`, filesystem, WebSocket, or general DOM APIs. Network operations
+`XMLHttpRequest`, `document.loadScript`, bounded timeout/interval APIs
+(`setTimeout`/`clearTimeout` and `setInterval`/`clearInterval`), and small
+context-local `Event` listeners on `document` and `window`. Listener callbacks run synchronously on the target, with capturing listeners
+first and registration order within each group; duplicate
+`(type, callback, capture)` registrations are ignored, matching removals,
+`once`, and `passive` work; `AbortSignal` listeners are unsupported and reject.
+`dispatchEvent` accepts only this runtime's synthetic `Event` instances
+(`isTrusted` is always `false`). There is no DOM tree, event propagation, or
+automatic lifecycle/user-event delivery. Listener exceptions are reported as
+`BrowserScriptError` and fail evaluation. It does not expose `process`,
+filesystem, WebSocket, or general DOM APIs. Network operations
 are serialized to the host and made through the same scoped `TlsSession`; Go
 remains authoritative for cookies.
 

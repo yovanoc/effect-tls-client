@@ -304,7 +304,93 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (timers.delete(number)) send({ type: "timer.clear", id: number });
   };
   const clearInterval = clearTimeout;
-  const document = {};
+  class Event {
+    constructor(type, options = {}) {
+      const init = options == null ? {} : options;
+      this._type = String(type);
+      this._bubbles = Boolean(init.bubbles);
+      this._cancelable = Boolean(init.cancelable);
+      this._defaultPrevented = false;
+      this._target = null;
+      this._currentTarget = null;
+      this._dispatching = false;
+      this._immediateStopped = false;
+      this._inPassiveListener = false;
+    }
+    get type() { return this._type; }
+    get bubbles() { return this._bubbles; }
+    get cancelable() { return this._cancelable; }
+    get defaultPrevented() { return this._defaultPrevented; }
+    get isTrusted() { return false; }
+    get target() { return this._target; }
+    get currentTarget() { return this._currentTarget; }
+    preventDefault() {
+      if (this.cancelable && !this._inPassiveListener) this._defaultPrevented = true;
+    }
+    stopImmediatePropagation() { this._immediateStopped = true; }
+  }
+  const makeEventTarget = (target) => {
+    const listeners = new Map();
+    const captureOf = (options) => typeof options === "boolean" ? options : Boolean(options && options.capture);
+    target.addEventListener = (type, callback, options = false) => {
+      if (callback == null) return;
+      if (typeof callback !== "function" && (typeof callback !== "object" || typeof callback.handleEvent !== "function")) {
+        throw new TypeError("event listener must be a function or an object with handleEvent");
+      }
+      const name = String(type);
+      const capture = captureOf(options);
+      const init = typeof options === "object" && options !== null ? options : {};
+      if (init.signal != null) throw new TypeError("event listener AbortSignal is not supported");
+      const entries = listeners.get(name) || [];
+      if (entries.some((entry) => entry.callback === callback && entry.capture === capture)) return;
+      entries.push({ callback, capture, once: Boolean(init.once), passive: Boolean(init.passive) });
+      listeners.set(name, entries);
+    };
+    target.removeEventListener = (type, callback, options = false) => {
+      if (callback == null) return;
+      const name = String(type);
+      const entries = listeners.get(name) || [];
+      const index = entries.findIndex((entry) => entry.callback === callback && entry.capture === captureOf(options));
+      if (index !== -1) entries.splice(index, 1);
+      if (entries.length === 0) listeners.delete(name);
+    };
+    target.dispatchEvent = (event) => {
+      if (!(event instanceof Event)) throw new TypeError("dispatchEvent expects an Event");
+      if (event._dispatching) throw new TypeError("event is already being dispatched");
+      const name = event.type;
+      const entries = [...(listeners.get(name) || [])].sort(
+        (left, right) => Number(right.capture) - Number(left.capture),
+      );
+      event._dispatching = true;
+      event._target = target;
+      event._currentTarget = target;
+      event._immediateStopped = false;
+      try {
+        for (const entry of entries) {
+          if (!(listeners.get(name) || []).includes(entry)) continue;
+          if (entry.once) target.removeEventListener(name, entry.callback, entry.capture);
+          try {
+            event._inPassiveListener = entry.passive;
+            if (typeof entry.callback === "function") entry.callback.call(target, event);
+            else entry.callback.handleEvent.call(entry.callback, event);
+          } catch (cause) {
+            send({ type: "script.error", reason: safeMessage(cause) });
+          } finally {
+            event._inPassiveListener = false;
+          }
+          if (event._immediateStopped) break;
+        }
+      } finally {
+        event._currentTarget = null;
+        event._dispatching = false;
+        event._inPassiveListener = false;
+        event._immediateStopped = false;
+      }
+      return !event.defaultPrevented;
+    };
+    return target;
+  };
+  const document = makeEventTarget({});
   Object.defineProperty(document, "cookie", {
     enumerable: true,
     get: () => authoritativeCookies ? visibleCookies : Array.from(visibleCookies, ([name, value]) => name + "=" + value).join("; "),
@@ -318,8 +404,8 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   });
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
-  const window = globalThis;
-  Object.assign(window, { document, location: document.location, navigator, console, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response });
+  const window = makeEventTarget(globalThis);
+  Object.assign(window, { document, location: document.location, navigator, console, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {

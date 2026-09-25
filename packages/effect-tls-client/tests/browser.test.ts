@@ -615,6 +615,49 @@ describe("browser layer", () => {
     ),
   );
 
+  it.effect("dispatches context-local document and window events", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const events = yield* runtime.evaluate(`
+        const order = [];
+        const listener = (event) => order.push("document:" + event.type + ":" + (event.currentTarget === document) + ":" + event.isTrusted);
+        const once = () => order.push("once");
+        const removed = () => order.push("removed");
+        document.addEventListener("synthetic", listener);
+        document.addEventListener("synthetic", listener);
+        document.addEventListener("synthetic", once, { once: true });
+        document.addEventListener("synthetic", removed);
+        document.removeEventListener("synthetic", removed);
+        document.dispatchEvent(new Event("synthetic"));
+        document.dispatchEvent(new Event("synthetic"));
+        window.addEventListener("window-event", (event) => order.push("window:" + (event.target === window)));
+        window.dispatchEvent(new Event("window-event"));
+        document.addEventListener("capture-order", () => order.push("bubble"));
+        document.addEventListener("capture-order", () => order.push("capture"), true);
+        document.dispatchEvent(new Event("capture-order"));
+        return order.join("|");
+      `);
+      expect(events.value).toBe(
+        "document:synthetic:true:false|once|document:synthetic:true:false|window:true|capture|bubble",
+      );
+      const listenerError = yield* Effect.flip(
+        runtime.evaluate(`
+          document.addEventListener("listener-error", () => {
+            throw new Error("event listener failed");
+          });
+          document.dispatchEvent(new Event("listener-error"));
+          return "unreachable";
+        `),
+      );
+      expect(listenerError).toBeInstanceOf(BrowserScriptError);
+      expect(listenerError.reason).toContain("event listener failed");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
   it.live("bridges fetch, script loading, cookies, and timers", () =>
     Effect.gen(function* () {
       const runtime = yield* BrowserMock;
