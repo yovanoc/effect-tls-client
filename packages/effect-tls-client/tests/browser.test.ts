@@ -754,7 +754,7 @@ describe("browser layer", () => {
         "return `${typeof __URL}|${typeof __cookieRead}|${typeof __randomBytes}|${typeof URL}|${typeof TextEncoder}|${typeof setTimeout}`;",
       );
       expect(hidden.value).toBe(
-        "undefined|undefined|undefined|undefined|undefined|function",
+        "undefined|undefined|undefined|function|undefined|function",
       );
     }).pipe(
       Effect.provide(
@@ -762,6 +762,55 @@ describe("browser layer", () => {
       ),
     ),
   );
+
+  it.layer(BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)), {
+    excludeTestServices: true,
+  })("context-local URL", ({ effect: testEffect }) => {
+    testEffect("provides bounded, read-only URL APIs", () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const result = yield* runtime.evaluate(`
+          const url = new URL("../next?query=one+two&query=%2B#part", "https://EXAMPLE.test:443/base/path");
+          const nonDefaultPort = new URL("/asset", "http://example.test:8080/base/");
+          const params = new URLSearchParams(url.search);
+          const localTypeError = (error) => error instanceof TypeError && error.constructor === TypeError &&
+            Object.getPrototypeOf(error) === TypeError.prototype;
+          const blocked = (value) => {
+            try { value.constructor.constructor("return process")(); return false; }
+            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+          };
+          let urlWriteRejected = false;
+          try { url.pathname = "/changed"; } catch (error) { urlWriteRejected = localTypeError(error); }
+          let paramsWriteRejected = false;
+          try { params.set("query", "changed"); } catch (error) { paramsWriteRejected = localTypeError(error); }
+          let invalidIsLocal = false;
+          try { new URL("http://["); } catch (error) { invalidIsLocal = localTypeError(error) && error.message === "Invalid URL" && blocked(error); }
+          let inputQuotaRejected = false;
+          try { new URL("x".repeat(8193), "https://example.test/"); }
+          catch (error) { inputQuotaRejected = localTypeError(error); }
+          let resultQuotaRejected = false;
+          try { new URL("/" + String.fromCharCode(0x800).repeat(8180), "https://a/"); }
+          catch (error) { resultQuotaRejected = localTypeError(error); }
+          const fields = [url.href, url.origin, url.protocol, url.host, url.hostname, url.port, url.pathname, url.search, url.hash, url.toString()].join("~");
+          const paramsView = [params.get("query"), params.get("missing") === null].join("~");
+          return [
+            fields,
+            url.href.startsWith("https://example.test/"),
+            [nonDefaultPort.origin, nonDefaultPort.host, nonDefaultPort.hostname, nonDefaultPort.port].join("~"),
+            paramsView,
+            URL === window.URL && URLSearchParams === window.URLSearchParams && url.searchParams === url.searchParams &&
+              Object.getPrototypeOf(url) === URL.prototype && Object.getPrototypeOf(params) === URLSearchParams.prototype,
+            urlWriteRejected && paramsWriteRejected && url.pathname === "/next" && params.get("query") === "one two",
+            invalidIsLocal && inputQuotaRejected && resultQuotaRejected,
+            typeof __urlOperation === "undefined" && blocked(url) && blocked(params),
+          ].join("|");
+        `);
+        expect(result.value).toBe(
+          "https://example.test/next?query=one+two&query=%2B#part~https://example.test~https:~example.test~example.test~~/next~?query=one+two&query=%2B~#part~https://example.test/next?query=one+two&query=%2B#part|true|http://example.test:8080~example.test:8080~example.test~8080|one two~true|true|true|true|true",
+        );
+      }),
+    );
+  });
 
   it.live("implements bounded, context-local Blob operations", () =>
     Effect.gen(function* () {

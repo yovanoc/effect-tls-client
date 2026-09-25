@@ -95,11 +95,19 @@ const browser = yield* Browser.open(config, {
 scripts. A fresh VM context exposes `document.cookie`, read-only location data,
 a small `navigator` and `console`, and a context-local `performance` with only
 monotonic `now()` and numeric `timeOrigin` backed by the runner's real monotonic
-clock. It exposes a context-local `crypto.getRandomValues` backed by Node's secure
-`node:crypto` random source through a private serialized-byte closure. It supports
-integer typed arrays (including BigInt), fills only the supplied view, returns the
-same view, and enforces the 65,536-byte per-call limit; floating-point arrays and
-`DataView` reject with context-local errors. `crypto.subtle` is not exposed. It
+clock. It exposes context-local `URL` and `URLSearchParams` backed by a private,
+string-only Node URL parser closure. URL parsing accepts bounded strings and an
+optional base, and provides `href`, `origin`, `protocol`, `host`, `hostname`,
+`port`, `pathname`, `search`, `hash`, and `toString()`. `URLSearchParams`
+accepts a query string and implements `get(name)` only. Both APIs are read-only:
+URL property writes and query mutations throw; non-string initializers and other
+query methods are unsupported. URL inputs are capped at 8,192 UTF-16 code units
+and serialized parser results at 64 KiB. It also exposes a context-local
+`crypto.getRandomValues` backed by Node's secure `node:crypto` random source
+through a private serialized-byte closure. It supports integer typed arrays
+(including BigInt), fills only the supplied view, returns the same view, and
+enforces the 65,536-byte per-call limit; floating-point arrays and `DataView`
+reject with context-local errors. `crypto.subtle` is not exposed. It
 synthesizes no browser fingerprint metrics. The context also provides
 Promise-based `fetch`, asynchronous `XMLHttpRequest`, `document.loadScript`,
 bounded timeout/interval APIs

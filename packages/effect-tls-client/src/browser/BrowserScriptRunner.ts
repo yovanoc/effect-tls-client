@@ -19,6 +19,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
 (() => {
   const post = __post;
   // Host helpers exchange only primitives; no host objects enter the VM.
+  const hostUrlOperation = __urlOperation;
+  delete globalThis.__urlOperation;
+  const jsonParse = JSON.parse;
   const hostRandomBytes = __randomBytes;
   const hostEncodeBlobText = __encodeBlobText;
   const hostDecodeBlobText = __decodeBlobText;
@@ -44,6 +47,80 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const stringCharCodeAt = String.prototype.charCodeAt;
   const stringFromCharCode = String.fromCharCode;
   const numberToString = Number.prototype.toString;
+  const MAX_URL_INPUT_LENGTH = 8192;
+  const MAX_URL_RESULT_LENGTH = 65536;
+  const urlOperation = (operation, input, first = "", second = "") => {
+    if (input.length > MAX_URL_INPUT_LENGTH || first.length > MAX_URL_INPUT_LENGTH || second.length > MAX_URL_INPUT_LENGTH) return null;
+    const encoded = hostUrlOperation(operation, input, first, second);
+    if (typeof encoded !== "string" || encoded.length > MAX_URL_RESULT_LENGTH) return null;
+    try { return jsonParse(encoded); } catch { return null; }
+  };
+  const requireUrlString = (value) => {
+    const text = NativeString(value);
+    if (text.length > MAX_URL_INPUT_LENGTH) throw new NativeTypeError("URL input exceeds 8192 characters");
+    return text;
+  };
+  const parameterData = new WeakMap();
+  const getParameterInput = (value) => {
+    const input = parameterData.get(value);
+    if (input === undefined) throw new NativeTypeError("URLSearchParams method called on an incompatible receiver");
+    return input;
+  };
+  const parameterValue = (value) => {
+    if (!Array.isArray(value) || value.length !== 1) throw new NativeTypeError("URLSearchParams result exceeds the 64 KiB limit");
+    return value[0];
+  };
+  class URLSearchParams {
+    constructor(input = "") {
+      if (typeof input !== "string") throw new NativeTypeError("BrowserMock URLSearchParams accepts string input only");
+      if (input.length > MAX_URL_INPUT_LENGTH) throw new NativeTypeError("URL input exceeds 8192 characters");
+      parameterData.set(this, input);
+      Object.freeze(this);
+    }
+    get(name) { return parameterValue(urlOperation("params:get", getParameterInput(this), requireUrlString(name))); }
+    append() { throw new NativeTypeError("BrowserMock URLSearchParams is read-only"); }
+    delete() { throw new NativeTypeError("BrowserMock URLSearchParams is read-only"); }
+    set() { throw new NativeTypeError("BrowserMock URLSearchParams is read-only"); }
+    sort() { throw new NativeTypeError("BrowserMock URLSearchParams is read-only"); }
+  }
+  const urlData = new WeakMap();
+  const getUrlData = (value) => {
+    const data = urlData.get(value);
+    if (data === undefined) throw new NativeTypeError("URL method called on an incompatible receiver");
+    return data;
+  };
+  const readOnlyUrl = () => { throw new NativeTypeError("BrowserMock URL is read-only"); };
+  class URL {
+    constructor(input, base) {
+      const value = requireUrlString(input);
+      const parsed = base === undefined
+        ? urlOperation("parse", value)
+        : urlOperation("parse-base", value, requireUrlString(base));
+      if (!Array.isArray(parsed) || parsed.length !== 9 || parsed.some((part) => typeof part !== "string")) {
+        throw new NativeTypeError("Invalid URL");
+      }
+      urlData.set(this, {
+        href: parsed[0], origin: parsed[1], protocol: parsed[2], host: parsed[3],
+        hostname: parsed[4], port: parsed[5], pathname: parsed[6], search: parsed[7], hash: parsed[8],
+        searchParams: null,
+      });
+      Object.freeze(this);
+    }
+    get searchParams() {
+      const data = getUrlData(this);
+      if (data.searchParams === null) data.searchParams = new URLSearchParams(data.search);
+      return data.searchParams;
+    }
+    set searchParams(_value) { readOnlyUrl(); }
+    toString() { return getUrlData(this).href; }
+  }
+  for (const key of ["href", "origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash"]) {
+    Object.defineProperty(URL.prototype, key, {
+      enumerable: true,
+      get() { return getUrlData(this)[key]; },
+      set: readOnlyUrl,
+    });
+  }
   const getRandomValues = (array) => {
     if (!isView(array)) throw new NativeTypeError("crypto.getRandomValues expects an integer typed array");
     const tag = apply(typedArrayTag, array, []);
@@ -1073,7 +1150,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event, ProgressEvent, Blob, FileReader, FormData });
+  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
@@ -1103,6 +1180,28 @@ const hostDecodeBlobText = (bytes) => {
   catch { return null; }
 };
 const { randomFillSync: hostRandomFillSync } = require("node:crypto");
+const hostUrlOperation = (() => {
+  const { URL: NodeURL, URLSearchParams: NodeURLSearchParams } = require("node:url");
+  const MAX_URL_INPUT_LENGTH = 8192;
+  const MAX_URL_RESULT_BYTES = 65536;
+  const serialize = (value) => {
+    const encoded = JSON.stringify(value);
+    return Buffer.byteLength(encoded, "utf8") <= MAX_URL_RESULT_BYTES ? encoded : null;
+  };
+  return (operation, input, first, second) => {
+    try {
+      if ([operation, input, first, second].some((value) => typeof value !== "string" || value.length > MAX_URL_INPUT_LENGTH)) return null;
+      let result;
+      if (operation === "parse" || operation === "parse-base") {
+        const url = operation === "parse" ? new NodeURL(input) : new NodeURL(input, first);
+        result = [url.href, url.origin, url.protocol, url.host, url.hostname, url.port, url.pathname, url.search, url.hash];
+      } else if (operation === "params:get") {
+        result = [new NodeURLSearchParams(input).get(first)];
+      } else return null;
+      return serialize(result);
+    } catch { return null; }
+  };
+})();
 const MAX_RANDOM_BYTES = 65536;
 const hostRandomBytes = (byteLength) => {
   try {
@@ -1170,6 +1269,7 @@ const handleParentLine = (line) => {
 const start = (input) => {
   const sandbox = Object.assign(Object.create(null), {
     __post: post,
+    __urlOperation: hostUrlOperation,
     __pageUrl: String(input.url),
     __cookie: String(input.cookie),
     __userAgent: String(input.userAgent),
@@ -1184,6 +1284,7 @@ const start = (input) => {
   vm.runInContext(bootstrap, context);
   deliver = vm.runInContext("__receive", context);
   delete sandbox.__post;
+  delete sandbox.__urlOperation;
   delete sandbox.__pageUrl;
   delete sandbox.__cookie;
   delete sandbox.__userAgent;
