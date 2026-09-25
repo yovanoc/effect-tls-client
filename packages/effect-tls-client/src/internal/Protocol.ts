@@ -222,6 +222,7 @@ export const RequestMeta = Schema.Struct({
   contentLength: Schema.optionalKey(NonNegativeInt),
   timeoutMs: Schema.optionalKey(NonNegativeInt),
   followRedirects: Schema.optionalKey(Schema.Boolean),
+  omitCredentials: Schema.optionalKey(Schema.Boolean),
   hostOverride: Schema.optionalKey(Schema.String),
   cookies: Schema.optionalKey(Schema.Array(Cookie)),
 }).check(

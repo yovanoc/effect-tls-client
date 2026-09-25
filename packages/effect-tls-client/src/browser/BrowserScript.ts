@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect";
+import { Duration, Effect, Schema } from "effect";
 
 const MAX_SOURCE_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
@@ -36,10 +36,40 @@ export interface BrowserScriptResult extends Schema.Schema.Type<
  * sandbox. Implementations must terminate synchronous work rather than relying
  * on Effect interruption.
  */
+export interface BrowserScriptRequest {
+  readonly kind: "fetch" | "script";
+  readonly url: string;
+  readonly method: string;
+  readonly headers: ReadonlyArray<readonly [string, string]>;
+  readonly body: string | null;
+}
+
+export interface BrowserScriptNetworkResponse {
+  readonly status: number;
+  readonly url: string;
+  readonly headers: ReadonlyArray<readonly [string, string]>;
+  readonly body: string;
+  readonly cookie: string;
+  readonly error?: string;
+}
+
+/** Host capabilities are serialized through the runner; no callback enters the VM. */
+export interface BrowserScriptHost {
+  readonly request: (
+    request: BrowserScriptRequest,
+  ) => Effect.Effect<BrowserScriptNetworkResponse, BrowserScriptError>;
+  readonly setCookie: (
+    value: string,
+  ) => Effect.Effect<string, BrowserScriptError>;
+}
+
 export interface BrowserScriptRuntime {
+  readonly allowedOrigins?: ReadonlyArray<string>;
+  readonly timeoutMs?: number;
   readonly evaluate: (
     source: string,
     context?: BrowserScriptContext,
+    host?: BrowserScriptHost,
   ) => Effect.Effect<BrowserScriptResult, BrowserScriptError>;
 }
 
@@ -52,6 +82,7 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
     runtime: BrowserScriptRuntime,
     input: unknown,
     context?: BrowserScriptContext,
+    host?: BrowserScriptHost,
   ) {
     const source = yield* Schema.decodeUnknownEffect(Schema.String)(input).pipe(
       Effect.mapError(
@@ -69,7 +100,7 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
     }
 
     const result = yield* Effect.try({
-      try: () => runtime.evaluate(source, context),
+      try: () => runtime.evaluate(source, context, host),
       catch: (cause) =>
         new BrowserScriptError({
           reason: "script runtime threw before evaluation",
@@ -78,7 +109,7 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
     }).pipe(
       Effect.flatMap((effect) => effect),
       Effect.timeoutOrElse({
-        duration: "2 seconds",
+        duration: Duration.millis(runtime.timeoutMs ?? 2_000),
         orElse: () =>
           Effect.fail(
             new BrowserScriptError({ reason: "script evaluation timed out" }),

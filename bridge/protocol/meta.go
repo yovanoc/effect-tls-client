@@ -219,6 +219,7 @@ type RequestMeta struct {
 	ContentLength   *int64             `json:"contentLength,omitempty"`
 	TimeoutMs       *int64             `json:"timeoutMs,omitempty"`
 	FollowRedirects *bool              `json:"followRedirects,omitempty"`
+	OmitCredentials bool               `json:"omitCredentials,omitempty"`
 	HostOverride    string             `json:"hostOverride,omitempty"`
 	Cookies         []CookieMeta       `json:"cookies,omitempty"`
 }

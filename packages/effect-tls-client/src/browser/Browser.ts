@@ -1,4 +1,4 @@
-import { Effect, Exit, Option, Schema, type Scope } from "effect";
+import { Effect, Exit, Option, Schema, Stream, type Scope } from "effect";
 import {
   SessionConfig,
   TlsClient,
@@ -16,13 +16,49 @@ import type { BridgeError } from "../internal/Errors.js";
 import {
   BrowserScriptError,
   runBoundedScript,
+  type BrowserScriptHost,
+  type BrowserScriptNetworkResponse,
+  type BrowserScriptRequest,
   type BrowserScriptRuntime,
 } from "./BrowserScript.js";
+import {
+  normalizeAllowedOrigins,
+  resolveAllowedUrl,
+  scriptOrigin,
+} from "./ScriptPolicy.js";
 
 const MAX_REDIRECTS = 15;
 const MAX_CHALLENGE_RETRIES = 1;
 const MAX_CONFIG_REDIRECTS = 100;
 const MAX_CONFIG_CHALLENGE_RETRIES = 10;
+const MAX_SCRIPT_REQUESTS = 8;
+const MAX_SCRIPT_REDIRECTS = 5;
+const MAX_SCRIPT_RESPONSE_BYTES = 64 * 1024;
+const MAX_SCRIPT_NETWORK_BYTES = 1024 * 1024;
+const MAX_SCRIPT_HEADERS = 128;
+const MAX_SCRIPT_HEADER_BYTES = 64 * 1024;
+const SCRIPT_CONTROLLED_HEADERS = new Set([
+  "accept-encoding",
+  "connection",
+  "content-length",
+  "cookie",
+  "host",
+  "origin",
+  "proxy-authorization",
+  "proxy-connection",
+  "referer",
+  "transfer-encoding",
+  "user-agent",
+]);
+const SCRIPT_METHODS = new Set([
+  "DELETE",
+  "GET",
+  "HEAD",
+  "OPTIONS",
+  "PATCH",
+  "POST",
+  "PUT",
+]);
 /** Cooperative interruption deadline; it cannot preempt synchronous handlers. */
 const CHALLENGE_HANDLER_TIMEOUT = "5 seconds";
 const LOCATION_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -470,6 +506,310 @@ const pageFrom = (
 const readBody = (response: TlsResponse): Effect.Effect<string, BridgeError> =>
   response.text;
 
+interface ScriptBody {
+  readonly text: string;
+  readonly bytes: number;
+}
+
+const readScriptBody = (
+  response: TlsResponse,
+): Effect.Effect<ScriptBody, BrowserScriptError> =>
+  response.stream.pipe(
+    Stream.runFoldEffect(
+      () => ({ chunks: [] as Array<Uint8Array>, bytes: 0 }),
+      (state, chunk) => {
+        const bytes = state.bytes + chunk.byteLength;
+        if (bytes > MAX_SCRIPT_RESPONSE_BYTES) {
+          return Effect.fail(
+            new BrowserScriptError({
+              reason: "script response exceeds the 64 KiB limit",
+            }),
+          );
+        }
+        state.chunks.push(chunk);
+        state.bytes = bytes;
+        return Effect.succeed(state);
+      },
+    ),
+    Effect.mapError((cause) =>
+      cause instanceof BrowserScriptError
+        ? cause
+        : new BrowserScriptError({
+            reason: "failed to read script response",
+            cause,
+          }),
+    ),
+    Effect.map(({ chunks, bytes }) => {
+      const output = new Uint8Array(bytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        output.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return { text: new TextDecoder().decode(output), bytes };
+    }),
+  );
+
+const makeScriptHost = (
+  transport: TlsSession,
+  pageUrl: string,
+  identityHeaders: ReadonlyArray<Pair>,
+  headerOrder: ReadonlyArray<string> | undefined,
+  allowedOrigins: ReadonlyArray<string>,
+): BrowserScriptHost => {
+  let requestCount = 0;
+  let networkBytes = 0;
+  const setCookie = (value: string) =>
+    transport.scriptCookies(pageUrl, [value]).pipe(
+      Effect.mapError(
+        (cause) =>
+          new BrowserScriptError({
+            reason: "failed to persist script cookie",
+            cause,
+          }),
+      ),
+    );
+  const request = (input: BrowserScriptRequest) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const validated = yield* Effect.try({
+          try: () => {
+            const method = input.method.toUpperCase();
+            if (!SCRIPT_METHODS.has(method)) {
+              throw new TypeError(
+                `unsupported script request method: ${method}`,
+              );
+            }
+            if (input.headers.length > MAX_SCRIPT_HEADERS) {
+              throw new TypeError(
+                "script request exceeds the header-count limit",
+              );
+            }
+            let headerBytes = 0;
+            for (const [name, value] of input.headers) {
+              if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/iu.test(name)) {
+                throw new TypeError(
+                  `invalid script request header name: ${name}`,
+                );
+              }
+              const lowerName = name.toLowerCase();
+              if (SCRIPT_CONTROLLED_HEADERS.has(lowerName)) {
+                throw new TypeError(
+                  `script cannot set the ${lowerName} header`,
+                );
+              }
+              if (/[\u0000-\u0008\u000a-\u001f\u007f]/u.test(value)) {
+                throw new TypeError(
+                  `invalid value for script request header: ${name}`,
+                );
+              }
+              headerBytes += new TextEncoder().encode(name + value).byteLength;
+              if (headerBytes > MAX_SCRIPT_HEADER_BYTES) {
+                throw new TypeError(
+                  "script request headers exceed the 64 KiB limit",
+                );
+              }
+            }
+            if (
+              (method === "GET" || method === "HEAD") &&
+              input.body !== null
+            ) {
+              throw new TypeError(
+                `${method} script requests cannot have a body`,
+              );
+            }
+            return {
+              method,
+              headers: [...input.headers],
+              body: input.body,
+            };
+          },
+          catch: (cause) =>
+            new BrowserScriptError({
+              reason:
+                cause instanceof Error
+                  ? cause.message
+                  : "invalid script request",
+              cause,
+            }),
+        });
+        let target = yield* Effect.try({
+          try: () => resolveAllowedUrl(input.url, pageUrl, allowedOrigins),
+          catch: (cause) =>
+            new BrowserScriptError({
+              reason:
+                cause instanceof Error
+                  ? cause.message
+                  : "script origin is not allowed",
+              cause,
+            }),
+        });
+        const pageOrigin = yield* Effect.try({
+          try: () => scriptOrigin(pageUrl),
+          catch: (cause) =>
+            new BrowserScriptError({
+              reason: "invalid page URL for script credentials",
+              cause,
+            }),
+        });
+        let method = validated.method;
+        let body = validated.body;
+        let headers = validated.headers;
+        let referer = pageUrl;
+
+        for (let redirect = 0; ; redirect += 1) {
+          if (++requestCount > MAX_SCRIPT_REQUESTS) {
+            return yield* new BrowserScriptError({
+              reason: `script network request budget exceeds ${MAX_SCRIPT_REQUESTS} requests`,
+            });
+          }
+          const outgoingHeaders = xhrHeaders(
+            identityHeaders,
+            target.toString(),
+            referer,
+            "",
+            headers,
+          );
+          const omitCredentials = target.origin !== pageOrigin;
+          const requestBytes = new TextEncoder().encode(
+            JSON.stringify({
+              url: target.toString(),
+              method,
+              headers: outgoingHeaders,
+              body,
+            }),
+          ).byteLength;
+          if (networkBytes + requestBytes > MAX_SCRIPT_NETWORK_BYTES) {
+            return yield* new BrowserScriptError({
+              reason: "script network byte budget exceeded",
+            });
+          }
+          networkBytes += requestBytes;
+          const response = yield* transport
+            .request(target.toString(), {
+              method,
+              headers: outgoingHeaders,
+              ...(headerOrder === undefined ? {} : { headerOrder }),
+              ...(body === null ? {} : { body }),
+              followRedirects: false,
+              omitCredentials,
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new BrowserScriptError({
+                    reason: "script network request failed",
+                    cause,
+                  }),
+              ),
+            );
+          const location = headerValue(response.headers, "location");
+          if (
+            LOCATION_REDIRECT_STATUSES.has(response.status) &&
+            location !== undefined
+          ) {
+            if (redirect >= MAX_SCRIPT_REDIRECTS) {
+              yield* response.close;
+              return yield* new BrowserScriptError({
+                reason: `script redirect limit exceeds ${MAX_SCRIPT_REDIRECTS} hops`,
+              });
+            }
+            const next = yield* Effect.try({
+              try: () =>
+                resolveAllowedUrl(location, target.toString(), allowedOrigins),
+              catch: (cause) =>
+                new BrowserScriptError({
+                  reason:
+                    cause instanceof Error
+                      ? cause.message
+                      : "redirect origin is not allowed",
+                  cause,
+                }),
+            }).pipe(Effect.ensuring(response.close));
+            if (target.protocol === "https:" && next.protocol === "http:") {
+              return yield* new BrowserScriptError({
+                reason: "script redirect cannot downgrade from HTTPS to HTTP",
+              });
+            }
+            if (target.origin !== next.origin) {
+              headers = headers.filter(
+                ([name]) =>
+                  !["authorization", "proxy-authorization"].includes(
+                    name.toLowerCase(),
+                  ),
+              );
+            }
+            if (
+              (response.status === 303 && method !== "HEAD") ||
+              ((response.status === 301 || response.status === 302) &&
+                method === "POST")
+            ) {
+              method = "GET";
+              body = null;
+              headers = headers.filter(
+                ([name]) => name.toLowerCase() !== "content-type",
+              );
+            }
+            referer = target.toString();
+            target = next;
+            continue;
+          }
+
+          const result = yield* Effect.gen(function* () {
+            const safeHeaders = response.headers.filter(
+              ([name]) =>
+                name.toLowerCase() !== "set-cookie" &&
+                name.toLowerCase() !== "set-cookie2",
+            );
+            if (safeHeaders.length > MAX_SCRIPT_HEADERS) {
+              return yield* new BrowserScriptError({
+                reason: "script response exceeds the header-count limit",
+              });
+            }
+            const responseHeaderBytes = safeHeaders.reduce(
+              (total, [name, value]) =>
+                total + new TextEncoder().encode(name + value).byteLength,
+              0,
+            );
+            if (responseHeaderBytes > MAX_SCRIPT_HEADER_BYTES) {
+              return yield* new BrowserScriptError({
+                reason: "script response headers exceed the 64 KiB limit",
+              });
+            }
+            const bodyResult = yield* readScriptBody(response);
+            if (
+              networkBytes + responseHeaderBytes + bodyResult.bytes >
+              MAX_SCRIPT_NETWORK_BYTES
+            ) {
+              return yield* new BrowserScriptError({
+                reason: "script network byte budget exceeded",
+              });
+            }
+            networkBytes += responseHeaderBytes + bodyResult.bytes;
+            const cookie = yield* transport.scriptCookies(pageUrl).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new BrowserScriptError({
+                    reason: "failed to read script cookies",
+                    cause,
+                  }),
+              ),
+            );
+            return {
+              status: response.status,
+              url: response.url,
+              headers: safeHeaders,
+              body: bodyResult.text,
+              cookie,
+            } satisfies BrowserScriptNetworkResponse;
+          }).pipe(Effect.ensuring(response.close));
+          return result;
+        }
+      }),
+    );
+  return { request, setCookie };
+};
+
 interface Step {
   readonly current: string;
   readonly referer: string;
@@ -524,13 +864,36 @@ const makeBrowserSession = (
       );
     }
     return Effect.gen(function* () {
-      const visibleCookie = yield* transport.scriptCookies(response.url);
-      const result = yield* runBoundedScript(runtime, source, {
-        url: response.url,
-        cookie: visibleCookie,
-        userAgent: headerValue(identity.headers, "user-agent") ?? "",
+      yield* identityValidation;
+      const allowedOrigins = yield* Effect.try({
+        try: () => normalizeAllowedOrigins(runtime.allowedOrigins ?? []),
+        catch: (cause) =>
+          new BrowserScriptError({
+            reason: "invalid script network origin policy",
+            cause,
+          }),
       });
-      yield* transport.scriptCookies(response.url, result.setCookies);
+      const visibleCookie = yield* transport.scriptCookies(response.url);
+      const host = makeScriptHost(
+        transport,
+        response.url,
+        requestIdentityHeaders,
+        requestHeaderOrder,
+        allowedOrigins,
+      );
+      const result = yield* runBoundedScript(
+        runtime,
+        source,
+        {
+          url: response.url,
+          cookie: visibleCookie,
+          userAgent: headerValue(identity.headers, "user-agent") ?? "",
+        },
+        host,
+      );
+      if (result.setCookies.length > 0) {
+        yield* transport.scriptCookies(response.url, result.setCookies);
+      }
       return result.value;
     });
   };

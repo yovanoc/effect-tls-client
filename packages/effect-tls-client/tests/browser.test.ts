@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Context, Effect, Layer, Stream } from "effect";
+import { Context, Deferred, Effect, Fiber, Layer, Stream } from "effect";
 import { NodeServices } from "@effect/platform-node";
 import * as Cookies from "effect/unstable/http/Cookies";
 import type { TlsResponse, TlsSession } from "../src/TlsClient.js";
@@ -12,6 +12,8 @@ import {
   navigationHeaders,
   runBoundedScript,
   xhrHeaders,
+  type BrowserScriptHost,
+  type BrowserScriptRuntime,
 } from "../src/browser/index.js";
 
 const bodyBytes = (body: string): Uint8Array => new TextEncoder().encode(body);
@@ -42,6 +44,21 @@ const response = (
   close: Effect.sync(onClose),
 });
 
+const hostRuntime = (
+  allowedOrigins: ReadonlyArray<string>,
+  evaluate: (
+    host: BrowserScriptHost,
+  ) => Effect.Effect<string, BrowserScriptError>,
+): BrowserScriptRuntime => ({
+  allowedOrigins,
+  evaluate: (_source, _context, host) =>
+    host === undefined
+      ? Effect.fail(
+          new BrowserScriptError({ reason: "script host unavailable" }),
+        )
+      : evaluate(host).pipe(Effect.map((value) => ({ value, setCookies: [] }))),
+});
+
 const session = (
   calls: Array<Call>,
   respond: (url: string) => TlsResponse,
@@ -56,7 +73,7 @@ const session = (
   webSocket: () => Effect.die("unused"),
   cookies: () => Effect.die("unused"),
   setCookies: () => Effect.die("unused"),
-  scriptCookies: () => Effect.die("unused"),
+  scriptCookies: () => Effect.succeed(""),
   exportCookies: Effect.die("unused"),
   importCookies: () => Effect.die("unused"),
   bandwidth: Effect.succeed({ read: 0, written: 0 }),
@@ -376,6 +393,152 @@ describe("browser layer", () => {
     );
   });
 
+  it.effect("reassembles fragmented script response bodies", () => {
+    const calls: Array<Call> = [];
+    const content = "fragment-".repeat(512);
+    const chunks = Array.from(bodyBytes(content), (byte) =>
+      Uint8Array.of(byte),
+    );
+    let scriptValue = "";
+    const runtime = hostRuntime(["https://example.test"], (host) =>
+      host
+        .request({
+          kind: "fetch",
+          url: "https://example.test/asset",
+          method: "GET",
+          headers: [],
+          body: null,
+        })
+        .pipe(Effect.map(({ body }) => body)),
+    );
+    const browser = fromSession(
+      session(calls, (url) =>
+        url.endsWith("/asset")
+          ? {
+              ...response(url, 200, content),
+              stream: Stream.fromIterable(chunks),
+            }
+          : response(url, 202, "challenge", [
+              ["x-amzn-waf-action", "challenge"],
+            ]),
+      ),
+      Chrome152Identity,
+      {
+        scriptRuntime: runtime,
+        challengeHandler: (_challenge, context) =>
+          context.evaluate("read fragmented response").pipe(
+            Effect.tap((value) => Effect.sync(() => (scriptValue = value))),
+            Effect.flatMap(() => Effect.succeedNone),
+          ),
+      },
+    );
+
+    return Effect.gen(function* () {
+      yield* browser.navigate("https://example.test/challenge");
+      expect(scriptValue).toBe(content);
+      expect(calls.filter(({ url }) => url.endsWith("/asset"))).toHaveLength(1);
+    });
+  });
+
+  it.effect("enforces the script request quota", () => {
+    const calls: Array<Call> = [];
+    const runtime = hostRuntime(["https://example.test"], (host) =>
+      Effect.gen(function* () {
+        for (let index = 0; index < 9; index += 1) {
+          yield* host.request({
+            kind: "fetch",
+            url: `https://example.test/${index}`,
+            method: "GET",
+            headers: [],
+            body: null,
+          });
+        }
+        return "unreachable";
+      }),
+    );
+    const browser = fromSession(
+      session(calls, (url) =>
+        url.endsWith("/challenge")
+          ? response(url, 202, "challenge", [
+              ["x-amzn-waf-action", "challenge"],
+            ])
+          : response(url, 200, "ok"),
+      ),
+      Chrome152Identity,
+      {
+        scriptRuntime: runtime,
+        challengeHandler: (_challenge, context) =>
+          context
+            .evaluate("exceed request quota")
+            .pipe(Effect.flatMap(() => Effect.succeedNone)),
+      },
+    );
+
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        browser.navigate("https://example.test/challenge"),
+      );
+      expect(error).toBeInstanceOf(BrowserScriptError);
+      if (error._tag === "BrowserScriptError") {
+        expect(error.reason).toContain("8 requests");
+      }
+      expect(
+        calls.filter(({ url }) => !url.endsWith("/challenge")),
+      ).toHaveLength(8);
+    });
+  });
+
+  it.effect("denies a redirect outside the script origin allowlist", () => {
+    const calls: Array<Call> = [];
+    let redirectClosed = 0;
+    const runtime = hostRuntime(["https://example.test"], (host) =>
+      host
+        .request({
+          kind: "fetch",
+          url: "https://example.test/redirect",
+          method: "GET",
+          headers: [],
+          body: null,
+        })
+        .pipe(Effect.map(({ body }) => body)),
+    );
+    const browser = fromSession(
+      session(calls, (url) =>
+        url.endsWith("/redirect")
+          ? response(
+              url,
+              302,
+              "",
+              [["location", "https://blocked.test/target"]],
+              () => (redirectClosed += 1),
+            )
+          : response(url, 202, "challenge", [
+              ["x-amzn-waf-action", "challenge"],
+            ]),
+      ),
+      Chrome152Identity,
+      {
+        scriptRuntime: runtime,
+        challengeHandler: (_challenge, context) =>
+          context
+            .evaluate("follow redirect")
+            .pipe(Effect.flatMap(() => Effect.succeedNone)),
+      },
+    );
+
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(
+        browser.navigate("https://example.test/challenge"),
+      );
+      expect(error).toBeInstanceOf(BrowserScriptError);
+      if (error._tag === "BrowserScriptError") {
+        expect(error.reason).toContain("not allowed");
+      }
+      expect(calls).toHaveLength(2);
+      expect(redirectClosed).toBe(1);
+    });
+  });
+
   it.effect("bounds an optional caller-supplied script runtime", () => {
     const runtime = {
       evaluate: (source: string) =>
@@ -405,10 +568,16 @@ describe("browser layer", () => {
           userAgent: "fixture",
         },
       );
-      expect(result.value).toBe(
-        "visible=yes; clearance=ok|undefined|undefined",
-      );
+      expect(result.value).toBe("visible=yes; clearance=ok|function|undefined");
       expect(result.setCookies).toEqual(["clearance=ok; Path=/"]);
+      const unsupportedFetchCredentials = yield* runtime.evaluate(
+        'try { await fetch("https://example.test/", { credentials: "include" }); return "accepted"; } catch (error) { return error.message; }',
+      );
+      expect(unsupportedFetchCredentials.value).toContain("credentials mode");
+      const unsupportedXhrCredentials = yield* runtime.evaluate(
+        'const xhr = new XMLHttpRequest(); try { xhr.withCredentials = true; return "accepted"; } catch (error) { return error.message; }',
+      );
+      expect(unsupportedXhrCredentials.value).toContain("withCredentials");
       const blocked = yield* Effect.flip(
         runtime.evaluate(
           'return this.constructor.constructor("return process")().pid;',
@@ -437,13 +606,196 @@ describe("browser layer", () => {
         "return `${typeof __URL}|${typeof __cookieRead}|${typeof URL}|${typeof TextEncoder}|${typeof setTimeout}`;",
       );
       expect(hidden.value).toBe(
-        "undefined|undefined|undefined|undefined|undefined",
+        "undefined|undefined|undefined|undefined|function",
       );
     }).pipe(
       Effect.provide(
         BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
       ),
     ),
+  );
+
+  it.live("bridges fetch, script loading, cookies, and timers", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      let cookie = "";
+      const requests: Array<string> = [];
+      const host: BrowserScriptHost = {
+        request: (request) => {
+          requests.push(`${request.kind}:${request.url}`);
+          return Effect.succeed({
+            status: 200,
+            url: request.url,
+            headers: [],
+            body:
+              request.kind === "script"
+                ? 'globalThis.scriptLoaded = "yes";'
+                : "payload",
+            cookie,
+          });
+        },
+        setCookie: (value) => {
+          cookie = value.split(";", 1)[0] ?? "";
+          return Effect.succeed(cookie);
+        },
+      };
+      const result = yield* runtime.evaluate(
+        'document.cookie = "clearance=ok; Path=/"; await document.loadScript("/script.js"); const body = await fetch("/data").then((response) => response.text()); return `${window.scriptLoaded}|${body}|${document.cookie}`;',
+        {
+          url: "https://allowed.test/page",
+          cookie: "",
+          userAgent: "fixture",
+        },
+        host,
+      );
+      expect(result.value).toBe("yes|payload|clearance=ok");
+      expect(result.setCookies).toEqual([]);
+      expect(requests).toEqual([
+        "script:https://allowed.test/script.js",
+        "fetch:https://allowed.test/data",
+      ]);
+      const blocked = yield* runtime.evaluate(
+        'try { await fetch("https://blocked.test/data"); } catch (error) { return error.message; }',
+        {
+          url: "https://allowed.test/page",
+          cookie: "",
+          userAgent: "fixture",
+        },
+        host,
+      );
+      expect(blocked.value).toContain("not allowed");
+      expect(requests).toHaveLength(2);
+      const timer = yield* runtime.evaluate(
+        'return await new Promise((resolve) => setTimeout(() => resolve("fired"), 5));',
+      );
+      expect(timer.value).toBe("fired");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.live("does not overwrite a newer cookie with an in-flight fetch", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const staleRequestStarted = yield* Deferred.make<void>();
+      const cookieSyncObserved = yield* Deferred.make<void>();
+      const releaseStaleResponse = yield* Deferred.make<void>();
+      let cookie = "session=old";
+      const host: BrowserScriptHost = {
+        request: (request) => {
+          const responseCookie = cookie;
+          if (request.url.endsWith("/stale")) {
+            return Effect.gen(function* () {
+              yield* Deferred.succeed(staleRequestStarted, undefined);
+              yield* Deferred.await(releaseStaleResponse);
+              return {
+                status: 200,
+                url: request.url,
+                headers: [],
+                body: "stale",
+                cookie: responseCookie,
+              };
+            });
+          }
+          if (request.url.endsWith("/write-cookie.js")) {
+            return Effect.gen(function* () {
+              yield* Deferred.await(staleRequestStarted);
+              return {
+                status: 200,
+                url: request.url,
+                headers: [],
+                body: 'document.cookie = "session=new; Path=/";',
+                cookie: responseCookie,
+              };
+            });
+          }
+          if (request.url.endsWith("/after-write")) {
+            return Effect.gen(function* () {
+              yield* Deferred.succeed(cookieSyncObserved, undefined);
+              return yield* new BrowserScriptError({
+                reason: "cookie write was acknowledged",
+              });
+            });
+          }
+          return Effect.die(`unexpected script request: ${request.url}`);
+        },
+        setCookie: (value) =>
+          Effect.sync(() => {
+            cookie = value.split(";", 1)[0] ?? "";
+            return cookie;
+          }),
+      };
+      const fiber = yield* runtime
+        .evaluate(
+          'const stale = fetch("/stale"); await document.loadScript("/write-cookie.js"); await fetch("/after-write").catch(() => {}); await stale; return document.cookie;',
+          {
+            url: "https://allowed.test/page",
+            cookie,
+            userAgent: "fixture",
+          },
+          host,
+        )
+        .pipe(Effect.forkChild);
+
+      yield* Deferred.await(staleRequestStarted);
+      yield* Deferred.await(cookieSyncObserved);
+      yield* Deferred.succeed(releaseStaleResponse, undefined);
+      expect((yield* Fiber.join(fiber)).value).toBe("session=new");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.live(
+    "keeps rejected cookie writes out of authoritative script state",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        let writes = 0;
+        const host: BrowserScriptHost = {
+          request: (request) =>
+            Effect.succeed({
+              status: 200,
+              url: request.url,
+              headers: [],
+              body: "ok",
+              cookie: "session=stored",
+            }),
+          setCookie: () =>
+            Effect.sync(() => {
+              writes += 1;
+              return "session=stored";
+            }),
+        };
+        const result = yield* runtime.evaluate(
+          'const before = document.cookie; document.cookie = "rejected=shown; Domain=other.test; Path=/"; const immediate = document.cookie; await fetch("/data"); return [before, immediate, document.cookie].join("|");',
+          {
+            url: "https://allowed.test/page",
+            cookie: "session=stored",
+            userAgent: "fixture",
+          },
+          host,
+        );
+        expect(result.value).toBe(
+          "session=stored|session=stored|session=stored",
+        );
+        expect(result.setCookies).toEqual([]);
+        expect(writes).toBe(1);
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
   );
 
   it.live(

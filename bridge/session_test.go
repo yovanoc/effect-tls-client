@@ -78,6 +78,57 @@ func TestRequestHeadersPreserveOrderAndOverrideIdentity(t *testing.T) {
 	}
 }
 
+func TestRequestHeadersOmitCredentials(t *testing.T) {
+	headers, err := requestHeaders(
+		protocol.IdentityMeta{Headers: []protocol.HeaderPair{
+			{"Authorization", "identity-token"},
+			{"Proxy-Authorization", "proxy-token"},
+			{"Cookie", "identity-cookie"},
+			{"X-Identity", "identity"},
+		}},
+		protocol.RequestMeta{
+			OmitCredentials: true,
+			Headers: []protocol.HeaderPair{
+				{"Authorization", "request-token"},
+				{"Cookie", "request-cookie"},
+				{"X-Request", "request"},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie"} {
+		if hasHeader(headers, name) {
+			t.Errorf("credential header %q was not omitted", name)
+		}
+	}
+	if headers.Get("X-Identity") != "identity" || headers.Get("X-Request") != "request" {
+		t.Fatalf("non-credential headers were not preserved: %#v", headers)
+	}
+}
+
+func TestCookieJarOmitsCredentialsInBothDirections(t *testing.T) {
+	jar, err := newSessionCookieJar(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse("https://example.test/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.storeCookies(u, []*http.Cookie{{Name: "session", Value: "kept", Path: "/"}})
+	jar.beginCredentialOmission()
+	if got := jar.Cookies(u); len(got) != 0 {
+		t.Fatalf("outbound cookies = %#v, want none", got)
+	}
+	jar.SetCookies(u, []*http.Cookie{{Name: "response", Value: "ignored", Path: "/"}})
+	jar.endCredentialOmission()
+	if got := jar.cookiesFor(u); len(got) != 1 || got[0].Name != "session" {
+		t.Fatalf("stored cookies = %#v, want only the pre-existing session cookie", got)
+	}
+}
+
 func TestClassifyProxyErrors(t *testing.T) {
 	err := &net.OpError{Op: "proxyconnect", Err: errors.New("connection refused")}
 	if got := classifyRequestError(err); got != protocol.ErrorKindProxy {

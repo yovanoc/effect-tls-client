@@ -68,6 +68,7 @@ const RequestOptionsSchema = Schema.Struct({
     Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   ),
   followRedirects: Schema.optionalKey(Schema.Boolean),
+  omitCredentials: Schema.optionalKey(Schema.Boolean),
   hostOverride: Schema.optionalKey(Schema.String),
   body: Schema.optionalKey(Schema.Unknown),
   cookies: Schema.optionalKey(Schema.Unknown),
@@ -112,6 +113,7 @@ export interface RequestOptions {
   readonly headerOrder?: ReadonlyArray<string>;
   readonly timeoutMs?: number;
   readonly followRedirects?: boolean;
+  readonly omitCredentials?: boolean;
   readonly hostOverride?: string;
   readonly method?: string;
   readonly body?: RequestBody;
@@ -478,6 +480,7 @@ interface NormalizedRequest {
     readonly contentLength?: number;
     readonly timeoutMs?: number;
     readonly followRedirects?: boolean;
+    readonly omitCredentials?: boolean;
     readonly hostOverride?: string;
     readonly cookies?: ReadonlyArray<WireCookie>;
   };
@@ -751,6 +754,9 @@ const normalizeRequest = (
         ...(parsed.followRedirects === undefined
           ? {}
           : { followRedirects: parsed.followRedirects }),
+        ...(parsed.omitCredentials === undefined
+          ? {}
+          : { omitCredentials: parsed.omitCredentials }),
         ...(parsed.hostOverride === undefined
           ? {}
           : { hostOverride: parsed.hostOverride }),

@@ -131,6 +131,7 @@ Go validates strictly: exactly one of `profile`/`customProfile`, unknown profile
   contentLength?: number                  // known body length; omitted for an unknown stream
   timeoutMs?: number                      // per-request override; 0 = no timeout
   followRedirects?: boolean               // per-request override
+  omitCredentials?: boolean              // omit auth/cookies and ignore response Set-Cookie
   hostOverride?: string
   cookies?: Cookie[]                      // added to the Jar for this URL before sending
 }
@@ -138,6 +139,12 @@ Go validates strictly: exactly one of `profile`/`customProfile`, unknown profile
 Sequence: `request` → (`body.chunk`* → `body.end` if `hasBody`) … Go: `headers` → `chunk`* → `end`. `body.end` is sent only after the body producer completes; it is never inferred from response completion. If Go receives response headers before `body.end`, it closes the upload pipe with an explicit `request upload aborted after response headers` error, and the TS pump stops without sending `body.end`. The accepted response is still delivered and may finish with `end`; that response terminal frame does not claim that the upload completed. An upload producer failure before response headers sends `cancel` for Go cleanup, but the pending request reports the original `error{kind:"Body"}`.
 
 `contentLength` is the normalized request length. TS derives it for bytes, strings, and `FormData`, and validates any explicit `Content-Length` header against it; Go validates the value, sets the request's `ContentLength`, and removes the header before handing the request to the transport. Unknown-length streams omit it unless the caller supplies a valid matching header. `cookies` are inserted into the target session's Go Jar for this URL immediately before the request; they therefore persist in a named session and are scoped to the one ephemeral client for sessionless requests. Cookies rejected by the RFC Jar are ignored and cannot appear in a later export.
+
+`omitCredentials: true` strips `Authorization`, `Proxy-Authorization`, and `Cookie`
+from identity and request headers, skips request-cookie seeding and automatic Jar
+injection, and ignores response `Set-Cookie` updates for that request. The flag is
+scoped to the selected client's serialized request; explicit cookie operations
+remain independent. Browser script requests use it for cross-origin fetches.
 
 The public session API maps `cookies(url)` and `setCookies(url, Cookies.Cookies)` to `cookies.get/set`; an empty Jar is always returned as `cookies: []`. `Max-Age` is exposed as an absolute unix-second `expires` value, including in exports/imports, and expired cookies are pruned. `exportCookies` is an Effect containing Schema-validated JSON for the complete accepted Jar; `importCookies(json)` validates that JSON before sending it to Go. Host-only exported cookies keep their original `domain: ""` and carry an additive `origin` only so they can be restored in a fresh session. An explicit `Cookie` request header replaces automatic Jar injection for that request, unchanged; response `Set-Cookie` headers still update the Jar. Explicit headers are discouraged because they bypass the Jar's domain/path policy.
 

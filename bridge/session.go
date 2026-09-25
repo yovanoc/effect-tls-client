@@ -58,11 +58,12 @@ type cookieJarState struct {
 type sessionCookieJar struct {
 	state *cookieJarState
 
-	// fhttp asks the Jar for cookies before each redirect hop. This flag is
-	// scoped to one client, so an explicit Cookie header can suppress automatic
-	// Jar injection without disabling response Set-Cookie processing.
-	skipMu        sync.Mutex
-	skipAutomatic bool
+	// fhttp asks the Jar for cookies before each redirect hop. These flags are
+	// scoped to one client request; explicit Cookie headers still accept response
+	// Set-Cookie values, while omitCredentials suppresses both directions.
+	skipMu          sync.Mutex
+	skipAutomatic   bool
+	omitCredentials bool
 }
 
 func newSessionCookieJar(strict bool) (*sessionCookieJar, error) {
@@ -95,10 +96,28 @@ func (j *sessionCookieJar) clearAutomaticCookieSkip() {
 	j.skipMu.Unlock()
 }
 
+func (j *sessionCookieJar) beginCredentialOmission() {
+	j.skipMu.Lock()
+	j.omitCredentials = true
+	j.skipMu.Unlock()
+}
+
+func (j *sessionCookieJar) endCredentialOmission() {
+	j.skipMu.Lock()
+	j.omitCredentials = false
+	j.skipMu.Unlock()
+}
+
 func (j *sessionCookieJar) skipsAutomaticCookies() bool {
 	j.skipMu.Lock()
 	defer j.skipMu.Unlock()
-	return j.skipAutomatic
+	return j.skipAutomatic || j.omitCredentials
+}
+
+func (j *sessionCookieJar) skipsResponseCookies() bool {
+	j.skipMu.Lock()
+	defer j.skipMu.Unlock()
+	return j.omitCredentials
 }
 
 func cloneCookie(cookie *http.Cookie) *http.Cookie {
@@ -354,6 +373,13 @@ func (j *sessionCookieJar) Cookies(u *url.URL) []*http.Cookie {
 }
 
 func (j *sessionCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	if j.skipsResponseCookies() {
+		return
+	}
+	j.storeCookies(u, cookies)
+}
+
+func (j *sessionCookieJar) storeCookies(u *url.URL, cookies []*http.Cookie) {
 	if u == nil || len(cookies) == 0 {
 		return
 	}
@@ -385,6 +411,14 @@ func (j *sessionCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 			sameSite:   candidate.SameSite,
 		}
 	}
+}
+
+func setClientCookies(client tlsClient.HttpClient, u *url.URL, cookies []*http.Cookie) {
+	if jar, ok := client.GetCookieJar().(*sessionCookieJar); ok {
+		jar.storeCookies(u, cookies)
+		return
+	}
+	client.SetCookies(u, cookies)
 }
 
 func (j *sessionCookieJar) GetAllCookies() map[string][]*http.Cookie {
@@ -1193,7 +1227,7 @@ func (d *dispatcher) runCookiesSet(ctx context.Context, op *operation, meta prot
 		_ = d.finishCancelled(op)
 		return
 	}
-	session.client.SetCookies(parsed, converted)
+	setClientCookies(session.client, parsed, converted)
 	releaseProxy()
 	_ = d.finishOK(op)
 }
@@ -1254,7 +1288,7 @@ func (d *dispatcher) runCookiesImport(ctx context.Context, op *operation, meta p
 		return
 	}
 	for _, item := range converted {
-		session.client.SetCookies(item.url, []*http.Cookie{item.cookie})
+		setClientCookies(session.client, item.url, []*http.Cookie{item.cookie})
 	}
 	releaseProxy()
 	_ = d.finishOK(op)
@@ -1723,9 +1757,27 @@ func mergeHeaderPairs(identity, request []protocol.HeaderPair) ([]protocol.Heade
 	return append(merged, request...), nil
 }
 
+func withoutCredentials(headers []protocol.HeaderPair) []protocol.HeaderPair {
+	result := make([]protocol.HeaderPair, 0, len(headers))
+	for _, pair := range headers {
+		switch strings.ToLower(pair[0]) {
+		case "authorization", "proxy-authorization", "cookie":
+			continue
+		default:
+			result = append(result, pair)
+		}
+	}
+	return result
+}
+
 func requestHeaders(identity protocol.IdentityMeta, request protocol.RequestMeta) (http.Header, error) {
 	identityHeaders := identity.Headers
-	merged, err := mergeHeaderPairs(identityHeaders, request.Headers)
+	requestHeaders := request.Headers
+	if request.OmitCredentials {
+		identityHeaders = withoutCredentials(identityHeaders)
+		requestHeaders = withoutCredentials(requestHeaders)
+	}
+	merged, err := mergeHeaderPairs(identityHeaders, requestHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -2125,12 +2177,17 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		return
 	}
 	defer releaseBandwidth()
-	if err := setRequestCookies(client, parsedURL, meta.Cookies); err != nil {
-		fail(protocol.ErrorKindInvalidConfig, err.Error())
-		return
+	if !meta.OmitCredentials {
+		if err := setRequestCookies(client, parsedURL, meta.Cookies); err != nil {
+			fail(protocol.ErrorKindInvalidConfig, err.Error())
+			return
+		}
 	}
-	if hasHeader(req.Header, "Cookie") {
-		if jar, ok := client.GetCookieJar().(*sessionCookieJar); ok {
+	if jar, ok := client.GetCookieJar().(*sessionCookieJar); ok {
+		if meta.OmitCredentials {
+			jar.beginCredentialOmission()
+			defer jar.endCredentialOmission()
+		} else if hasHeader(req.Header, "Cookie") {
 			jar.skipAutomaticCookies()
 			defer jar.clearAutomaticCookieSkip()
 		}

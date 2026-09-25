@@ -92,11 +92,25 @@ const browser = yield* Browser.open(config, {
 ```
 
 `BrowserMock` is an optional process-backed runtime for reviewed challenge
-scripts. It adds only `document.cookie`, a read-only `location.href`, a small
-`navigator`, `console`, and `Promise` to a fresh VM context. URL constructors,
-encoding/timer primitives, `fetch`, XHR, WebSocket, DOM constructors,
-filesystem, and process APIs are intentionally absent; network work stays in
-the host `TlsSession`:
+scripts. A fresh VM context exposes `document.cookie`, read-only location data,
+a small `navigator` and `console`, Promise-based `fetch`, asynchronous
+`XMLHttpRequest`, `document.loadScript`, and bounded `setTimeout`/
+`clearTimeout`. It does not expose `process`, filesystem, WebSocket, or general
+DOM APIs. Network operations are serialized to the host and made through the
+same scoped `TlsSession`; Go remains authoritative for cookies.
+
+Network access is denied unless each origin is explicitly configured. HTTPS
+origins must be allowlisted; plain HTTP is allowed only for loopback origins.
+Redirects are followed manually, each hop must satisfy the same policy,
+HTTPS-to-HTTP downgrades are rejected, and authorization headers are removed on
+cross-origin redirects. The default allowlist is empty. Configure the runtime
+layer with only the exact origins required:
+
+```ts
+const runtimeLayer = Browser.BrowserMock.layer({
+  allowedOrigins: ["https://challenge.example.test"],
+});
+```
 
 ```ts
 const scriptRuntime = yield* Browser.BrowserMock;
@@ -114,29 +128,44 @@ const browser = yield* Browser.open(config, {
 });
 ```
 
-The runtime starts a fresh child process for each evaluation and kills it on the
-bounded timeout. It always starts Node with `--permission` and verifies that
-its permission API reports `process.permission.has("net") === false` before
-reading the script. This requires a modern Node release with network permission
-support (Node 25+ currently); Node 22's stable permission model does not deny
-network access and is rejected. Older or incompatible executables fail closed
-rather than falling back to the older experimental flag.
-A Bun host delegates to an available Node executable; configure
-`BrowserMock.layer({ executable: "..." })` when `node` is not on `PATH`.
+The bridge is intentionally small: up to 8 network requests (4 concurrent),
+16 KiB per request body, 64 KiB per response body, 1 MiB of total network data,
+64 KiB/64 writes of script cookies, 64 active timers, and 256 timer firings.
+Timers are capped at 120 seconds. Evaluation defaults to a 2-second hard
+process deadline (configurable up to 120 seconds); the child and its timers are
+terminated on completion, failure, timeout, or scope closure. Fetch supports
+string URLs and string bodies, same-origin credentials, and normal follow
+redirects only. Credentials are sent only when each request hop matches the
+page origin: cross-origin fetches remain allowed, but session Authorization,
+Proxy-Authorization, Jar cookies, and response Set-Cookie updates are omitted.
+Fetch modes other than `same-origin` and XHR `withCredentials = true` reject.
+XHR is asynchronous and supports string bodies. Unsupported browser options
+reject rather than silently changing their meaning.
 
-Script cookie reads and writes cross the `cookies.script` Bridge operation. Go
-filters `HttpOnly` cookies using the request URL and applies raw script writes
+The runtime always starts Node with `--permission` and verifies that its
+permission API reports `process.permission.has("net") === false` before reading
+the script. This requires Node 25+; older or incompatible executables fail
+closed rather than falling back to an experimental permission flag. A Bun host
+delegates to Node; configure `BrowserMock.layer({ executable: "..." })` when
+`node` is not on `PATH`.
+
+Script cookie reads and writes use the `cookies.script` Bridge operation. Go
+filters `HttpOnly` cookies using the page URL and applies raw script writes
 under the authoritative Jar lock, ignoring `HttpOnly` writes and exact
-name/domain/path overwrites of existing `HttpOnly` cookies. The browser layer
-therefore does not export, mirror, or re-import cookie state. This is not a
-malicious-code sandbox: Node's permission model has documented limitations, and
-`node:vm` is only the evaluator context, never the security boundary. Run
-reviewed vendor scripts only; do not pass arbitrary attacker-controlled source.
-There is no guaranteed child memory cap; source/output limits and the timeout do
-not bound allocations. `runBoundedScript` still limits source/result to 64 KiB,
-and the five-second challenge-handler timeout remains cooperative. The package
-does not provide an AWS WAF solver or vendor-specific handler, and a handler
-must not claim success without verifying the follow-up response.
+name/domain/path overwrites of existing `HttpOnly` cookies. Response
+`Set-Cookie` headers are not exposed to scripts. `document.cookie` writes cross
+the asynchronous Bridge, so a synchronous read immediately after assignment
+can still show the previous value. Pending writes are committed before a
+network request or evaluation completes, and the authoritative Jar value then
+replaces the script view; rejected `HttpOnly`, domain, path, or secure writes
+never become visible after synchronization. This is not a malicious-code
+sandbox: Node's permission model has documented limitations, and `node:vm` is
+only the evaluator context, never the security boundary. Run reviewed vendor
+scripts only; do not pass arbitrary attacker-controlled source. There is no
+guaranteed child memory cap; size limits and the deadline do not bound
+allocations. The package does not provide an AWS WAF solver or vendor-specific
+handler, and a handler must not claim success without verifying the follow-up
+response.
 
 The layer preserves raw transport behavior: callers that do not use the
 browser subpath continue to control redirects, headers, cookies, and response
