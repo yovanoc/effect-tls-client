@@ -12,19 +12,31 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const bootstrap = String.raw`
 (() => {
   const post = __post;
-  // Keep host randomness private; only primitive bytes cross into the VM.
+  // Host helpers exchange only primitives; no host objects enter the VM.
   const hostRandomBytes = __randomBytes;
+  const hostEncodeBlobText = __encodeBlobText;
+  const hostDecodeBlobText = __decodeBlobText;
   const NativeUint8Array = Uint8Array;
+  const NativeArrayBuffer = ArrayBuffer;
+  const NativePromise = Promise;
   const NativeError = Error;
   const NativeTypeError = TypeError;
+  const NativeString = String;
+  const NativeNumber = Number;
+  const mathTrunc = Math.trunc;
   const apply = Reflect.apply;
-  const isView = ArrayBuffer.isView;
+  const isView = NativeArrayBuffer.isView;
   const typedArrayPrototype = Object.getPrototypeOf(NativeUint8Array.prototype);
   const typedArrayTag = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag).get;
   const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, "buffer").get;
   const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteOffset").get;
   const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteLength").get;
+  const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, "buffer").get;
+  const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, "byteOffset").get;
+  const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
+  const arrayBufferByteLength = Object.getOwnPropertyDescriptor(NativeArrayBuffer.prototype, "byteLength").get;
   const stringCharCodeAt = String.prototype.charCodeAt;
+  const stringFromCharCode = String.fromCharCode;
   const getRandomValues = (array) => {
     if (!isView(array)) throw new NativeTypeError("crypto.getRandomValues expects an integer typed array");
     const tag = apply(typedArrayTag, array, []);
@@ -75,6 +87,166 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     return bytes;
   };
+  const MAX_BLOB_BYTES = 1024 * 1024;
+  const blobData = new WeakMap();
+  let blobBytesAllocated = 0;
+  const blobQuotaError = () => {
+    const error = new NativeError("Blob allocation exceeds the 1 MiB per-evaluation quota");
+    error.name = "QuotaExceededError";
+    return error;
+  };
+  const reserveBlobBytes = (size) => {
+    if (size < 0 || blobBytesAllocated + size > MAX_BLOB_BYTES) throw blobQuotaError();
+    blobBytesAllocated += size;
+  };
+  const normalizeBlobType = (value) => {
+    const text = value === undefined ? "" : NativeString(value);
+    for (let index = 0; index < text.length; index += 1) {
+      const code = apply(stringCharCodeAt, text, [index]);
+      if (code < 0x20 || code > 0x7e) return "";
+    }
+    reserveBlobBytes(text.length);
+    let result = "";
+    for (let index = 0; index < text.length; index += 1) {
+      const code = apply(stringCharCodeAt, text, [index]);
+      result += stringFromCharCode(code >= 0x41 && code <= 0x5a ? code + 0x20 : code);
+    }
+    return result;
+  };
+  const copyBlobRange = (buffer, byteOffset, byteLength) => {
+    reserveBlobBytes(byteLength);
+    const source = new NativeUint8Array(buffer, byteOffset, byteLength);
+    const copy = new NativeUint8Array(byteLength);
+    for (let index = 0; index < byteLength; index += 1) copy[index] = source[index];
+    return copy;
+  };
+  const getBlobData = (value) => {
+    const data = blobData.get(value);
+    if (data === undefined) throw new NativeTypeError("Blob method called on an incompatible receiver");
+    return data;
+  };
+  const relativeBlobIndex = (value, size) => {
+    const number = NativeNumber(value);
+    const integer = number !== number || number === 0 ? 0 : mathTrunc(number);
+    const index = integer < 0 ? size + integer : integer;
+    return index < 0 ? 0 : index > size ? size : index;
+  };
+  const blobByteString = (data) => {
+    let result = "";
+    for (let index = data.start; index < data.end; index += 1) {
+      result += stringFromCharCode(data.bytes[index]);
+    }
+    return result;
+  };
+  class Blob {
+    constructor(parts = [], options = {}) {
+      const init = options == null ? {} : options;
+      const endings = init.endings;
+      if (endings !== undefined && endings !== "transparent") {
+        throw new NativeTypeError("Blob endings must be 'transparent'; native endings are unsupported");
+      }
+      const type = normalizeBlobType(init.type);
+      const copiedParts = [];
+      let size = 0;
+      const sourceParts = parts == null ? [] : parts;
+      for (const part of sourceParts) {
+        let copy;
+        if (typeof part === "string") {
+          const encoded = hostEncodeBlobText(part, MAX_BLOB_BYTES - blobBytesAllocated);
+          if (encoded === null) throw blobQuotaError();
+          reserveBlobBytes(encoded.length);
+          copy = new NativeUint8Array(encoded.length);
+          for (let index = 0; index < encoded.length; index += 1) {
+            copy[index] = apply(stringCharCodeAt, encoded, [index]);
+          }
+        } else if (blobData.has(part)) {
+          const data = blobData.get(part);
+          copy = copyBlobRange(data.bytes.buffer, data.start, data.end - data.start);
+        } else if (isView(part)) {
+          let buffer;
+          let byteOffset;
+          let byteLength;
+          try {
+            buffer = apply(typedArrayBuffer, part, []);
+            byteOffset = apply(typedArrayByteOffset, part, []);
+            byteLength = apply(typedArrayByteLength, part, []);
+          } catch {
+            try {
+              buffer = apply(dataViewBuffer, part, []);
+              byteOffset = apply(dataViewByteOffset, part, []);
+              byteLength = apply(dataViewByteLength, part, []);
+            } catch {
+              throw new NativeTypeError("Blob view part is detached or invalid");
+            }
+          }
+          copy = copyBlobRange(buffer, byteOffset, byteLength);
+        } else {
+          let byteLength;
+          try {
+            byteLength = apply(arrayBufferByteLength, part, []);
+          } catch {
+            throw new NativeTypeError("Blob parts must be strings, ArrayBuffers, views, or Blobs");
+          }
+          copy = copyBlobRange(part, 0, byteLength);
+        }
+        copiedParts[copiedParts.length] = copy;
+        size += apply(typedArrayByteLength, copy, []);
+      }
+      const bytes = new NativeUint8Array(size);
+      let offset = 0;
+      for (let partIndex = 0; partIndex < copiedParts.length; partIndex += 1) {
+        const part = copiedParts[partIndex];
+        const length = apply(typedArrayByteLength, part, []);
+        for (let index = 0; index < length; index += 1) bytes[offset + index] = part[index];
+        offset += length;
+      }
+      blobData.set(this, { bytes, start: 0, end: size, type });
+    }
+    get size() {
+      const data = getBlobData(this);
+      return data.end - data.start;
+    }
+    get type() { return getBlobData(this).type; }
+    text() {
+      const data = getBlobData(this);
+      try {
+        reserveBlobBytes(data.end - data.start);
+        const text = hostDecodeBlobText(blobByteString(data));
+        if (text === null) throw new NativeError("Blob UTF-8 decoding failed");
+        return new NativePromise((resolve) => resolve(text));
+      } catch (error) {
+        return new NativePromise((_resolve, reject) => reject(error));
+      }
+    }
+    arrayBuffer() {
+      const data = getBlobData(this);
+      const size = data.end - data.start;
+      try {
+        reserveBlobBytes(size);
+        const bytes = new NativeUint8Array(size);
+        for (let index = 0; index < size; index += 1) bytes[index] = data.bytes[data.start + index];
+        return new NativePromise((resolve) => resolve(bytes.buffer));
+      } catch (error) {
+        return new NativePromise((_resolve, reject) => reject(error));
+      }
+    }
+    slice(start = 0, end, contentType = "") {
+      const data = getBlobData(this);
+      const size = data.end - data.start;
+      const first = relativeBlobIndex(start, size);
+      const last = end === undefined ? size : relativeBlobIndex(end, size);
+      const type = normalizeBlobType(contentType);
+      const result = new Blob();
+      blobData.set(result, {
+        bytes: data.bytes,
+        start: data.start + first,
+        end: data.start + (last > first ? last : first),
+        type,
+      });
+      return result;
+    }
+    stream() { throw new NativeTypeError("Blob.stream() is not supported by BrowserMock"); }
+  }
   const cookieMap = (value) => {
     const result = new Map();
     for (const part of String(value).split(";")) {
@@ -451,7 +623,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event });
+  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event, Blob });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
@@ -469,6 +641,17 @@ const readline = require("node:readline");
 const hostPerformance = require("node:perf_hooks").performance;
 const hostMonotonicNow = () => hostPerformance.now();
 const hostTimeOrigin = hostPerformance.timeOrigin;
+const hostEncodeBlobText = (text, maxBytes) => {
+  try {
+    if (typeof text !== "string" || !Number.isInteger(maxBytes) || maxBytes < 0) return null;
+    if (Buffer.byteLength(text, "utf8") > maxBytes) return null;
+    return Buffer.from(text, "utf8").toString("latin1");
+  } catch { return null; }
+};
+const hostDecodeBlobText = (bytes) => {
+  try { return typeof bytes === "string" ? Buffer.from(bytes, "latin1").toString("utf8") : null; }
+  catch { return null; }
+};
 const { randomFillSync: hostRandomFillSync } = require("node:crypto");
 const MAX_RANDOM_BYTES = 65536;
 const hostRandomBytes = (byteLength) => {
@@ -542,6 +725,8 @@ const start = (input) => {
     __performanceNow: hostMonotonicNow,
     __performanceTimeOrigin: hostTimeOrigin,
     __randomBytes: hostRandomBytes,
+    __encodeBlobText: hostEncodeBlobText,
+    __decodeBlobText: hostDecodeBlobText,
   });
   context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
   vm.runInContext(bootstrap, context);
@@ -554,6 +739,8 @@ const start = (input) => {
   delete sandbox.__performanceNow;
   delete sandbox.__performanceTimeOrigin;
   delete sandbox.__randomBytes;
+  delete sandbox.__encodeBlobText;
+  delete sandbox.__decodeBlobText;
   const wrapper = "(async function () {\n" +
     "  const snapshot = __cookieSnapshot; const flush = __cookieFlush; const describe = __safeMessage;\n" +
     "  delete globalThis.__cookieSnapshot; delete globalThis.__cookieFlush; delete globalThis.__safeMessage;\n" +

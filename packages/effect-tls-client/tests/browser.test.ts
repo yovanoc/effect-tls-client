@@ -694,6 +694,112 @@ describe("browser layer", () => {
     ),
   );
 
+  it.live("implements bounded, context-local Blob operations", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runtime.evaluate(`
+        const input = new Uint8Array([120, 97, 98, 121]);
+        const view = new Uint8Array(input.buffer, 1, 2);
+        const blob = new Blob(["雪", view], { type: "TEXT/PLAIN" });
+        view[0] = 0x7a;
+        const buffer = await blob.arrayBuffer();
+        const bytes = Array.from(new Uint8Array(buffer));
+        new Uint8Array(buffer)[3] = 0x7a;
+        const text = await blob.text();
+        const slice = blob.slice(-2, 99, "APPLICATION/OCTET-STREAM");
+        const sliceText = await slice.text();
+        const dataView = new DataView(new Uint8Array([0, 67, 68, 0]).buffer, 1, 2);
+        const nested = new Blob([blob, dataView, "!"]);
+        const nestedText = await nested.text();
+        const sourceBuffer = new Uint8Array([88, 89]).buffer;
+        const copiedBuffer = new Blob([sourceBuffer]);
+        new Uint8Array(sourceBuffer)[0] = 90;
+        const bufferText = await copiedBuffer.text();
+        const unsupportedStream = (() => {
+          try { blob.stream(); return false; }
+          catch (error) { return error instanceof TypeError && error.constructor === TypeError; }
+        })();
+        const blocked = (value) => {
+          try { value.constructor.constructor("return process")(); return false; }
+          catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+        };
+        return JSON.stringify({
+          sameConstructor: Blob === window.Blob,
+          size: blob.size,
+          type: blob.type,
+          bytes: bytes.join(","),
+          text,
+          sliceSize: slice.size,
+          sliceType: slice.type,
+          sliceText,
+          emptySlices: blob.slice(4, 2).size === 0 && blob.slice(99).size === 0,
+          nestedText,
+          bufferText,
+          promiseRealm: blob.text() instanceof Promise && Object.getPrototypeOf(blob.text()) === Promise.prototype,
+          arrayBufferRealm: Object.getPrototypeOf(buffer) === ArrayBuffer.prototype,
+          invalidMimeType: new Blob([], { type: "text/é" }).type === "",
+          unsupportedStream,
+          workersAbsent: typeof Worker === "undefined",
+          hostGlobalsAbsent: [typeof process, typeof Buffer, typeof require, typeof __encodeBlobText, typeof __decodeBlobText].every((value) => value === "undefined"),
+          hostEscapeBlocked: blocked(blob) && blocked(blob.text()),
+        });
+      `);
+      expect(JSON.parse(result.value)).toEqual({
+        sameConstructor: true,
+        size: 5,
+        type: "text/plain",
+        bytes: "233,155,170,97,98",
+        text: "雪ab",
+        sliceSize: 2,
+        sliceType: "application/octet-stream",
+        sliceText: "ab",
+        emptySlices: true,
+        nestedText: "雪abCD!",
+        bufferText: "XY",
+        promiseRealm: true,
+        arrayBufferRealm: true,
+        invalidMimeType: true,
+        unsupportedStream: true,
+        workersAbsent: true,
+        hostGlobalsAbsent: true,
+        hostEscapeBlocked: true,
+      });
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.live("enforces the context-local Blob allocation quota", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runtime.evaluate(`
+        const localQuotaError = (error) => error instanceof Error &&
+          error.constructor === Error && Object.getPrototypeOf(error) === Error.prototype &&
+          error.name === "QuotaExceededError";
+        let oversizedRejected = false;
+        try { new Blob(["x".repeat(1024 * 1024 + 1)]); }
+        catch (error) { oversizedRejected = localQuotaError(error); }
+        const blob = new Blob(["x".repeat(1024 * 1024)]);
+        let constructorRejected = false;
+        try { new Blob(["x"]); }
+        catch (error) { constructorRejected = localQuotaError(error); }
+        const read = blob.arrayBuffer();
+        const localPromise = read instanceof Promise && Object.getPrototypeOf(read) === Promise.prototype;
+        let readRejected = false;
+        try { await read; }
+        catch (error) { readRejected = localQuotaError(error); }
+        return [blob.size, oversizedRejected, constructorRejected, localPromise, readRejected].join("|");
+      `);
+      expect(result.value).toBe("1048576|true|true|true|true");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
   it.effect("dispatches context-local document and window events", () =>
     Effect.gen(function* () {
       const runtime = yield* BrowserMock;

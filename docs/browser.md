@@ -111,8 +111,14 @@ first and registration order within each group; duplicate
 `dispatchEvent` accepts only this runtime's synthetic `Event` instances
 (`isTrusted` is always `false`). There is no DOM tree, event propagation, or
 automatic lifecycle/user-event delivery. Listener exceptions are reported as
-`BrowserScriptError` and fail evaluation. It does not expose `process`,
-filesystem, WebSocket, or general DOM APIs. Network operations
+`BrowserScriptError` and fail evaluation. Context-local `Blob` supports UTF-8
+strings, ArrayBuffers, views, nested Blobs, `size`, `type`, `text()`,
+`arrayBuffer()`, and `slice()`. Its cumulative per-evaluation allocation quota
+is 1 MiB, including Blob data, type metadata, and materialized text/ArrayBuffer
+copies; quota failures use context-local `QuotaExceededError`. `Blob.stream()`
+and native line endings explicitly reject. Workers, object URLs, and Blob
+network bodies are not provided. It does not expose `process`, filesystem,
+WebSocket, or general DOM APIs. Network operations
 are serialized to the host and made through the same scoped `TlsSession`; Go
 remains authoritative for cookies.
 
