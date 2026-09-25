@@ -33,7 +33,8 @@ const MAX_CONFIG_REDIRECTS = 100;
 const MAX_CONFIG_CHALLENGE_RETRIES = 10;
 const MAX_SCRIPT_REQUESTS = 8;
 const MAX_SCRIPT_REDIRECTS = 5;
-const MAX_SCRIPT_RESPONSE_BYTES = 64 * 1024;
+const MAX_FETCH_RESPONSE_BYTES = 64 * 1024;
+const MAX_SCRIPT_ASSET_BYTES = 1024 * 1024;
 const MAX_SCRIPT_NETWORK_BYTES = 1024 * 1024;
 const MAX_SCRIPT_HEADERS = 128;
 const MAX_SCRIPT_HEADER_BYTES = 64 * 1024;
@@ -513,18 +514,16 @@ interface ScriptBody {
 
 const readScriptBody = (
   response: TlsResponse,
+  maxBytes: number,
+  limitReason: string,
 ): Effect.Effect<ScriptBody, BrowserScriptError> =>
   response.stream.pipe(
     Stream.runFoldEffect(
       () => ({ chunks: [] as Array<Uint8Array>, bytes: 0 }),
       (state, chunk) => {
         const bytes = state.bytes + chunk.byteLength;
-        if (bytes > MAX_SCRIPT_RESPONSE_BYTES) {
-          return Effect.fail(
-            new BrowserScriptError({
-              reason: "script response exceeds the 64 KiB limit",
-            }),
-          );
+        if (bytes > maxBytes) {
+          return Effect.fail(new BrowserScriptError({ reason: limitReason }));
         }
         state.chunks.push(chunk);
         state.bytes = bytes;
@@ -765,7 +764,15 @@ const makeScriptHost = (
                 name.toLowerCase() !== "set-cookie" &&
                 name.toLowerCase() !== "set-cookie2",
             );
-            const bodyResult = yield* readScriptBody(response);
+            const bodyResult = yield* readScriptBody(
+              response,
+              input.kind === "script"
+                ? MAX_SCRIPT_ASSET_BYTES
+                : MAX_FETCH_RESPONSE_BYTES,
+              input.kind === "script"
+                ? "script asset exceeds the 1 MiB limit"
+                : "script fetch response exceeds the 64 KiB limit",
+            );
             if (networkBytes + bodyResult.bytes > MAX_SCRIPT_NETWORK_BYTES) {
               return yield* new BrowserScriptError({
                 reason: "script network byte budget exceeded",

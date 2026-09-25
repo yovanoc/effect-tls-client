@@ -129,18 +129,27 @@ const browser = yield* Browser.open(config, {
 ```
 
 The bridge is intentionally small: up to 8 network requests (4 concurrent),
-16 KiB per request body, 64 KiB per response body, 1 MiB of total network data,
-64 KiB/64 writes of script cookies, 64 active timers, and 256 timer firings.
-Timers are capped at 120 seconds. Evaluation defaults to a 2-second hard
-process deadline (configurable up to 120 seconds); the child and its timers are
-terminated on completion, failure, timeout, or scope closure. Fetch supports
-string URLs and string bodies, same-origin credentials, and normal follow
-redirects only. Credentials are sent only when each request hop matches the
-page origin: cross-origin fetches remain allowed, but session Authorization,
-Proxy-Authorization, Jar cookies, and response Set-Cookie updates are omitted.
-Fetch modes other than `same-origin` and XHR `withCredentials = true` reject.
-XHR is asynchronous and supports string bodies. Unsupported browser options
-reject rather than silently changing their meaning.
+16 KiB per request body, 64 KiB per fetch/XHR response, 1 MiB per
+`document.loadScript` asset, and 1 MiB of total network data per evaluation
+(including serialized requests, response headers, and bodies). The 64 KiB
+initial `context.evaluate` source limit is separate from the network-loaded
+script asset limit. Host-to-runner network-response JSON IPC is capped at 8 MiB
+per line, and all host-to-runner messages share an 8 MiB evaluation budget;
+startup and control lines remain capped at 128 KiB. This covers the sixfold
+worst-case JSON escaping of a 1 MiB body plus bounded headers and cookie state.
+Runner-to-host IPC remains capped at 128 KiB per line and 1 MiB per evaluation.
+Script cookie state and writes are capped at 64 KiB, with at most 64 writes,
+64 active timers, and 256 timer firings. Timers are capped at 120 seconds.
+Evaluation defaults to a 2-second hard process deadline (configurable up to
+120 seconds); the child and its timers are terminated on completion, failure,
+timeout, or scope closure. Fetch supports string URLs and string bodies,
+same-origin credentials, and normal follow redirects only. Credentials are
+sent only when each request hop matches the page origin: cross-origin fetches
+remain allowed, but session Authorization, Proxy-Authorization, Jar cookies,
+and response Set-Cookie updates are omitted. Fetch modes other than
+`same-origin` and XHR `withCredentials = true` reject. XHR is asynchronous and
+supports string bodies. Unsupported browser options reject rather than
+silently changing their meaning.
 
 The runtime always starts Node with `--permission` and verifies that its
 permission API reports `process.permission.has("net") === false` before reading

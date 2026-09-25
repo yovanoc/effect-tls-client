@@ -23,12 +23,15 @@ import { normalizeAllowedOrigins, resolveAllowedUrl } from "./ScriptPolicy.js";
 const DEFAULT_TIMEOUT_MS = 2_000;
 const MAX_SOURCE_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
-const MAX_INPUT_BYTES = 1024 * 1024;
-const MAX_IPC_LINE_BYTES = 128 * 1024;
+const MAX_INPUT_BYTES = 8 * 1024 * 1024;
+const MAX_INPUT_LINE_BYTES = 8 * 1024 * 1024;
+const MAX_CONTROL_INPUT_LINE_BYTES = 128 * 1024;
+const MAX_OUTPUT_LINE_BYTES = 128 * 1024;
 const MAX_NETWORK_REQUESTS = 8;
 const MAX_CONCURRENT_REQUESTS = 4;
 const MAX_REQUEST_BODY_BYTES = 16 * 1024;
 const MAX_RESPONSE_BYTES = 64 * 1024;
+const MAX_SCRIPT_ASSET_BYTES = 1024 * 1024;
 const MAX_TOTAL_NETWORK_BYTES = 1024 * 1024;
 const MAX_COOKIE_BYTES = 64 * 1024;
 const MAX_COOKIE_WRITES = 64;
@@ -127,7 +130,9 @@ const RunnerStartJson = Schema.fromJsonString(RunnerStart);
 const RunnerMessageJson = Schema.fromJsonString(RunnerMessage);
 
 const RUNNER_SOURCE = makeBrowserScriptRunnerSource({
-  maxIpcLineBytes: MAX_IPC_LINE_BYTES,
+  maxInputLineBytes: MAX_INPUT_LINE_BYTES,
+  maxControlInputLineBytes: MAX_CONTROL_INPUT_LINE_BYTES,
+  maxOutputLineBytes: MAX_OUTPUT_LINE_BYTES,
   maxCookieBytes: MAX_COOKIE_BYTES,
   maxCookieWrites: MAX_COOKIE_WRITES,
   maxTimers: MAX_TIMERS,
@@ -145,6 +150,9 @@ const hostProcess =
 const lineBytes = (line: string): number =>
   new TextEncoder().encode(line).byteLength;
 
+const exceedsCookieLimit = (cookie: string): boolean =>
+  cookie.length > MAX_COOKIE_BYTES || lineBytes(cookie) > MAX_COOKIE_BYTES;
+
 const makeEvaluate = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   options: BrowserMockOptions,
@@ -159,9 +167,24 @@ const makeEvaluate = (
     },
     host?: BrowserScriptHost,
   ): Effect.fn.Return<BrowserScriptResult, BrowserScriptError> {
-    if (new TextEncoder().encode(source).byteLength > MAX_SOURCE_BYTES) {
+    if (
+      source.length > MAX_SOURCE_BYTES ||
+      new TextEncoder().encode(source).byteLength > MAX_SOURCE_BYTES
+    ) {
       return yield* new BrowserScriptError({
         reason: "script source exceeds the 64 KiB limit",
+      });
+    }
+    if (
+      exceedsCookieLimit(context.cookie) ||
+      source.length +
+        context.url.length +
+        context.cookie.length +
+        context.userAgent.length >
+        MAX_CONTROL_INPUT_LINE_BYTES
+    ) {
+      return yield* new BrowserScriptError({
+        reason: "script IPC start input exceeds its 128 KiB limit",
       });
     }
     const start = yield* Schema.encodeEffect(RunnerStartJson)({
@@ -190,6 +213,14 @@ const makeEvaluate = (
         ? { PATH: hostProcess.env["PATH"] }
         : {};
     const startLine = new TextEncoder().encode(`${start}\n`);
+    if (
+      startLine.byteLength > MAX_CONTROL_INPUT_LINE_BYTES ||
+      startLine.byteLength > MAX_INPUT_BYTES
+    ) {
+      return yield* new BrowserScriptError({
+        reason: "script IPC start input exceeds its 128 KiB limit",
+      });
+    }
     const output = yield* Effect.scoped(
       Effect.gen(function* () {
         const handle = yield* spawner
@@ -230,6 +261,7 @@ const makeEvaluate = (
 
         const writeInput = (
           message: unknown,
+          maxLineBytes = MAX_CONTROL_INPUT_LINE_BYTES,
         ): Effect.Effect<void, BrowserScriptError> =>
           Effect.gen(function* () {
             const validated = yield* Schema.decodeUnknownEffect(
@@ -243,16 +275,27 @@ const makeEvaluate = (
                   }),
               ),
             );
+            const cookie =
+              validated.type === "cookie.sync"
+                ? validated.cookie
+                : validated.type === "reply" && validated.ok
+                  ? validated.response.cookie
+                  : undefined;
+            if (cookie !== undefined && exceedsCookieLimit(cookie)) {
+              return yield* new BrowserScriptError({
+                reason: "script cookie state exceeds the 64 KiB limit",
+              });
+            }
             const bytes = yield* Effect.try({
               try: () => {
                 const line = `${JSON.stringify(validated)}\n`;
                 const encoded = new TextEncoder().encode(line);
                 if (
-                  encoded.byteLength > MAX_IPC_LINE_BYTES ||
+                  encoded.byteLength > maxLineBytes ||
                   inputBytes + encoded.byteLength > MAX_INPUT_BYTES
                 ) {
                   throw new RangeError(
-                    "script IPC input exceeds the 1 MiB limit",
+                    "script IPC input exceeds the 8 MiB limit",
                   );
                 }
                 inputBytes += encoded.byteLength;
@@ -391,12 +434,19 @@ const makeEvaluate = (
                     })
                   : yield* host.request(request);
               const responseBytes = lineBytes(response.body);
-              if (responseBytes > MAX_RESPONSE_BYTES) {
+              const responseLimit =
+                event.kind === "script"
+                  ? MAX_SCRIPT_ASSET_BYTES
+                  : MAX_RESPONSE_BYTES;
+              if (responseBytes > responseLimit) {
                 yield* writeInput({
                   type: "reply",
                   id: event.id,
                   ok: false,
-                  error: "script response exceeds the 64 KiB limit",
+                  error:
+                    event.kind === "script"
+                      ? "script asset exceeds the 1 MiB limit"
+                      : "script response exceeds the 64 KiB limit",
                 });
                 return;
               }
@@ -427,16 +477,7 @@ const makeEvaluate = (
                 ok: true,
                 response: encoded,
               } as const;
-              if (lineBytes(JSON.stringify(message)) + 1 > MAX_IPC_LINE_BYTES) {
-                yield* writeInput({
-                  type: "reply",
-                  id: event.id,
-                  ok: false,
-                  error: "script response exceeds the IPC message limit",
-                });
-              } else {
-                yield* writeInput(message);
-              }
+              yield* writeInput(message, MAX_INPUT_LINE_BYTES);
             }).pipe(
               Effect.catch((error) =>
                 writeInput({
@@ -453,12 +494,13 @@ const makeEvaluate = (
 
         const onLine = (line: string, state: Output) =>
           Effect.gen(function* () {
-            if (lineBytes(line) > MAX_IPC_LINE_BYTES) {
+            const lineLength = lineBytes(line);
+            if (lineLength > MAX_OUTPUT_LINE_BYTES) {
               return yield* new BrowserScriptError({
                 reason: "script process emitted an oversized IPC line",
               });
             }
-            const bytes = state.bytes + lineBytes(line) + 1;
+            const bytes = state.bytes + lineLength + 1;
             if (bytes > MAX_OUTPUT_BYTES) {
               return yield* new BrowserScriptError({
                 reason: "script process output exceeds the 1 MiB limit",

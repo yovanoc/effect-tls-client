@@ -116,6 +116,32 @@ const startFixture = async (): Promise<{
       response.end("xhr-response");
       return;
     }
+    if (path === "/script/generated.js") {
+      response.setHeader("content-type", "text/javascript");
+      response.end(
+        `/*${"x".repeat(700 * 1024)}*/ globalThis.generatedAssetResult = "loaded";`,
+      );
+      return;
+    }
+    if (path === "/script/aggregate.js") {
+      response.setHeader("content-type", "text/javascript");
+      response.end(
+        `/*${"x".repeat(400 * 1024)}*/ globalThis.aggregateAssetLoaded = true;`,
+      );
+      return;
+    }
+    if (path === "/script/oversized.js") {
+      response.end("x".repeat(1024 * 1024 + 1));
+      return;
+    }
+    if (path === "/script/oversized-fetch") {
+      response.end("x".repeat(64 * 1024 + 1));
+      return;
+    }
+    if (path === "/script/escaped") {
+      response.end("\0".repeat(32 * 1024));
+      return;
+    }
     if (path === "/private/script-success") {
       const header = request.headers.cookie ?? "";
       const valid =
@@ -382,6 +408,73 @@ describeRealIntegration("real BrowserMock integration", () => {
         expect(result.status).toBe(200);
         expect(result.body).toBe("script-ok");
         expect(fixture.cookies[4]).toContain("bridge-cookie=network");
+      }),
+  );
+
+  it.live(
+    "bounds large script assets, fetch bodies, aggregate data, and escaped IPC",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(startFixture);
+        const platform = Layer.mergeAll(
+          NodeServices.layer,
+          ConfigProvider.layer(
+            ConfigProvider.fromUnknown({ TLS_CLIENT_BRIDGE_PATH: bridgePath }),
+          ),
+        );
+        const services = Layer.mergeAll(
+          TlsClient.layer.pipe(Layer.provide(platform)),
+          Browser.BrowserMock.layer({ allowedOrigins: [fixture.url] }).pipe(
+            Layer.provide(platform),
+          ),
+        );
+        const value = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const runtime = yield* Browser.BrowserMock;
+            const browser = yield* Browser.open(
+              {
+                transport: { profile: "chrome_146", forceHttp1: true },
+                identity: Browser.Chrome146Identity,
+              },
+              {
+                scriptRuntime: runtime,
+                challengeHandler: (_challenge, context) =>
+                  Effect.gen(function* () {
+                    const url = (route: string) =>
+                      JSON.stringify(`${fixture.url}${route}`);
+                    const result = yield* context.evaluate(
+                      [
+                        `await document.loadScript(${url("/script/generated.js")});`,
+                        `const escaped = await fetch(${url("/script/escaped")}).then((response) => response.text());`,
+                        `let fetchError = ""; try { await fetch(${url("/script/oversized-fetch")}); } catch (error) { fetchError = error.message; }`,
+                        `let assetError = ""; try { await document.loadScript(${url("/script/oversized.js")}); } catch (error) { assetError = error.message; }`,
+                        `let aggregateError = ""; try { await document.loadScript(${url("/script/aggregate.js")}); } catch (error) { aggregateError = error.message; }`,
+                        `return [window.generatedAssetResult, escaped.length === ${32 * 1024} && escaped.charCodeAt(0) === 0 && escaped.charCodeAt(escaped.length - 1) === 0, fetchError, assetError, aggregateError].join("|");`,
+                      ].join("\n"),
+                    );
+                    expect(result).toBe(
+                      [
+                        "loaded",
+                        "true",
+                        "script fetch response exceeds the 64 KiB limit",
+                        "script asset exceeds the 1 MiB limit",
+                        "script network byte budget exceeded",
+                      ].join("|"),
+                    );
+                    return Option.none();
+                  }),
+              },
+            );
+            return yield* browser.navigate(`${fixture.url}/challenge`);
+          }).pipe(Effect.provide(services)),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+        expect(value.status).toBe(202);
+        expect(fixture.cookies.slice(1)).toHaveLength(5);
+        expect(
+          fixture.cookies
+            .slice(1)
+            .every((cookie) => cookie.includes("read-secret=hidden")),
+        ).toBe(true);
       }),
   );
 

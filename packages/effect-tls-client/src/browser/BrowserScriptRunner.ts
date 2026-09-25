@@ -1,5 +1,7 @@
 interface RunnerLimits {
-  readonly maxIpcLineBytes: number;
+  readonly maxInputLineBytes: number;
+  readonly maxControlInputLineBytes: number;
+  readonly maxOutputLineBytes: number;
   readonly maxCookieBytes: number;
   readonly maxCookieWrites: number;
   readonly maxTimers: number;
@@ -319,7 +321,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   return String.raw`
 const vm = require("node:vm");
 const readline = require("node:readline");
-const MAX_LINE_BYTES = ${limits.maxIpcLineBytes};
+const MAX_INPUT_LINE_BYTES = ${limits.maxInputLineBytes};
+const MAX_CONTROL_INPUT_LINE_BYTES = ${limits.maxControlInputLineBytes};
+const MAX_OUTPUT_LINE_BYTES = ${limits.maxOutputLineBytes};
 const pendingKinds = new Map();
 let context;
 let deliver;
@@ -338,7 +342,7 @@ const writeFinal = (output) => {
 };
 const post = (line) => {
   try {
-    if (typeof line !== "string" || Buffer.byteLength(line) > MAX_LINE_BYTES) {
+    if (typeof line !== "string" || Buffer.byteLength(line) > MAX_OUTPUT_LINE_BYTES) {
       process.stdout.write(JSON.stringify({ type: "script.error", reason: "runner message exceeds the limit" }) + "\n");
       return;
     }
@@ -350,7 +354,7 @@ const post = (line) => {
 const bootstrap = ${JSON.stringify(bootstrap)};
 const handleParentLine = (line) => {
   try {
-    if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw new Error("host IPC line exceeds the limit");
+    if (Buffer.byteLength(line) > MAX_INPUT_LINE_BYTES) throw new Error("host IPC line exceeds the limit");
     let message = JSON.parse(line);
     if (message.type === "fatal") {
       writeFinal({ ok: false, reason: String(message.reason) });
@@ -359,11 +363,14 @@ const handleParentLine = (line) => {
     if (message.type === "reply") {
       const kind = pendingKinds.get(message.id);
       pendingKinds.delete(message.id);
-      if (message.ok && kind === "script" && !message.response.error && message.response.status >= 200 && message.response.status < 300) {
-        try { vm.runInContext(message.response.body, context); }
-        catch (cause) {
-          message = { type: "reply", id: message.id, ok: false, error: "loaded script failed: " + safeMessage(cause) };
+      if (message.ok && kind === "script") {
+        if (!message.response.error && message.response.status >= 200 && message.response.status < 300) {
+          try { vm.runInContext(message.response.body, context); }
+          catch (cause) {
+            message = { type: "reply", id: message.id, ok: false, error: "loaded script failed: " + safeMessage(cause) };
+          }
         }
+        if (message.ok) message.response.body = "";
       }
     }
     deliver(JSON.stringify(message));
@@ -408,7 +415,10 @@ if (!Number.isInteger(major) || major < 25 || process.permission?.has("net") !==
   let started = false;
   lines.on("line", (line) => {
     if (finished) return;
-    if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
+    const lineLimit = started
+      ? MAX_INPUT_LINE_BYTES
+      : MAX_CONTROL_INPUT_LINE_BYTES;
+    if (Buffer.byteLength(line) > lineLimit) {
       writeFinal({ ok: false, reason: "host IPC line exceeds the limit" });
       return;
     }
