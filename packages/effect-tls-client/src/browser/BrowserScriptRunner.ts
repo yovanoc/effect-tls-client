@@ -138,6 +138,35 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     return result;
   };
+  const copyBlobBytes = (data) => {
+    const size = data.end - data.start;
+    reserveBlobBytes(size);
+    const bytes = new NativeUint8Array(size);
+    for (let index = 0; index < size; index += 1) bytes[index] = data.bytes[data.start + index];
+    return bytes;
+  };
+  const decodeBlobText = (data) => {
+    reserveBlobBytes(data.end - data.start);
+    const text = hostDecodeBlobText(blobByteString(data));
+    if (text === null) throw new NativeError("Blob UTF-8 decoding failed");
+    return text;
+  };
+  const encodeBlobDataUrl = (data) => {
+    const size = data.end - data.start;
+    const prefix = "data:" + data.type + ";base64,";
+    reserveBlobBytes(prefix.length + Math.ceil(size / 3) * 4);
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let encoded = "";
+    for (let index = data.start; index < data.end; index += 3) {
+      const first = data.bytes[index];
+      const second = index + 1 < data.end ? data.bytes[index + 1] : 0;
+      const third = index + 2 < data.end ? data.bytes[index + 2] : 0;
+      encoded += alphabet[first >> 2] + alphabet[((first & 3) << 4) | (second >> 4)] +
+        (index + 1 < data.end ? alphabet[((second & 15) << 2) | (third >> 6)] : "=") +
+        (index + 2 < data.end ? alphabet[third & 63] : "=");
+    }
+    return prefix + encoded;
+  };
   class Blob {
     constructor(parts = [], options = {}) {
       const init = options == null ? {} : options;
@@ -210,22 +239,15 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     text() {
       const data = getBlobData(this);
       try {
-        reserveBlobBytes(data.end - data.start);
-        const text = hostDecodeBlobText(blobByteString(data));
-        if (text === null) throw new NativeError("Blob UTF-8 decoding failed");
-        return new NativePromise((resolve) => resolve(text));
+        return new NativePromise((resolve) => resolve(decodeBlobText(data)));
       } catch (error) {
         return new NativePromise((_resolve, reject) => reject(error));
       }
     }
     arrayBuffer() {
       const data = getBlobData(this);
-      const size = data.end - data.start;
       try {
-        reserveBlobBytes(size);
-        const bytes = new NativeUint8Array(size);
-        for (let index = 0; index < size; index += 1) bytes[index] = data.bytes[data.start + index];
-        return new NativePromise((resolve) => resolve(bytes.buffer));
+        return new NativePromise((resolve) => resolve(copyBlobBytes(data).buffer));
       } catch (error) {
         return new NativePromise((_resolve, reject) => reject(error));
       }
@@ -547,6 +569,17 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     stopImmediatePropagation() { this._immediateStopped = true; }
   }
+  class ProgressEvent extends Event {
+    constructor(type, options = {}) {
+      const init = options == null ? {} : options;
+      super(type, init);
+      Object.defineProperties(this, {
+        lengthComputable: { value: Boolean(init.lengthComputable), enumerable: true },
+        loaded: { value: init.loaded === undefined ? 0 : NativeNumber(init.loaded), enumerable: true },
+        total: { value: init.total === undefined ? 0 : NativeNumber(init.total), enumerable: true },
+      });
+    }
+  }
   const makeEventTarget = (target) => {
     const listeners = new Map();
     const captureOf = (options) => typeof options === "boolean" ? options : Boolean(options && options.capture);
@@ -608,6 +641,153 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     };
     return target;
   };
+  const fileReaderState = new WeakMap();
+  const getFileReaderState = (reader) => {
+    const state = fileReaderState.get(reader);
+    if (state === undefined) throw new NativeTypeError("FileReader method called on an incompatible receiver");
+    return state;
+  };
+  const fileReaderError = (name, message) => {
+    const error = new NativeError(message);
+    error.name = name;
+    return error;
+  };
+  const dispatchFileReaderEvent = (reader, type, loaded, total) => {
+    reader.dispatchEvent(new ProgressEvent(type, {
+      lengthComputable: true,
+      loaded,
+      total,
+    }));
+  };
+  const finishFileRead = (reader, state, task, result, error) => {
+    if (state.task !== task) return;
+    state.task = null;
+    state.readyState = FileReader.DONE;
+    state.result = error === null ? result : null;
+    state.error = error;
+    const size = task.data.end - task.data.start;
+    dispatchFileReaderEvent(reader, error === null ? "load" : "error", task.loaded, size);
+    if (state.readyState !== FileReader.LOADING) {
+      dispatchFileReaderEvent(reader, "loadend", task.loaded, size);
+    }
+  };
+  const completeFileRead = (reader, state, task) => {
+    task.timer = null;
+    if (state.task !== task) return;
+    const size = task.data.end - task.data.start;
+    if (size > 0) {
+      task.loaded = size;
+      dispatchFileReaderEvent(reader, "progress", size, size);
+    }
+    if (state.task !== task) return;
+    try {
+      const result = task.kind === "arrayBuffer"
+        ? copyBlobBytes(task.data).buffer
+        : task.kind === "text"
+          ? decodeBlobText(task.data)
+          : encodeBlobDataUrl(task.data);
+      finishFileRead(reader, state, task, result, null);
+    } catch (error) {
+      finishFileRead(reader, state, task, null, error);
+    }
+  };
+  const startFileRead = (reader, blob, kind, encoding) => {
+    const state = getFileReaderState(reader);
+    if (state.readyState === FileReader.LOADING || state.task !== null) {
+      throw fileReaderError("InvalidStateError", "A FileReader read is already in progress");
+    }
+    const data = getBlobData(blob);
+    if (kind === "text" && encoding != null) {
+      const label = NativeString(encoding).trim().toLowerCase();
+      if (label !== "" && label !== "utf-8" && label !== "utf8") {
+        throw new NativeTypeError("FileReader supports UTF-8 text only");
+      }
+    }
+    const task = { data, kind, timer: null, loaded: 0 };
+    state.task = task;
+    state.result = null;
+    state.error = null;
+    state.readyState = FileReader.LOADING;
+    try {
+      task.timer = setTimeout(() => {
+        task.timer = null;
+        if (state.task !== task) return;
+        dispatchFileReaderEvent(reader, "loadstart", 0, task.data.end - task.data.start);
+        if (state.task !== task) return;
+        try {
+          task.timer = setTimeout(() => completeFileRead(reader, state, task), 0);
+        } catch (error) {
+          finishFileRead(reader, state, task, null, error);
+        }
+      }, 0);
+    } catch (error) {
+      state.task = null;
+      state.result = null;
+      state.error = null;
+      state.readyState = FileReader.EMPTY;
+      throw error;
+    }
+  };
+  const abortFileRead = (reader) => {
+    const state = getFileReaderState(reader);
+    if (state.readyState === FileReader.EMPTY || state.readyState === FileReader.DONE) {
+      state.result = null;
+      return;
+    }
+    const task = state.task;
+    state.readyState = FileReader.DONE;
+    state.result = null;
+    if (task !== null) {
+      if (task.timer !== null) clearTimeout(task.timer);
+      task.timer = null;
+      state.task = null;
+    }
+    const size = task === null ? 0 : task.data.end - task.data.start;
+    const loaded = task === null ? 0 : task.loaded;
+    dispatchFileReaderEvent(reader, "abort", loaded, size);
+    if (state.readyState !== FileReader.LOADING) {
+      dispatchFileReaderEvent(reader, "loadend", loaded, size);
+    }
+  };
+  class FileReader {
+    static EMPTY = 0;
+    static LOADING = 1;
+    static DONE = 2;
+    get EMPTY() { return FileReader.EMPTY; }
+    get LOADING() { return FileReader.LOADING; }
+    get DONE() { return FileReader.DONE; }
+    constructor() {
+      fileReaderState.set(this, {
+        readyState: FileReader.EMPTY,
+        result: null,
+        error: null,
+        task: null,
+      });
+      makeEventTarget(this);
+      for (const type of ["loadstart", "progress", "load", "error", "abort", "loadend"]) {
+        let callback = null;
+        let listener = null;
+        Object.defineProperty(this, "on" + type, {
+          enumerable: true,
+          configurable: true,
+          get: () => callback,
+          set: (value) => {
+            if (listener !== null) this.removeEventListener(type, listener);
+            callback = typeof value === "function" ? value : null;
+            listener = callback === null ? null : (event) => callback.call(this, event);
+            if (listener !== null) this.addEventListener(type, listener);
+          },
+        });
+      }
+    }
+    get readyState() { return getFileReaderState(this).readyState; }
+    get result() { return getFileReaderState(this).result; }
+    get error() { return getFileReaderState(this).error; }
+    readAsArrayBuffer(blob) { startFileRead(this, blob, "arrayBuffer"); }
+    readAsText(blob, encoding) { startFileRead(this, blob, "text", encoding); }
+    readAsDataURL(blob) { startFileRead(this, blob, "dataURL"); }
+    abort() { abortFileRead(this); }
+  }
   const document = makeEventTarget({});
   Object.defineProperty(document, "cookie", {
     enumerable: true,
@@ -623,7 +803,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event, Blob });
+  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event, ProgressEvent, Blob, FileReader });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {

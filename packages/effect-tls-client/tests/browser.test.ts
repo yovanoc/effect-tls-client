@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Fiber, Layer, Stream } from "effect";
+import * as Schema from "effect/Schema";
 import { NodeServices } from "@effect/platform-node";
 import * as Cookies from "effect/unstable/http/Cookies";
 import type { TlsResponse, TlsSession } from "../src/TlsClient.js";
@@ -799,6 +800,330 @@ describe("browser layer", () => {
       ),
     ),
   );
+
+  it.layer(BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)), {
+    excludeTestServices: true,
+  })("context-local FileReader", ({ effect: testEffect }) => {
+    testEffect("implements FileReader operations and event ordering", () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const result = yield* runtime.evaluate(`
+        const blob = new Blob(["snowman: ☃"], { type: "text/plain" });
+        const reader = new FileReader();
+        const events = [];
+        let eventValuesStayLocal = true;
+        let progressEventIsLocal = false;
+        let firstEvent;
+        const observe = (event) => {
+          if (firstEvent === undefined) firstEvent = event;
+          eventValuesStayLocal = eventValuesStayLocal && event instanceof ProgressEvent &&
+            Object.getPrototypeOf(event) === ProgressEvent.prototype &&
+            event.target === reader && event.currentTarget === reader && event.isTrusted === false;
+        };
+        reader.addEventListener("loadstart", (event) => { observe(event); events.push("loadstart"); });
+        reader.onloadstart = (event) => { observe(event); events.push("onloadstart"); };
+        reader.addEventListener("progress", (event) => {
+          observe(event);
+          progressEventIsLocal = event instanceof ProgressEvent &&
+            Object.getPrototypeOf(event) === ProgressEvent.prototype && ProgressEvent === window.ProgressEvent;
+          events.push("progress:" + event.loaded + "/" + event.total + ":" + event.lengthComputable);
+        });
+        reader.addEventListener("load", (event) => { observe(event); events.push("load"); });
+        reader.onload = (event) => { observe(event); events.push("onload"); };
+        reader.addEventListener("loadend", (event) => { observe(event); events.push("loadend"); });
+        const completion = new Promise((resolve) => { reader.onloadend = resolve; });
+        const readReturn = reader.readAsArrayBuffer(blob);
+        const asynchronous = reader.readyState === FileReader.LOADING && reader.result === null;
+        events.push("immediate");
+        const completionPromiseIsLocal = Object.getPrototypeOf(completion) === Promise.prototype;
+        await completion;
+        const eventOrder = events.join("|");
+        const buffer = reader.result;
+        const bytes = Array.from(new Uint8Array(buffer)).join(",");
+        const read = (method) => new Promise((resolve, reject) => {
+          reader.onerror = () => reject(reader.error);
+          reader.onloadend = () => resolve(reader.result);
+          reader[method](blob);
+        });
+        const text = await read("readAsText");
+        const dataURL = await read("readAsDataURL");
+        const previousDoneResult = reader.result;
+        const previousError = reader.error;
+        reader.abort();
+        const doneAbortClearsResult = previousDoneResult === dataURL && reader.readyState === FileReader.DONE &&
+          reader.result === null && reader.error === previousError;
+        const invalid = new FileReader();
+        let nonBlobErrorIsLocal = false;
+        try { invalid.readAsText({}); }
+        catch (error) {
+          nonBlobErrorIsLocal = error instanceof TypeError && error.constructor === TypeError &&
+            Object.getPrototypeOf(error) === TypeError.prototype;
+        }
+        const reentrant = new FileReader();
+        let concurrentReadRejected = false;
+        const reentrantDone = new Promise((resolve) => {
+          reentrant.onloadstart = () => {
+            try { reentrant.readAsText(blob); }
+            catch (error) {
+              concurrentReadRejected = error instanceof Error && error.name === "InvalidStateError" &&
+                error.constructor === Error && Object.getPrototypeOf(error) === Error.prototype;
+            }
+          };
+          reentrant.onloadend = resolve;
+        });
+        reentrant.readAsArrayBuffer(blob);
+        await reentrantDone;
+        const blocked = (value) => {
+          try { value.constructor.constructor("return process")(); return false; }
+          catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+        };
+        return JSON.stringify({
+          exposed: FileReader === window.FileReader,
+          constants: FileReader.EMPTY === 0 && FileReader.LOADING === 1 && FileReader.DONE === 2 &&
+            reader.EMPTY === 0 && reader.LOADING === 1 && reader.DONE === 2,
+          readReturnIsUndefined: readReturn === undefined,
+          asynchronous,
+          localPromise: completionPromiseIsLocal,
+          eventOrder,
+          eventValuesStayLocal,
+          progressEventIsLocal,
+          bytes,
+          arrayBufferIsLocal: buffer instanceof ArrayBuffer && Object.getPrototypeOf(buffer) === ArrayBuffer.prototype,
+          text,
+          dataURL,
+          doneAbortClearsResult,
+          nonBlobErrorIsLocal,
+          concurrentReadRejected,
+          localCallbacksAndReader: Object.getPrototypeOf(reader.onload) === Function.prototype &&
+            Object.getOwnPropertyDescriptor(FileReader.prototype, "result").set === undefined &&
+            !("onreadystatechange" in reader),
+          escapesBlocked: blocked(reader) && blocked(reader.readAsArrayBuffer) && blocked(buffer) && blocked(firstEvent),
+          hiddenHostGlobals: [typeof process, typeof Buffer, typeof require].every((value) => value === "undefined"),
+        });
+      `);
+        const resultValue = yield* Schema.decodeEffect(
+          Schema.fromJsonString(Schema.Unknown),
+        )(result.value);
+        expect(resultValue).toEqual({
+          exposed: true,
+          constants: true,
+          readReturnIsUndefined: true,
+          asynchronous: true,
+          localPromise: true,
+          eventOrder:
+            "immediate|loadstart|onloadstart|progress:12/12:true|load|onload|loadend",
+          eventValuesStayLocal: true,
+          progressEventIsLocal: true,
+          bytes: "115,110,111,119,109,97,110,58,32,226,152,131",
+          arrayBufferIsLocal: true,
+          text: "snowman: ☃",
+          dataURL: "data:text/plain;base64,c25vd21hbjog4piD",
+          doneAbortClearsResult: true,
+          nonBlobErrorIsLocal: true,
+          concurrentReadRejected: true,
+          localCallbacksAndReader: true,
+          escapesBlocked: true,
+          hiddenHostGlobals: true,
+        });
+      }),
+    );
+    testEffect(
+      "aborts FileReader reads and charges materialized results to the Blob quota",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const aborted = yield* runtime.evaluate(`
+        const empty = new FileReader();
+        empty.abort();
+        const emptyAbortKeepsState = empty.readyState === FileReader.EMPTY && empty.result === null && empty.error === null;
+        const blob = new Blob(["pending"]);
+        const reader = new FileReader();
+        const events = [];
+        let activeAbortHasNullError = false;
+        let activeAbortIsDone = false;
+        let concurrentReadRejected = false;
+        reader.addEventListener("loadstart", () => events.push("loadstart"));
+        reader.addEventListener("abort", (event) => events.push("abort:" + event.isTrusted));
+        reader.addEventListener("loadend", (event) => events.push("loadend:" + event.isTrusted));
+        const done = new Promise((resolve) => {
+          reader.onloadstart = () => {
+            try { reader.readAsText(blob); }
+            catch (error) {
+              concurrentReadRejected = error instanceof Error && error.name === "InvalidStateError";
+            }
+            reader.abort();
+          };
+          reader.onabort = () => {
+            activeAbortHasNullError = reader.error === null;
+            activeAbortIsDone = reader.readyState === FileReader.DONE && reader.result === null;
+          };
+          reader.onloadend = resolve;
+        });
+        reader.readAsArrayBuffer(blob);
+        const loadingBeforeEvents = reader.readyState === FileReader.LOADING && reader.result === null;
+        await done;
+        const abortedState = reader.readyState === FileReader.DONE && reader.result === null;
+        reader.abort();
+        const doneAbortKeepsState = reader.readyState === FileReader.DONE && reader.result === null && reader.error === null;
+        return JSON.stringify({
+          events: events.join("|"),
+          loadingBeforeEvents,
+          abortedState,
+          emptyAbortKeepsState,
+          doneAbortKeepsState,
+          activeAbortHasNullError,
+          activeAbortIsDone,
+          concurrentReadRejected,
+        });
+      `);
+          const abortedValue = yield* Schema.decodeEffect(
+            Schema.fromJsonString(Schema.Unknown),
+          )(aborted.value);
+          expect(abortedValue).toEqual({
+            events: "loadstart|abort:false|loadend:false",
+            loadingBeforeEvents: true,
+            abortedState: true,
+            emptyAbortKeepsState: true,
+            doneAbortKeepsState: true,
+            activeAbortHasNullError: true,
+            activeAbortIsDone: true,
+            concurrentReadRejected: true,
+          });
+
+          const quota = yield* runtime.evaluate(`
+        const blob = new Blob(["x".repeat(700000)]);
+        const reader = new FileReader();
+        const events = [];
+        const done = new Promise((resolve) => {
+          reader.onerror = () => events.push("error");
+          reader.onloadend = resolve;
+        });
+        reader.readAsDataURL(blob);
+        await done;
+        const previousError = reader.error;
+        reader.abort();
+        return JSON.stringify({
+          error: previousError && previousError.name,
+          doneAbortPreservesError: reader.error === previousError && reader.readyState === FileReader.DONE && reader.result === null,
+          localError: previousError instanceof Error && previousError.constructor === Error &&
+            Object.getPrototypeOf(previousError) === Error.prototype,
+          state: reader.readyState,
+          result: reader.result,
+          events: events.join("|"),
+          escapeBlocked: (() => {
+            try { reader.error.constructor.constructor("return process")(); return false; }
+            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+          })(),
+        });
+      `);
+          const quotaValue = yield* Schema.decodeEffect(
+            Schema.fromJsonString(Schema.Unknown),
+          )(quota.value);
+          expect(quotaValue).toEqual({
+            error: "QuotaExceededError",
+            doneAbortPreservesError: true,
+            localError: true,
+            state: 2,
+            result: null,
+            events: "error",
+            escapeBlocked: true,
+          });
+        }),
+    );
+    testEffect(
+      "suppresses stale loadend events when terminal callbacks start another read",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const result = yield* runtime.evaluate(`
+        const blob = new Blob(["chain"]);
+        const loadEvents = [];
+        const loadReader = new FileReader();
+        let loadCount = 0;
+        const loadDone = new Promise((resolve) => {
+          loadReader.onloadstart = () => loadEvents.push("loadstart");
+          loadReader.onprogress = () => loadEvents.push("progress");
+          loadReader.onload = () => {
+            loadEvents.push("load");
+            if (loadCount++ === 0) loadReader.readAsText(blob);
+          };
+          loadReader.onloadend = () => {
+            loadEvents.push("loadend");
+            resolve();
+          };
+        });
+        loadReader.readAsArrayBuffer(blob);
+        await loadDone;
+
+        const errorEvents = [];
+        const errorReader = new FileReader();
+        let retried = false;
+        const errorDone = new Promise((resolve) => {
+          errorReader.onloadstart = () => errorEvents.push("loadstart");
+          errorReader.onprogress = () => errorEvents.push("progress");
+          errorReader.onerror = () => {
+            errorEvents.push("error");
+            if (!retried) {
+              retried = true;
+              errorReader.readAsText(new Blob(["ok"]));
+            }
+          };
+          errorReader.onload = () => errorEvents.push("load");
+          errorReader.onloadend = () => {
+            errorEvents.push("loadend");
+            resolve();
+          };
+        });
+        errorReader.readAsDataURL(new Blob(["x".repeat(700000)]));
+        await errorDone;
+
+        const abortEvents = [];
+        const abortReader = new FileReader();
+        let abortIsDone = false;
+        let abortHasNullError = false;
+        let abortImmediateEvents = "";
+        const abortDone = new Promise((resolve) => {
+          abortReader.onloadstart = () => abortEvents.push("loadstart");
+          abortReader.onprogress = () => abortEvents.push("progress");
+          abortReader.onabort = () => {
+            abortEvents.push("abort");
+            abortIsDone = abortReader.readyState === FileReader.DONE && abortReader.result === null;
+            abortHasNullError = abortReader.error === null;
+            abortReader.readAsText(blob);
+          };
+          abortReader.onload = () => abortEvents.push("load");
+          abortReader.onloadend = () => {
+            abortEvents.push("loadend");
+            resolve();
+          };
+        });
+        abortReader.readAsArrayBuffer(blob);
+        abortReader.abort();
+        abortImmediateEvents = abortEvents.join("|");
+        await abortDone;
+        return JSON.stringify({
+          load: loadEvents.join("|"),
+          error: errorEvents.join("|"),
+          abort: abortEvents.join("|"),
+          abortImmediateEvents,
+          abortIsDone,
+          abortHasNullError,
+        });
+      `);
+          const resultValue = yield* Schema.decodeEffect(
+            Schema.fromJsonString(Schema.Unknown),
+          )(result.value);
+          expect(resultValue).toEqual({
+            load: "loadstart|progress|load|loadstart|progress|load|loadend",
+            error: "loadstart|progress|error|loadstart|progress|load|loadend",
+            abort: "abort|loadstart|progress|load|loadend",
+            abortImmediateEvents: "abort",
+            abortIsDone: true,
+            abortHasNullError: true,
+          });
+        }),
+    );
+  });
 
   it.effect("dispatches context-local document and window events", () =>
     Effect.gen(function* () {

@@ -114,10 +114,20 @@ automatic lifecycle/user-event delivery. Listener exceptions are reported as
 `BrowserScriptError` and fail evaluation. Context-local `Blob` supports UTF-8
 strings, ArrayBuffers, views, nested Blobs, `size`, `type`, `text()`,
 `arrayBuffer()`, and `slice()`. Its cumulative per-evaluation allocation quota
-is 1 MiB, including Blob data, type metadata, and materialized text/ArrayBuffer
-copies; quota failures use context-local `QuotaExceededError`. `Blob.stream()`
-and native line endings explicitly reject. Workers, object URLs, and Blob
-network bodies are not provided. It does not expose `process`, filesystem,
+is 1 MiB, including Blob data, type metadata, and materialized reads; quota
+failures use context-local `QuotaExceededError`. `Blob.stream()` and native line
+endings explicitly reject. Context-local `FileReader` asynchronously supports
+`readAsArrayBuffer`, UTF-8-only `readAsText`, and `readAsDataURL` with
+`loadstart`, `progress`, `load`, `error`, `abort`, and
+`loadend` events, with local `ProgressEvent` values for progress events. It
+shares the Blob quota, including the locally encoded DataURL result. Active
+`abort()` cancels the pending read and emits `abort`/`loadend` immediately; it
+leaves the reader `DONE` with null result/error. In `EMPTY` or `DONE`, `abort()`
+only clears the result and preserves the state/error. Concurrent-read errors
+stay inside the VM. Its events remain synthetic (`isTrusted === false`), and its result, errors, and callbacks
+are context-local. DataURL base64 is only used as the script-visible local
+result, never for Bridge or network body transport. Workers, object URLs, and
+Blob network bodies are not provided. It does not expose `process`, filesystem,
 WebSocket, or general DOM APIs. Network operations
 are serialized to the host and made through the same scoped `TlsSession`; Go
 remains authoritative for cookies.
