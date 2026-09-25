@@ -669,6 +669,11 @@ describe("browser layer", () => {
         'return await new Promise((resolve) => setTimeout(() => resolve("fired"), 5));',
       );
       expect(timer.value).toBe("fired");
+      expect(
+        (yield* runtime.evaluate(
+          "return await new Promise((resolve) => { let ticks = 0; const id = setInterval(() => { if (++ticks === 2) { clearInterval(id); resolve(ticks); } }, 1); });",
+        )).value,
+      ).toBe("2");
     }).pipe(
       Effect.provide(
         BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(

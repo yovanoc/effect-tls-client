@@ -116,9 +116,12 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const fireTimer = (id) => {
     const timer = timers.get(id);
     if (!timer) return;
-    timers.delete(id);
+    if (timer.interval === undefined) timers.delete(id);
     try { timer.callback(...timer.args); }
     catch (cause) { send({ type: "script.error", reason: safeMessage(cause) }); }
+    if (timer.interval !== undefined && timers.get(id) === timer) {
+      send({ type: "timer.set", id, ms: timer.interval });
+    }
   };
   const receive = (raw) => {
     let message;
@@ -287,10 +290,20 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     send({ type: "timer.set", id, ms });
     return id;
   };
+  const setInterval = (callback, delay = 0, ...args) => {
+    if (typeof callback !== "function") throw new TypeError("timer callback must be a function");
+    if (timers.size >= ${limits.maxTimers}) throw new RangeError("script timer budget exceeded");
+    const id = ++nextTimerId;
+    const ms = Number.isFinite(Number(delay)) ? Math.max(0, Math.min(Number(delay), ${limits.maxTimerDelayMs})) : 0;
+    timers.set(id, { callback, args, interval: ms });
+    send({ type: "timer.set", id, ms });
+    return id;
+  };
   const clearTimeout = (id) => {
     const number = Number(id);
     if (timers.delete(number)) send({ type: "timer.clear", id: number });
   };
+  const clearInterval = clearTimeout;
   const document = {};
   Object.defineProperty(document, "cookie", {
     enumerable: true,
@@ -306,7 +319,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = globalThis;
-  Object.assign(window, { document, location: document.location, navigator, console, fetch, XMLHttpRequest, setTimeout, clearTimeout, Headers, Response });
+  Object.assign(window, { document, location: document.location, navigator, console, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
