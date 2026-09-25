@@ -35,6 +35,8 @@ const MAX_SCRIPT_ASSET_BYTES = 1024 * 1024;
 const MAX_TOTAL_NETWORK_BYTES = 1024 * 1024;
 const MAX_COOKIE_BYTES = 64 * 1024;
 const MAX_COOKIE_WRITES = 64;
+const MAX_SCRIPT_HEADERS = 128;
+const MAX_SCRIPT_HEADER_BYTES = 64 * 1024;
 const MAX_TIMERS = 64;
 const MAX_TIMER_FIRES = 256;
 const MAX_TIMER_DELAY_MS = 120_000;
@@ -60,6 +62,16 @@ const RunnerOutput = Schema.Union([
   }),
   Schema.Struct({ ok: Schema.Literal(false), reason: Schema.String }),
 ]);
+const RunnerRequestBody = Schema.NullOr(
+  Schema.Union([
+    Schema.String,
+    Schema.Array(
+      Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(
+        Schema.isLessThanOrEqualTo(255),
+      ),
+    ).check(Schema.isMaxLength(MAX_REQUEST_BODY_BYTES)),
+  ]),
+);
 const RunnerMessage = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("network"),
@@ -69,7 +81,7 @@ const RunnerMessage = Schema.Union([
     url: Schema.String,
     method: Schema.String,
     headers: Schema.Array(Schema.Tuple([Schema.String, Schema.String])),
-    body: Schema.NullOr(Schema.String),
+    body: RunnerRequestBody,
   }),
   Schema.Struct({
     type: Schema.Literal("cookie.write"),
@@ -133,7 +145,13 @@ const RUNNER_SOURCE = makeBrowserScriptRunnerSource({
   maxInputLineBytes: MAX_INPUT_LINE_BYTES,
   maxControlInputLineBytes: MAX_CONTROL_INPUT_LINE_BYTES,
   maxOutputLineBytes: MAX_OUTPUT_LINE_BYTES,
+  maxOutputBytes: MAX_OUTPUT_BYTES,
   maxCookieBytes: MAX_COOKIE_BYTES,
+  maxNetworkRequests: MAX_NETWORK_REQUESTS,
+  maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES,
+  maxTotalNetworkBytes: MAX_TOTAL_NETWORK_BYTES,
+  maxHeaders: MAX_SCRIPT_HEADERS,
+  maxHeaderBytes: MAX_SCRIPT_HEADER_BYTES,
   maxCookieWrites: MAX_COOKIE_WRITES,
   maxTimers: MAX_TIMERS,
   maxTimerDelayMs: MAX_TIMER_DELAY_MS,
@@ -347,10 +365,13 @@ const makeEvaluate = (
           >,
         ) =>
           Effect.gen(function* () {
-            if (
-              event.body !== null &&
-              lineBytes(event.body) > MAX_REQUEST_BODY_BYTES
-            ) {
+            let requestBodyBytes = 0;
+            if (typeof event.body === "string") {
+              requestBodyBytes = lineBytes(event.body);
+            } else if (event.body !== null) {
+              requestBodyBytes = event.body.length;
+            }
+            if (requestBodyBytes > MAX_REQUEST_BODY_BYTES) {
               yield* writeInput({
                 type: "reply",
                 id: event.id,
@@ -421,7 +442,11 @@ const makeEvaluate = (
               url,
               method: event.method,
               headers: event.headers,
-              body: event.body,
+              body: typeof event.body === "string" ? event.body : null,
+              bodyBytes:
+                typeof event.body === "string" || event.body === null
+                  ? null
+                  : event.body,
             } as const;
             networkBytes += requestBytes;
             activeRequests += 1;

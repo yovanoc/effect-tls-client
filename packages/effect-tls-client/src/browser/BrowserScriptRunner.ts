@@ -2,8 +2,14 @@ interface RunnerLimits {
   readonly maxInputLineBytes: number;
   readonly maxControlInputLineBytes: number;
   readonly maxOutputLineBytes: number;
+  readonly maxOutputBytes: number;
   readonly maxCookieBytes: number;
   readonly maxCookieWrites: number;
+  readonly maxNetworkRequests: number;
+  readonly maxRequestBodyBytes: number;
+  readonly maxTotalNetworkBytes: number;
+  readonly maxHeaders: number;
+  readonly maxHeaderBytes: number;
   readonly maxTimers: number;
   readonly maxTimerDelayMs: number;
 }
@@ -37,6 +43,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const arrayBufferByteLength = Object.getOwnPropertyDescriptor(NativeArrayBuffer.prototype, "byteLength").get;
   const stringCharCodeAt = String.prototype.charCodeAt;
   const stringFromCharCode = String.fromCharCode;
+  const numberToString = Number.prototype.toString;
   const getRandomValues = (array) => {
     if (!isView(array)) throw new NativeTypeError("crypto.getRandomValues expects an integer typed array");
     const tag = apply(typedArrayTag, array, []);
@@ -73,14 +80,21 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const initialUrl = String(__pageUrl);
   const userAgent = String(__userAgent);
   const authoritativeCookies = Boolean(__authoritativeCookies);
+  const MAX_REQUEST_BODY_BYTES = ${limits.maxRequestBodyBytes};
+  const MAX_NETWORK_REQUESTS = ${limits.maxNetworkRequests};
+  const MAX_TOTAL_NETWORK_BYTES = ${limits.maxTotalNetworkBytes};
+  const MAX_OUTPUT_LINE_BYTES = ${limits.maxOutputLineBytes};
+  const MAX_OUTPUT_BYTES = ${limits.maxOutputBytes};
+  const MAX_HEADERS = ${limits.maxHeaders};
+  const MAX_HEADER_BYTES = ${limits.maxHeaderBytes};
   const utf8Length = (value) => {
     const text = String(value);
     let bytes = 0;
     for (let index = 0; index < text.length; index += 1) {
-      const code = text.charCodeAt(index);
+      const code = apply(stringCharCodeAt, text, [index]);
       if (code <= 0x7f) bytes += 1;
       else if (code <= 0x7ff) bytes += 2;
-      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length && text.charCodeAt(index + 1) >= 0xdc00 && text.charCodeAt(index + 1) <= 0xdfff) {
+      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length && apply(stringCharCodeAt, text, [index + 1]) >= 0xdc00 && apply(stringCharCodeAt, text, [index + 1]) <= 0xdfff) {
         bytes += 4;
         index += 1;
       } else bytes += 3;
@@ -269,6 +283,198 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     stream() { throw new NativeTypeError("Blob.stream() is not supported by BrowserMock"); }
   }
+  const formDataEntries = new WeakMap();
+  const MAX_FORM_DATA_ENTRIES = 256;
+  const getFormDataEntries = (value) => {
+    const entries = formDataEntries.get(value);
+    if (entries === undefined) throw new NativeTypeError("FormData method called on an incompatible receiver");
+    return entries;
+  };
+  const formDataEntryLimitError = () => new NativeTypeError("FormData exceeds the 256-entry limit");
+  const reserveFormDataName = (name) => {
+    if (name.length > MAX_BLOB_BYTES - blobBytesAllocated || utf8Length(name) > MAX_BLOB_BYTES - blobBytesAllocated) {
+      throw blobQuotaError();
+    }
+    reserveBlobBytes(utf8Length(name));
+  };
+  const copyFormDataValue = (value) => {
+    if (blobData.has(value)) {
+      const data = getBlobData(value);
+      return new Blob([value], { type: data.type });
+    }
+    const text = NativeString(value);
+    new Blob([text]);
+    return text;
+  };
+  class FormData {
+    constructor(...args) {
+      if (args.length !== 0) throw new NativeTypeError("FormData HTMLFormElement construction is not supported");
+      formDataEntries.set(this, []);
+    }
+    append(name, value, ...options) {
+      if (options.length !== 0) throw new NativeTypeError("FormData filenames are not supported");
+      const entries = getFormDataEntries(this);
+      if (entries.length >= MAX_FORM_DATA_ENTRIES) throw formDataEntryLimitError();
+      const key = NativeString(name);
+      reserveFormDataName(key);
+      entries[entries.length] = [key, copyFormDataValue(value)];
+    }
+    set(name, value, ...options) {
+      if (options.length !== 0) throw new NativeTypeError("FormData filenames are not supported");
+      const key = NativeString(name);
+      const entries = getFormDataEntries(this);
+      if (entries.length >= MAX_FORM_DATA_ENTRIES && !entries.some(([entryName]) => entryName === key)) throw formDataEntryLimitError();
+      reserveFormDataName(key);
+      const item = [key, copyFormDataValue(value)];
+      let first = -1;
+      for (let index = 0; index < entries.length; index += 1) {
+        if (entries[index][0] !== key) continue;
+        if (first === -1) {
+          first = index;
+          entries[index] = item;
+        } else {
+          entries.splice(index, 1);
+          index -= 1;
+        }
+      }
+      if (first === -1) entries[entries.length] = item;
+    }
+    delete(name) {
+      const key = NativeString(name);
+      const entries = getFormDataEntries(this);
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        if (entries[index][0] === key) entries.splice(index, 1);
+      }
+    }
+    get(name) {
+      const key = NativeString(name);
+      const entries = getFormDataEntries(this);
+      for (const [entryName, value] of entries) if (entryName === key) return value;
+      return null;
+    }
+    getAll(name) {
+      const key = NativeString(name);
+      const values = [];
+      for (const [entryName, value] of getFormDataEntries(this)) if (entryName === key) values[values.length] = value;
+      return values;
+    }
+    has(name) {
+      const key = NativeString(name);
+      for (const [entryName] of getFormDataEntries(this)) if (entryName === key) return true;
+      return false;
+    }
+    *entries() {
+      for (const [name, value] of getFormDataEntries(this)) yield [name, value];
+    }
+    *keys() {
+      for (const [name] of getFormDataEntries(this)) yield name;
+    }
+    *values() {
+      for (const [, value] of getFormDataEntries(this)) yield value;
+    }
+    forEach(callback, thisArg) {
+      if (typeof callback !== "function") throw new NativeTypeError("FormData.forEach callback must be a function");
+      for (const [name, value] of getFormDataEntries(this)) apply(callback, thisArg, [value, name, this]);
+    }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+  const multipartTextLength = (text, escapeName) => {
+    let bytes = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      const code = apply(stringCharCodeAt, text, [index]);
+      if (code === 13 || code === 10) {
+        if (escapeName) {
+          bytes += 6;
+          if (code === 13 && index + 1 < text.length && apply(stringCharCodeAt, text, [index + 1]) === 10) index += 1;
+        } else {
+          bytes += 2;
+          if (code === 13 && index + 1 < text.length && apply(stringCharCodeAt, text, [index + 1]) === 10) index += 1;
+        }
+      } else if (escapeName && code === 34) bytes += 3;
+      else if (code <= 0x7f) bytes += 1;
+      else if (code <= 0x7ff) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && index + 1 < text.length && apply(stringCharCodeAt, text, [index + 1]) >= 0xdc00 && apply(stringCharCodeAt, text, [index + 1]) <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else bytes += 3;
+    }
+    return bytes;
+  };
+  const encodeMultipartText = (text, escapeName) => {
+    let result = "";
+    for (let index = 0; index < text.length; index += 1) {
+      const code = apply(stringCharCodeAt, text, [index]);
+      if (code === 13 || code === 10) {
+        result += escapeName ? "%0D%0A" : "\r\n";
+        if (code === 13 && index + 1 < text.length && apply(stringCharCodeAt, text, [index + 1]) === 10) index += 1;
+      } else if (escapeName && code === 34) result += "%22";
+      else result += apply(stringFromCharCode, NativeString, [code]);
+    }
+    return result;
+  };
+  const randomMultipartBoundary = () => {
+    const random = new NativeUint8Array(16);
+    getRandomValues(random);
+    let suffix = "";
+    for (let index = 0; index < random.length; index += 1) {
+      const value = apply(numberToString, random[index], [16]);
+      suffix += value.length === 1 ? "0" + value : value;
+    }
+    return "----BrowserMockFormBoundary" + suffix;
+  };
+  const serializeFormData = (formData) => {
+    const boundary = randomMultipartBoundary();
+    const entries = getFormDataEntries(formData);
+    const dispositionPrefix = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"";
+    const dispositionSuffix = "\"\r\n";
+    const blobDispositionSuffix = "\"; filename=\"blob\"\r\n";
+    let size = utf8Length("--" + boundary + "--\r\n");
+    for (const [name, value] of entries) {
+      const isBlob = blobData.has(value);
+      const suffix = isBlob ? blobDispositionSuffix : dispositionSuffix;
+      size += utf8Length(dispositionPrefix) + multipartTextLength(name, true) + utf8Length(suffix + "\r\n");
+      if (isBlob) {
+        const data = getBlobData(value);
+        size += utf8Length("Content-Type: " + (data.type || "application/octet-stream") + "\r\n");
+        size += data.end - data.start;
+      } else {
+        size += multipartTextLength(value, false);
+      }
+      size += 2;
+      if (size > ${limits.maxRequestBodyBytes}) throw new NativeTypeError("FormData request body exceeds the 16 KiB limit");
+    }
+    const segments = [];
+    for (const [name, value] of entries) {
+      const isBlob = blobData.has(value);
+      let header = dispositionPrefix + encodeMultipartText(name, true) + (isBlob ? blobDispositionSuffix : dispositionSuffix);
+      if (isBlob) {
+        const data = getBlobData(value);
+        header += "Content-Type: " + (data.type || "application/octet-stream") + "\r\n";
+        segments[segments.length] = { header, data };
+      } else {
+        segments[segments.length] = { header, text: encodeMultipartText(value, false) };
+      }
+    }
+    const bytes = new NativeUint8Array(size);
+    let offset = 0;
+    const appendText = (text) => {
+      const encoded = hostEncodeBlobText(text, bytes.length - offset);
+      if (encoded === null) throw new NativeTypeError("FormData UTF-8 encoding exceeded the request body limit");
+      for (let index = 0; index < encoded.length; index += 1) bytes[offset++] = apply(stringCharCodeAt, encoded, [index]);
+    };
+    for (const segment of segments) {
+      appendText(segment.header + "\r\n");
+      if (segment.data !== undefined) {
+        for (let index = segment.data.start; index < segment.data.end; index += 1) bytes[offset++] = segment.data.bytes[index];
+      } else {
+        appendText(segment.text);
+      }
+      appendText("\r\n");
+    }
+    appendText("--" + boundary + "--\r\n");
+    if (offset !== size) throw new NativeError("FormData serialization length mismatch");
+    return { bytes, contentType: "multipart/form-data; boundary=" + boundary };
+  };
   const cookieMap = (value) => {
     const result = new Map();
     for (const part of String(value).split(";")) {
@@ -288,8 +494,18 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const timers = new Map();
   let nextRequestId = 0;
   let nextTimerId = 0;
+  let outgoingIpcBytes = 0;
+  let outgoingNetworkBytes = 0;
+  let outgoingNetworkRequests = 0;
+  const postLine = (line) => {
+    const bytes = utf8Length(line) + 1;
+    if (bytes - 1 > MAX_OUTPUT_LINE_BYTES || outgoingIpcBytes + bytes > MAX_OUTPUT_BYTES) return false;
+    if (post(line) === false) return false;
+    outgoingIpcBytes += bytes;
+    return true;
+  };
   const send = (message) => {
-    try { post(JSON.stringify(message)); } catch {}
+    try { postLine(JSON.stringify(message)); } catch {}
   };
   const applyVisibleCookie = (text) => {
     const first = text.split(";", 1)[0] || "";
@@ -342,9 +558,50 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     return new Promise((resolve, reject) => cookieWaiters.push({ version: cookieVersion, resolve, reject }));
   };
   const request = (kind, url, method, headers, body) => flushCookies().then(() => new Promise((resolve, reject) => {
-    const id = ++nextRequestId;
-    pending.set(id, { resolve, reject, kind });
-    send({ type: "network", id, kind, url: String(url), method, headers: Array.from(headers), body, cookieVersion });
+    try {
+      if (outgoingNetworkRequests >= MAX_NETWORK_REQUESTS) throw new NativeTypeError("script network request budget exceeded");
+      if (headers.values.length > MAX_HEADERS) throw new NativeTypeError("script request exceeds the header-count limit");
+      let headerBytes = 0;
+      for (const [name, value] of headers.values) {
+        headerBytes += utf8Length(name) + utf8Length(value);
+        if (headerBytes > MAX_HEADER_BYTES) throw new NativeTypeError("script request headers exceed the 64 KiB limit");
+      }
+      if (body !== null && typeof body !== "string" && !(body instanceof NativeUint8Array)) throw new NativeTypeError("script request body must be a string or byte array");
+      let bodyLength = 0;
+      if (typeof body === "string") bodyLength = utf8Length(body);
+      else if (body !== null) bodyLength = body.byteLength;
+      if (bodyLength > MAX_REQUEST_BODY_BYTES) throw new NativeTypeError("script request body exceeds the 16 KiB limit");
+      const id = nextRequestId + 1;
+      const message = { type: "network", id, kind, url: String(url), method, headers: Array.from(headers), body: null, cookieVersion };
+      const metadataBytes = utf8Length(JSON.stringify(message));
+      let encodedBodyBytes = 4;
+      if (typeof body === "string") encodedBodyBytes = utf8Length(JSON.stringify(body));
+      else if (body instanceof NativeUint8Array) {
+        encodedBodyBytes = 2;
+        for (let index = 0; index < body.byteLength; index += 1) {
+          const value = body[index];
+          encodedBodyBytes += value < 10 ? 1 : value < 100 ? 2 : 3;
+          if (index > 0) encodedBodyBytes += 1;
+        }
+      }
+      const lineBytes = metadataBytes - 4 + encodedBodyBytes;
+      if (lineBytes > MAX_OUTPUT_LINE_BYTES) throw new NativeTypeError("script request exceeds the 128 KiB IPC line limit");
+      if (outgoingNetworkBytes + lineBytes > MAX_TOTAL_NETWORK_BYTES) throw new NativeTypeError("script network byte budget exceeded");
+      if (outgoingIpcBytes + lineBytes + 1 > MAX_OUTPUT_BYTES) throw new NativeTypeError("script runner output exceeds the 1 MiB limit");
+      message.body = body instanceof NativeUint8Array ? Array.from(body) : body;
+      const line = JSON.stringify(message);
+      if (utf8Length(line) !== lineBytes) throw new NativeError("script request IPC size mismatch");
+      pending.set(id, { resolve, reject, kind });
+      if (!postLine(line)) {
+        pending.delete(id);
+        throw new NativeTypeError("script request exceeds the runner IPC budget");
+      }
+      nextRequestId = id;
+      outgoingNetworkBytes += lineBytes;
+      outgoingNetworkRequests += 1;
+    } catch (cause) {
+      reject(cause);
+    }
   }));
   const safeMessage = (cause) => {
     try {
@@ -445,10 +702,19 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
       const url = typeof input === "string" ? input : input && input.url;
       if (typeof url !== "string") throw new TypeError("fetch expects a URL string");
       const method = String(init.method || "GET").toUpperCase();
-      const body = init.body == null ? null : typeof init.body === "string" ? init.body : null;
-      if (init.body != null && body === null) throw new TypeError("fetch supports string request bodies only");
+      const headers = new Headers(init.headers);
+      let body = null;
+      if (init.body instanceof FormData) {
+        if (method === "GET" || method === "HEAD") throw new TypeError("GET and HEAD cannot have a body");
+        const multipart = serializeFormData(init.body);
+        body = multipart.bytes;
+        if (!headers.has("content-type")) headers.set("content-type", multipart.contentType);
+      } else if (init.body != null) {
+        if (typeof init.body !== "string") throw new TypeError("fetch supports string and FormData request bodies only");
+        body = init.body;
+      }
       if ((method === "GET" || method === "HEAD") && body !== null) throw new TypeError("GET and HEAD cannot have a body");
-      return request("fetch", url, method, new Headers(init.headers), body).then((value) => new Response(value));
+      return request("fetch", url, method, headers, body).then((value) => new Response(value));
     } catch (cause) { return Promise.reject(cause); }
   };
   function XMLHttpRequest() {
@@ -503,7 +769,11 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   };
   XMLHttpRequest.prototype.send = function(body = null) {
     if (this.readyState !== 1) throw new TypeError("open() must be called before send()");
-    if (body !== null && typeof body !== "string") throw new TypeError("XMLHttpRequest supports string request bodies only");
+    if (body instanceof FormData) {
+      const multipart = serializeFormData(body);
+      body = multipart.bytes;
+      if (!this._headers.has("content-type")) this._headers.set("content-type", multipart.contentType);
+    } else if (body !== null && typeof body !== "string") throw new TypeError("XMLHttpRequest supports string and FormData request bodies only");
     request("fetch", this._url, this._method, this._headers, body).then((value) => {
       this.status = value.status;
       this.statusText = "";
@@ -803,7 +1073,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event, ProgressEvent, Blob, FileReader });
+  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event, ProgressEvent, Blob, FileReader, FormData });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
@@ -843,6 +1113,8 @@ const hostRandomBytes = (byteLength) => {
 const MAX_INPUT_LINE_BYTES = ${limits.maxInputLineBytes};
 const MAX_CONTROL_INPUT_LINE_BYTES = ${limits.maxControlInputLineBytes};
 const MAX_OUTPUT_LINE_BYTES = ${limits.maxOutputLineBytes};
+const MAX_OUTPUT_BYTES = ${limits.maxOutputBytes};
+let outputBytes = 0;
 const pendingKinds = new Map();
 let context;
 let deliver;
@@ -861,14 +1133,14 @@ const writeFinal = (output) => {
 };
 const post = (line) => {
   try {
-    if (typeof line !== "string" || Buffer.byteLength(line) > MAX_OUTPUT_LINE_BYTES) {
-      process.stdout.write(JSON.stringify({ type: "script.error", reason: "runner message exceeds the limit" }) + "\n");
-      return;
-    }
+    const bytes = Buffer.byteLength(line) + 1;
+    if (typeof line !== "string" || bytes - 1 > MAX_OUTPUT_LINE_BYTES || outputBytes + bytes > MAX_OUTPUT_BYTES) return false;
     const message = JSON.parse(line);
     if (message.type === "network") pendingKinds.set(message.id, message.kind);
+    outputBytes += bytes;
     process.stdout.write(line + "\n");
-  } catch {}
+    return true;
+  } catch { return false; }
 };
 const bootstrap = ${JSON.stringify(bootstrap)};
 const handleParentLine = (line) => {

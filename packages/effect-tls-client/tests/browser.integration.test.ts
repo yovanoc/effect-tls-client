@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
 import { execFile } from "node:child_process";
+import { Buffer } from "node:buffer";
 import path from "node:path";
 import { createServer, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
@@ -195,6 +196,10 @@ describeRealIntegration("real BrowserMock integration", () => {
         const targetRequests: Array<{
           readonly authorization: string;
           readonly cookie: string;
+          readonly path: string;
+          readonly method: string;
+          readonly contentType: string;
+          readonly body: Buffer;
         }> = [];
         let targetUrl = "";
         const source = createServer((request, response) => {
@@ -218,12 +223,21 @@ describeRealIntegration("real BrowserMock integration", () => {
           }
         });
         const target = createServer((request, response) => {
-          targetRequests.push({
-            authorization: request.headers.authorization ?? "",
-            cookie: request.headers.cookie ?? "",
+          const chunks: Array<Buffer> = [];
+          request.on("data", (chunk: Buffer) => chunks.push(chunk));
+          request.on("end", () => {
+            const contentType = request.headers["content-type"];
+            targetRequests.push({
+              authorization: request.headers.authorization ?? "",
+              cookie: request.headers.cookie ?? "",
+              path: new URL(request.url ?? "/", "http://localhost").pathname,
+              method: request.method ?? "",
+              contentType: typeof contentType === "string" ? contentType : "",
+              body: Buffer.concat(chunks),
+            });
+            response.setHeader("set-cookie", "cross=must-not-stick; Path=/");
+            response.end("target");
           });
-          response.setHeader("set-cookie", "cross=must-not-stick; Path=/");
-          response.end("target");
         });
         const servers = [source, target];
         const [sourceUrl, otherUrl] = yield* Effect.promise(async () =>
@@ -262,9 +276,23 @@ describeRealIntegration("real BrowserMock integration", () => {
                 challengeHandler: (_challenge, context) =>
                   Effect.gen(function* () {
                     const value = yield* context.evaluate(
-                      `const before = await fetch("${sourceUrl}/echo").then((r) => r.text()); const cross = await fetch("${otherUrl}/echo").then((r) => r.text()); const after = await fetch("${sourceUrl}/echo").then((r) => r.text()); const redirected = await fetch("${sourceUrl}/redirect").then((r) => r.text()); return [before, cross, after, redirected].join("|");`,
+                      `
+                        const before = await fetch("${sourceUrl}/echo").then((r) => r.text());
+                        const cross = await fetch("${otherUrl}/echo").then((r) => r.text());
+                        const form = new FormData();
+                        form.append('naïve "name"\\r\\n', "café\\nline");
+                        form.append("duplicate", "first");
+                        form.append("duplicate", "second");
+                        form.append("cr\\rname", "cr");
+                        form.append("lf\\nname", "lf");
+                        form.append("binary", new Blob([new Uint8Array([0, 255, 128, 13, 10])], { type: "application/octet-stream" }));
+                        const uploaded = await fetch("${otherUrl}/upload", { method: "POST", body: form }).then((r) => r.text());
+                        const after = await fetch("${sourceUrl}/echo").then((r) => r.text());
+                        const redirected = await fetch("${sourceUrl}/redirect").then((r) => r.text());
+                        return [before, cross, uploaded, after, redirected].join("|");
+                      `,
                     );
-                    expect(value).toBe("source|target|source|target");
+                    expect(value).toBe("source|target|target|source|target");
                     return Option.none();
                   }),
               },
@@ -293,11 +321,39 @@ describeRealIntegration("real BrowserMock integration", () => {
           authorization: "Bearer fixture",
           cookie: "page=fixture",
         });
-        expect(targetRequests).toHaveLength(2);
-        expect(targetRequests).toEqual([
+        expect(targetRequests).toHaveLength(3);
+        expect(
+          targetRequests.map(({ authorization, cookie }) => ({
+            authorization,
+            cookie,
+          })),
+        ).toEqual([
+          { authorization: "", cookie: "" },
           { authorization: "", cookie: "" },
           { authorization: "", cookie: "" },
         ]);
+        const upload = targetRequests[1] ?? null;
+        expect(upload).not.toBeNull();
+        if (upload === null) return;
+        expect(upload).toMatchObject({ path: "/upload", method: "POST" });
+        const boundaryMatch = /^multipart\/form-data; boundary=(.+)$/u.exec(
+          upload.contentType,
+        );
+        expect(boundaryMatch).not.toBeNull();
+        if (boundaryMatch === null) return;
+        const boundary = boundaryMatch[1] ?? null;
+        expect(boundary).not.toBeNull();
+        if (boundary === null) return;
+        expect(boundary).toMatch(/^----BrowserMockFormBoundary[0-9a-f]{32}$/u);
+        const expected = Buffer.concat([
+          Buffer.from(
+            `--${boundary}\r\nContent-Disposition: form-data; name="naïve %22name%22%0D%0A"\r\n\r\ncafé\r\nline\r\n--${boundary}\r\nContent-Disposition: form-data; name="duplicate"\r\n\r\nfirst\r\n--${boundary}\r\nContent-Disposition: form-data; name="duplicate"\r\n\r\nsecond\r\n--${boundary}\r\nContent-Disposition: form-data; name="cr%0D%0Aname"\r\n\r\ncr\r\n--${boundary}\r\nContent-Disposition: form-data; name="lf%0D%0Aname"\r\n\r\nlf\r\n--${boundary}\r\nContent-Disposition: form-data; name="binary"; filename="blob"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+            "utf8",
+          ),
+          Buffer.from([0, 255, 128, 13, 10]),
+          Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"),
+        ]);
+        expect(upload.body).toEqual(expected);
       }),
   );
 

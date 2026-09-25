@@ -36,6 +36,7 @@ const MAX_SCRIPT_REDIRECTS = 5;
 const MAX_FETCH_RESPONSE_BYTES = 64 * 1024;
 const MAX_SCRIPT_ASSET_BYTES = 1024 * 1024;
 const MAX_SCRIPT_NETWORK_BYTES = 1024 * 1024;
+const MAX_SCRIPT_REQUEST_BODY_BYTES = 16 * 1024;
 const MAX_SCRIPT_HEADERS = 128;
 const MAX_SCRIPT_HEADER_BYTES = 64 * 1024;
 const SCRIPT_CONTROLLED_HEADERS = new Set([
@@ -609,10 +610,20 @@ const makeScriptHost = (
                 );
               }
             }
-            if (
-              (method === "GET" || method === "HEAD") &&
-              input.body !== null
-            ) {
+            const body =
+              input.bodyBytes === null ? input.body : input.bodyBytes;
+            let bodyLength = 0;
+            if (typeof body === "string") {
+              bodyLength = new TextEncoder().encode(body).byteLength;
+            } else if (body !== null) {
+              bodyLength = body.length;
+            }
+            if (bodyLength > MAX_SCRIPT_REQUEST_BODY_BYTES) {
+              throw new TypeError(
+                "script request body exceeds the 16 KiB limit",
+              );
+            }
+            if ((method === "GET" || method === "HEAD") && body !== null) {
               throw new TypeError(
                 `${method} script requests cannot have a body`,
               );
@@ -620,7 +631,7 @@ const makeScriptHost = (
             return {
               method,
               headers: [...input.headers],
-              body: input.body,
+              body,
             };
           },
           catch: (cause) =>
@@ -684,12 +695,16 @@ const makeScriptHost = (
             });
           }
           networkBytes += requestBytes;
+          const requestBody: string | Uint8Array | null =
+            body === null || typeof body === "string"
+              ? body
+              : new Uint8Array(body);
           const response = yield* transport
             .request(target.toString(), {
               method,
               headers: outgoingHeaders,
               ...(headerOrder === undefined ? {} : { headerOrder }),
-              ...(body === null ? {} : { body }),
+              ...(requestBody === null ? {} : { body: requestBody }),
               followRedirects: false,
               omitCredentials,
             })

@@ -41,7 +41,9 @@ export interface BrowserScriptRequest {
   readonly url: string;
   readonly method: string;
   readonly headers: ReadonlyArray<readonly [string, string]>;
+  /** At most one of the string and raw-byte body fields is non-null. */
   readonly body: string | null;
+  readonly bodyBytes: ReadonlyArray<number> | null;
 }
 
 export interface BrowserScriptNetworkResponse {

@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Fiber, Layer, Stream } from "effect";
 import * as Schema from "effect/Schema";
@@ -18,6 +19,27 @@ import {
 } from "../src/browser/index.js";
 
 const bodyBytes = (body: string): Uint8Array => new TextEncoder().encode(body);
+
+const multipartRequestBytes = (
+  request: Parameters<BrowserScriptHost["request"]>[0],
+): Uint8Array => {
+  if (request.bodyBytes === null) {
+    throw new TypeError("request does not contain raw multipart bytes");
+  }
+  return new Uint8Array(request.bodyBytes);
+};
+
+const concatBytes = (...chunks: ReadonlyArray<Uint8Array>): Uint8Array => {
+  const output = new Uint8Array(
+    chunks.reduce((size, chunk) => size + chunk.byteLength, 0),
+  );
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
+};
 
 type Call = {
   readonly url: string;
@@ -488,6 +510,7 @@ describe("browser layer", () => {
           method: "GET",
           headers: [],
           body: null,
+          bodyBytes: null,
         })
         .pipe(Effect.map(({ body }) => body)),
     );
@@ -531,6 +554,7 @@ describe("browser layer", () => {
             method: "GET",
             headers: [],
             body: null,
+            bodyBytes: null,
           });
         }
         return "unreachable";
@@ -579,6 +603,7 @@ describe("browser layer", () => {
           method: "GET",
           headers: [],
           body: null,
+          bodyBytes: null,
         })
         .pipe(Effect.map(({ body }) => body)),
     );
@@ -771,6 +796,340 @@ describe("browser layer", () => {
       ),
     ),
   );
+
+  it.layer(
+    BrowserMock.layer({ allowedOrigins: ["https://example.test"] }).pipe(
+      Layer.provide(NodeServices.layer),
+    ),
+    { excludeTestServices: true },
+  )("context-local FormData", ({ effect: testEffect }) => {
+    testEffect(
+      "preserves ordered duplicates, value types, iteration, and isolation",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const result = yield* runtime.evaluate(`
+          const localTypeError = (error) => error instanceof TypeError &&
+            error.constructor === TypeError && Object.getPrototypeOf(error) === TypeError.prototype;
+          const data = new FormData();
+          const sourceBlob = new Blob(["data"], { type: "text/plain" });
+          data.append("duplicate", "first");
+          data.append("middle", "one");
+          data.append("duplicate", "second");
+          data.append("middle", "two");
+          data.append("blob", sourceBlob);
+          data.append("coerced", 23);
+          const describe = (value) => typeof value === "string" ? value : "blob:" + value.type + ":" + value.size;
+          const entries = () => Array.from(data, ([name, value]) => name + ":" + describe(value)).join(",");
+          const initial = entries();
+          const duplicates = data.getAll("duplicate");
+          const getAllCopy = duplicates.length === 2 && Object.getPrototypeOf(duplicates) === Array.prototype;
+          duplicates.pop();
+          const getAllIndependent = data.getAll("duplicate").length === 2;
+          const storedBlob = data.get("blob");
+          data.set("duplicate", "updated");
+          const calls = [];
+          const receiver = {};
+          data.forEach(function(value, name, parent) {
+            calls.push((this === receiver) + ":" + name + ":" + describe(value) + ":" + (parent === data));
+          }, receiver);
+          const keys = Array.from(data.keys()).join(",");
+          const values = Array.from(data.values(), describe).join(",");
+          const iterator = data.entries();
+          const pair = iterator.next().value;
+          pair[1] = "changed";
+          const iteratorLocal = pair instanceof Array && Object.getPrototypeOf(pair) === Array.prototype &&
+            iterator[Symbol.iterator]() === iterator && data.get("duplicate") === "updated";
+          data.delete("middle");
+          let constructorRejected = false;
+          try { new FormData({}); } catch (error) { constructorRejected = localTypeError(error); }
+          let filenameRejected = false;
+          try { data.append("file", sourceBlob, "name.txt"); }
+          catch (error) { filenameRejected = localTypeError(error); }
+          const blocked = (value) => {
+            try { value.constructor.constructor("return process")(); return false; }
+            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+          };
+          return [
+            FormData === window.FormData && data instanceof FormData && Object.getPrototypeOf(data) === FormData.prototype,
+            initial,
+            getAllCopy && getAllIndependent && data.getAll("duplicate").join(",") === "updated",
+            keys,
+            values,
+            calls.join(","),
+            iteratorLocal,
+            !data.has("middle") && data.get("middle") === null && data.getAll("middle").length === 0,
+            entries(),
+            storedBlob instanceof Blob && storedBlob !== sourceBlob && await storedBlob.text() === "data",
+            constructorRejected,
+            filenameRejected,
+            typeof HTMLFormElement === "undefined" && typeof File === "undefined",
+            blocked(data) && blocked(FormData.prototype.append) && blocked(storedBlob),
+          ].join("|");
+        `);
+          expect(result.value).toBe(
+            "true|duplicate:first,middle:one,duplicate:second,middle:two,blob:blob:text/plain:4,coerced:23|true|duplicate,middle,middle,blob,coerced|updated,one,two,blob:text/plain:4,23|true:duplicate:updated:true,true:middle:one:true,true:middle:two:true,true:blob:blob:text/plain:4:true,true:coerced:23:true|true|true|duplicate:updated,blob:blob:text/plain:4,coerced:23|true|true|true|true|true",
+          );
+        }),
+    );
+    testEffect(
+      "charges FormData names, strings, and copied Blobs to the shared quota",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const result = yield* runtime.evaluate(`
+          const localQuotaError = (error) => error instanceof Error &&
+            error.constructor === Error && Object.getPrototypeOf(error) === Error.prototype &&
+            error.name === "QuotaExceededError";
+          const data = new FormData();
+          data.append("text", "t".repeat(300000));
+          const blob = new Blob(["b".repeat(300000)], { type: "text/plain" });
+          data.append("blob", blob);
+          let quotaRejected = false;
+          try { data.append("overflow", "o".repeat(200000)); }
+          catch (error) { quotaRejected = localQuotaError(error); }
+          const names = new FormData();
+          names.append("n".repeat(100000), "");
+          let nameQuotaRejected = false;
+          try { names.append("n".repeat(50000), ""); }
+          catch (error) { nameQuotaRejected = localQuotaError(error); }
+          const entries = new FormData();
+          for (let index = 0; index < 256; index += 1) entries.append("", "");
+          let entryLimitRejected = false;
+          try { entries.append("", ""); }
+          catch (error) { entryLimitRejected = error instanceof TypeError && error.message.includes("256-entry"); }
+          return [data.get("text").length, data.get("blob").size, quotaRejected, nameQuotaRejected, entryLimitRejected].join("|");
+        `);
+          expect(result.value).toBe("300000|300000|true|true|true");
+        }),
+    );
+    testEffect(
+      "encodes Fetch and XHR FormData as bounded multipart bytes",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const requests: Array<Parameters<BrowserScriptHost["request"]>[0]> =
+            [];
+          const host: BrowserScriptHost = {
+            request: (input) =>
+              Effect.sync(() => {
+                requests.push(input);
+                return {
+                  status: 200,
+                  url: input.url,
+                  headers: [],
+                  body: "ok",
+                  cookie: "",
+                };
+              }),
+            setCookie: () => Effect.succeed(""),
+          };
+          const result = yield* runtime.evaluate(
+            `
+            const data = new FormData();
+            data.append('naïve "name"\\r\\n', "café\\nline");
+            data.append("duplicate", "first");
+            data.append("duplicate", "second");
+            data.append("cr\\rname", "cr");
+            data.append("lf\\nname", "lf");
+            data.append("binary", new Blob([new Uint8Array([0, 255, 128, 13, 10])], { type: "application/octet-stream" }));
+            const fetched = await fetch("https://example.test/fetch", { method: "POST", body: data });
+            const custom = new FormData();
+            custom.append("value", "fetch");
+            await fetch("https://example.test/custom", { method: "POST", headers: { "content-type": "application/custom" }, body: custom });
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", "https://example.test/xhr");
+            xhr.setRequestHeader("content-type", "application/custom-xhr");
+            const xhrResult = new Promise((resolve, reject) => {
+              xhr.onload = () => resolve(xhr.status + ":" + xhr.responseText);
+              xhr.onerror = () => reject(new Error("XHR failed"));
+            });
+            const xhrData = new FormData();
+            xhrData.append("value", "xhr");
+            xhr.send(xhrData);
+            let filenameRejected = false;
+            try { data.append("filename", new Blob([]), "explicit.txt"); }
+            catch (error) { filenameRejected = error instanceof TypeError && error.message.includes("filenames"); }
+            let blobFetchRejected = false;
+            try { await fetch("https://example.test/blob", { method: "POST", body: new Blob(["raw"]) }); }
+            catch (error) { blobFetchRejected = error instanceof TypeError; }
+            const blobXhr = new XMLHttpRequest();
+            blobXhr.open("POST", "https://example.test/blob-xhr");
+            let blobXhrRejected = false;
+            try { blobXhr.send(new Blob(["raw"])); }
+            catch (error) { blobXhrRejected = error instanceof TypeError; }
+            return fetched.status + ":" + await fetched.text() + "|" + await xhrResult + "|" + filenameRejected + "|" + blobFetchRejected + "|" + blobXhrRejected;
+          `,
+            {
+              url: "https://example.test/",
+              cookie: "",
+              userAgent: "",
+            },
+            host,
+          );
+          expect(result.value).toBe("200:ok|200:ok|true|true|true");
+          expect(requests).toHaveLength(3);
+
+          const fetchRequest = requests[0] ?? null,
+            customFetch = requests[1] ?? null,
+            customXhr = requests[2] ?? null;
+          expect(fetchRequest).not.toBeNull();
+          expect(customFetch).not.toBeNull();
+          expect(customXhr).not.toBeNull();
+          if (
+            fetchRequest === null ||
+            customFetch === null ||
+            customXhr === null
+          ) {
+            return;
+          }
+          const contentTypeEntry =
+            fetchRequest.headers.find(
+              ([name]) => name.toLowerCase() === "content-type",
+            ) ?? null;
+          expect(contentTypeEntry).not.toBeNull();
+          if (contentTypeEntry === null) return;
+          const contentType = contentTypeEntry[1];
+          expect(contentType).toMatch(
+            /^multipart\/form-data; boundary=----BrowserMockFormBoundary[0-9a-f]{32}$/u,
+          );
+          const boundary = contentType.slice(
+            contentType.indexOf("boundary=") + 9,
+          );
+          const expected = concatBytes(
+            bodyBytes(
+              `--${boundary}\r\nContent-Disposition: form-data; name="naïve %22name%22%0D%0A"\r\n\r\ncafé\r\nline\r\n--${boundary}\r\nContent-Disposition: form-data; name="duplicate"\r\n\r\nfirst\r\n--${boundary}\r\nContent-Disposition: form-data; name="duplicate"\r\n\r\nsecond\r\n--${boundary}\r\nContent-Disposition: form-data; name="cr%0D%0Aname"\r\n\r\ncr\r\n--${boundary}\r\nContent-Disposition: form-data; name="lf%0D%0Aname"\r\n\r\nlf\r\n--${boundary}\r\nContent-Disposition: form-data; name="binary"; filename="blob"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+            ),
+            new Uint8Array([0, 255, 128, 13, 10]),
+            bodyBytes(`\r\n--${boundary}--\r\n`),
+          );
+          expect(Array.from(multipartRequestBytes(fetchRequest))).toEqual(
+            Array.from(expected),
+          );
+          expect(customFetch.headers).toContainEqual([
+            "content-type",
+            "application/custom",
+          ]);
+          expect(customXhr.headers).toContainEqual([
+            "content-type",
+            "application/custom-xhr",
+          ]);
+          const xhrText = new TextDecoder().decode(
+            multipartRequestBytes(customXhr),
+          );
+          const xhrBoundaryMatch =
+            /^--(----BrowserMockFormBoundary[0-9a-f]{32})\r\n/u.exec(xhrText);
+          expect(xhrBoundaryMatch).not.toBeNull();
+          if (xhrBoundaryMatch === null) return;
+          const xhrBoundary = xhrBoundaryMatch[1] ?? null;
+          expect(xhrBoundary).not.toBeNull();
+          if (xhrBoundary === null) return;
+          expect(xhrText).toBe(
+            `--${xhrBoundary}\r\nContent-Disposition: form-data; name="value"\r\n\r\nxhr\r\n--${xhrBoundary}--\r\n`,
+          );
+        }),
+    );
+    testEffect(
+      "keeps multipart boundaries safe from script prototype mutation",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+          const host: BrowserScriptHost = {
+            request: (input) =>
+              Effect.sync(() => {
+                requests.push(input);
+                return {
+                  body: "ok",
+                  cookie: "",
+                  headers: [],
+                  status: 200,
+                  url: input.url,
+                };
+              }),
+            setCookie: () => Effect.succeed(""),
+          };
+          const source = String.raw`
+            Number.prototype.toString = () => "0x";
+            const injectedBoundary = "----BrowserMockFormBoundary" + "0x".repeat(16);
+            const crlf = "\r\n";
+            const embedded = crlf + "--" + injectedBoundary + crlf +
+              'Content-Disposition: form-data; name="injected"' +
+              crlf + crlf + "forged" + crlf + "--" + injectedBoundary + "--" + crlf;
+            const data = new FormData();
+            data.append("upload", new Blob(["prefix" + embedded], { type: "text/plain" }));
+            await fetch("https://example.test/upload", { method: "POST", body: data });
+            return embedded;
+          `;
+          const result = yield* runtime.evaluate(
+            source,
+            {
+              url: "https://example.test/",
+              cookie: "",
+              userAgent: "",
+            },
+            host,
+          );
+          expect(result.value).toContain(
+            'Content-Disposition: form-data; name="injected"',
+          );
+          expect(requests).toHaveLength(1);
+          const [request] = requests;
+          assert(request);
+          const contentTypeHeader = request.headers.find(
+            ([name]) => name === "content-type",
+          );
+          assert(contentTypeHeader);
+          const [, contentType] = contentTypeHeader;
+          expect(contentType).toMatch(
+            /^multipart\/form-data; boundary=----BrowserMockFormBoundary[0-9a-f]{32}$/u,
+          );
+          const boundaryPrefix = "boundary=";
+          const boundary = contentType.slice(
+            contentType.indexOf(boundaryPrefix) + boundaryPrefix.length,
+          );
+          const body = new TextDecoder().decode(multipartRequestBytes(request));
+          expect(body).toContain(`prefix${result.value}`);
+          expect(body).not.toContain(
+            `\r\n--${boundary}\r\nContent-Disposition: form-data; name="injected"`,
+          );
+        }),
+    );
+    testEffect("rejects oversized multipart bodies before host dispatch", () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        let requests = 0;
+        const host: BrowserScriptHost = {
+          request: () =>
+            Effect.sync(() => {
+              requests += 1;
+              return {
+                status: 200,
+                url: "https://example.test/",
+                headers: [],
+                body: "unexpected",
+                cookie: "",
+              };
+            }),
+          setCookie: () => Effect.succeed(""),
+        };
+        const result = yield* runtime.evaluate(
+          `
+            const data = new FormData();
+            data.append("binary", new Blob([new Uint8Array(16 * 1024)]));
+            let rejected = false;
+            try { await fetch("https://example.test/", { method: "POST", body: data }); }
+            catch (error) { rejected = error instanceof TypeError && error.message.includes("16 KiB"); }
+            return String(rejected);
+          `,
+          { url: "https://example.test/", cookie: "", userAgent: "" },
+          host,
+        );
+        expect(result.value).toBe("true");
+        expect(requests).toBe(0);
+      }),
+    );
+  });
 
   it.live("enforces the context-local Blob allocation quota", () =>
     Effect.gen(function* () {
