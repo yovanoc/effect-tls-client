@@ -150,6 +150,35 @@ it.layer(
       }),
   );
   it.effect(
+    "hides private callbacks and prevents cookie-sync forgery in both realms",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const check = `
+        const before = document.cookie;
+        let rejected = false;
+        try { __receive(JSON.stringify({type:'cookie.sync',cookie:'frame=forged',version:1,applied:true})); }
+        catch (error) { if (!(error instanceof ReferenceError)) throw error; rejected = true; }
+        if (typeof __receive !== 'undefined' || !rejected || document.cookie !== before) throw new Error('cookie-sync forgery');
+        for (const key of ['__receive','__cookieSnapshot','__cookieFlush','__safeMessage','__post','__childRealm','__consumeBudget','__urlOperation','__pageUrl','__pageLocation','__referrer','__cookie','__userAgent','__languages','__authoritativeCookies','__performanceNow','__performanceTimeOrigin','__randomBytes','__cryptoOperation','__encodeBlobText','__decodeBlobText']) {
+          if (typeof globalThis[key] !== 'undefined' || key in globalThis) throw new Error('private binding visible: ' + key);
+        }
+      `;
+        const result = yield* runtime.evaluate(
+          check + append(),
+          context,
+          host([check], "granted=fixture"),
+        );
+        expect(parseOutcome(result.value)).toEqual({
+          outcome: "load",
+          marker: "parent",
+          opaque: true,
+          noRealm: false,
+        });
+        expect(result.setCookies).toEqual([]);
+      }),
+  );
+  it.effect(
     "cross-origin child has no cookies, private referrer, DOM alias, or network authority",
     () =>
       Effect.gen(function* () {

@@ -1873,6 +1873,10 @@ const post = (line, owner = context) => {
   } catch { return false; }
 };
 const bootstrap = ${JSON.stringify(bootstrap)};
+// Node 25 can retain VM-created globals after deletion through the host sandbox.
+// These fixed kernel sources run before any guest code and verify realm-local removal.
+const cleanupPrivateBindings = "{ for (const key of ['__receive', '__post', '__childRealm', '__consumeBudget', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const handleParentLine = (line) => {
   try {
     if (Buffer.byteLength(line) > MAX_INPUT_LINE_BYTES) throw new Error("host IPC line exceeds the limit");
@@ -1968,23 +1972,9 @@ const createRealm = (input, childRealm) => {
   });
   const realm = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
   run(bootstrap, realm);
-  delete sandbox.__post;
-  delete sandbox.__urlOperation;
-  delete sandbox.__pageUrl;
-  delete sandbox.__pageLocation;
-  delete sandbox.__referrer;
-  delete sandbox.__cookie;
-  delete sandbox.__userAgent;
-  delete sandbox.__languages;
   receivers.set(realm, run("__receive", realm));
-  delete sandbox.__receive;
-  delete sandbox.__performanceNow;
-  delete sandbox.__performanceTimeOrigin;
-  delete sandbox.__randomBytes;
-  delete sandbox.__cryptoOperation;
-  delete sandbox.__encodeBlobText;
-  delete sandbox.__decodeBlobText;
-  if (childRealm) { delete sandbox.__cookieSnapshot; delete sandbox.__cookieFlush; delete sandbox.__safeMessage; }
+  run(cleanupPrivateBindings, realm);
+  if (childRealm) run(cleanupCookieBindings, realm);
   return realm;
 };
 const start = (input) => {
@@ -1994,7 +1984,7 @@ const start = (input) => {
   context = createRealm(input, false);
   const wrapper = "(async function () {\n" +
     "  const snapshot = __cookieSnapshot; const flush = __cookieFlush; const describe = __safeMessage;\n" +
-    "  delete globalThis.__cookieSnapshot; delete globalThis.__cookieFlush; delete globalThis.__safeMessage;\n" +
+    cleanupCookieBindings + "\n" +
     "  try { const value = await (async function () {\n" + input.source + "\n})(); await flush();\n" +
     "    const state = JSON.parse(snapshot()); if (state.error) return JSON.stringify({ ok: false, reason: state.error });\n" +
     "    return JSON.stringify({ ok: true, value: String(value == null ? \"\" : value), setCookies: state.setCookies });\n" +
