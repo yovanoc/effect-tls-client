@@ -31,6 +31,10 @@
       "types": "./dist/browser/index.d.mts",
       "import": "./dist/browser/index.mjs"
     },
+    "./challenges/aws-waf": {
+      "types": "./dist/challenges/aws-waf.d.mts",
+      "import": "./dist/challenges/aws-waf.mjs"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

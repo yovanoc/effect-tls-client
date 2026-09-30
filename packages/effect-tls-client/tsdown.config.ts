@@ -1,7 +1,11 @@
 import { defineConfig } from "tsdown";
 
 export default defineConfig({
-  entry: ["src/index.ts", "src/browser/index.ts"],
+  entry: {
+    index: "src/index.ts",
+    "browser/index": "src/browser/index.ts",
+    "challenges/aws-waf": "src/challenges/AwsWaf.ts",
+  },
   outDir: "dist",
   format: "esm",
   clean: true,

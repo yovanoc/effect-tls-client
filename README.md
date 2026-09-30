@@ -181,7 +181,10 @@ await Effect.runPromise(
 ```
 
 See [docs/browser.md](docs/browser.md) for the runnable Node/Bun example,
-cookie ownership, and challenge limitations.
+cookie ownership, and challenge limitations. AWS WAF support is a separate,
+experimental import from `effect-tls-client/challenges/aws-waf`; it does not
+change default browser behavior or enter the core barrel. The browser guide has
+an explicit-origin, reviewed-bootstrap example and its limitations.
 
 ### WebSockets
 

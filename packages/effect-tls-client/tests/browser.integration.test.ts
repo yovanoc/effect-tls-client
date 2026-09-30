@@ -3,7 +3,7 @@ import { NodeServices } from "@effect/platform-node";
 import { execFile } from "node:child_process";
 import { Buffer } from "node:buffer";
 import path from "node:path";
-import { createServer, type Server } from "node:http";
+import { createServer, type Server, type ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
@@ -15,6 +15,7 @@ import {
   type Scope,
 } from "effect";
 import * as Browser from "../src/browser/index.js";
+import { awsWafChallengeHandler } from "../src/challenges/AwsWaf.js";
 import { TlsClient } from "../src/index.js";
 
 const bridgePath = process.env["TLS_CLIENT_BRIDGE_PATH"];
@@ -305,7 +306,7 @@ const acquisitionSource = (url: string, awaitStart = true): string =>
   ].join("\n");
 
 const withChallengeBrowser = <A, E>(
-  fixture: Awaited<ReturnType<typeof startAcquisitionFixture>>,
+  fixture: { readonly url: string },
   challengeHandler: Browser.BrowserChallengeHandler,
   use: (browser: Browser.BrowserSession) => Effect.Effect<A, E, Scope.Scope>,
 ): Effect.Effect<A, E | Browser.BrowserOperationError> =>
@@ -335,6 +336,189 @@ const listenLocal = (server: Server): Promise<string> =>
         resolve(`http://127.0.0.1:${address.port}`);
       }
     });
+  });
+
+type AwsFixtureBehavior =
+  | "success"
+  | "asset-404"
+  | "rejected"
+  | "empty-token"
+  | "no-cookie"
+  | "always-challenge"
+  | "asset-too-large"
+  | "reload";
+
+const startAwsWafFixture = async (
+  options: {
+    readonly behavior?: AwsFixtureBehavior;
+    readonly pageAcquisition?: boolean;
+    readonly crossOriginAsset?: boolean;
+    readonly freezeSdk?: boolean;
+  } = {},
+): Promise<{
+  readonly url: string;
+  readonly assetOrigin: string;
+  readonly paths: Array<string>;
+  readonly assetPaths: Array<string>;
+  readonly challengeCookies: Array<string>;
+  readonly verifyMethods: Array<string>;
+  readonly tokenWrites: Array<string>;
+  readonly close: () => Promise<void>;
+}> => {
+  const behavior = options.behavior ?? "success";
+  const paths: Array<string> = [];
+  const assetPaths: Array<string> = [];
+  const challengeCookies: Array<string> = [];
+  const verifyMethods: Array<string> = [];
+  const tokenWrites: Array<string> = [];
+  let pageUrl = "";
+  let assetUrl = "";
+
+  const serveChallengeScript = (response: ServerResponse) => {
+    if (behavior === "asset-404") {
+      response.statusCode = 404;
+      response.end("missing synthetic asset");
+      return;
+    }
+    response.setHeader("content-type", "text/javascript");
+    if (behavior === "asset-too-large") {
+      response.end("x".repeat(1024 * 1024 + 1));
+      return;
+    }
+    response.end(`
+      const syntheticAcquire = (method) => new Promise((resolve, reject) => {
+        setTimeout(async () => {
+          try {
+            const result = await fetch(window.syntheticWafConfig.verifyUrl, {
+              method: "POST",
+              body: method,
+            });
+            if (result.status < 200 || result.status >= 300) {
+              throw new Error("synthetic acquisition rejected");
+            }
+            resolve(window.syntheticWafConfig.behavior === "empty-token" ? "" : "synthetic-token");
+          } catch (error) {
+            reject(error);
+          }
+        }, 5);
+      });
+      window.AwsWafIntegration = {
+        getToken() { return syntheticAcquire("getToken"); },
+        forceRefreshToken() {
+          const pending = syntheticAcquire("forceRefreshToken");
+          return window.syntheticWafConfig.behavior === "reload"
+            ? pending.then(() => window.location.reload())
+            : pending;
+        },
+      };
+      ${options.freezeSdk === true ? "Object.freeze(window.AwsWafIntegration);" : ""}
+    `);
+  };
+
+  const assetServer = options.crossOriginAsset
+    ? createServer((request, response) => {
+        const route = new URL(request.url ?? "/", "http://localhost").pathname;
+        assetPaths.push(route);
+        if (route === "/challenge.js") serveChallengeScript(response);
+        else {
+          response.statusCode = 404;
+          response.end();
+        }
+      })
+    : undefined;
+
+  const server = createServer((request, response) => {
+    const route = new URL(request.url ?? "/", "http://localhost").pathname;
+    paths.push(route);
+    if (route === "/challenge") {
+      const hasToken = (request.headers.cookie ?? "")
+        .split(";")
+        .some((cookie) => cookie.trim().startsWith("aws-waf-token="));
+      challengeCookies.push(request.headers.cookie ?? "");
+      const accepted = hasToken && behavior !== "always-challenge";
+      response.statusCode = accepted ? 200 : 202;
+      if (!accepted) {
+        response.setHeader("x-amzn-waf-action", "challenge");
+        response.setHeader("content-type", "text/html");
+        const acquisition =
+          "if (window.syntheticWafConfig.pageAcquisition) window.AwsWafIntegration.forceRefreshToken();";
+        response.end(
+          `<!doctype html><script>window.syntheticWafConfig = ${JSON.stringify({
+            behavior,
+            pageAcquisition: options.pageAcquisition !== false,
+            verifyUrl: `${pageUrl}/verify`,
+          })};</script><script src="${assetUrl}"></script><script>${acquisition}</script>`,
+        );
+      } else {
+        response.end("synthetic success");
+      }
+      return;
+    }
+    if (route === "/challenge.js" && assetServer === undefined) {
+      serveChallengeScript(response);
+      return;
+    }
+    if (route === "/verify" && request.method === "POST") {
+      const chunks: Array<Buffer> = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        verifyMethods.push(Buffer.concat(chunks).toString("utf8"));
+        if (behavior === "rejected") {
+          response.statusCode = 403;
+          response.end("rejected");
+          return;
+        }
+        if (behavior !== "no-cookie") {
+          const cookie = `aws-waf-token=synthetic-${verifyMethods.length}; Path=/; HttpOnly`;
+          tokenWrites.push(cookie);
+          response.setHeader("set-cookie", cookie);
+        }
+        response.end("verified");
+      });
+      return;
+    }
+    if (route === "/ping") {
+      response.end("pong");
+      return;
+    }
+    response.statusCode = 404;
+    response.end();
+  });
+
+  pageUrl = await listenLocal(server);
+  const assetOrigin =
+    assetServer === undefined ? pageUrl : await listenLocal(assetServer);
+  assetUrl = `${assetOrigin}/challenge.js`;
+  const servers = assetServer === undefined ? [server] : [server, assetServer];
+  return {
+    url: pageUrl,
+    assetOrigin,
+    paths,
+    assetPaths,
+    challengeCookies,
+    verifyMethods,
+    tokenWrites,
+    close: () => Promise.all(servers.map(close)).then(() => {}),
+  };
+};
+
+const awsWafHandler = (
+  fixture: { readonly assetOrigin: string },
+  acquisition?: "page" | "getToken",
+) =>
+  awsWafChallengeHandler({
+    scriptOrigins: [fixture.assetOrigin],
+    bootstrap: (page) => {
+      expect(page.scripts.map(({ _tag }) => _tag)).toEqual([
+        "Inline",
+        "External",
+        "Inline",
+      ]);
+      return Effect.succeedSome({
+        scripts: page.scripts,
+        ...(acquisition === undefined ? {} : { acquisition }),
+      });
+    },
   });
 
 describeRealIntegration("real BrowserMock integration", () => {
@@ -993,6 +1177,274 @@ describeRealIntegration("real BrowserMock integration", () => {
         "/acq.js",
         "/verify",
       ]);
+    }),
+  );
+
+  it.live(
+    "observes page-selected forceRefreshToken and retries with the Go Jar",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(() => startAwsWafFixture());
+        const page = yield* withChallengeBrowser(
+          fixture,
+          awsWafHandler(fixture),
+          (browser) => browser.navigate(`${fixture.url}/challenge`),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+        expect(fixture.paths).toEqual([
+          "/challenge",
+          "/challenge.js",
+          "/verify",
+          "/challenge",
+        ]);
+        expect(fixture.verifyMethods).toEqual(["forceRefreshToken"]);
+        expect(fixture.challengeCookies[0]).toBe("");
+        expect(fixture.challengeCookies[1]).toContain(
+          "aws-waf-token=synthetic-1",
+        );
+        expect(page.status).toBe(200);
+        expect(page.body).toBe("synthetic success");
+      }),
+  );
+
+  it.live("uses the public getToken method when explicitly selected", () =>
+    Effect.gen(function* () {
+      const fixture = yield* Effect.promise(() =>
+        startAwsWafFixture({ pageAcquisition: false, freezeSdk: true }),
+      );
+      const page = yield* withChallengeBrowser(
+        fixture,
+        awsWafHandler(fixture, "getToken"),
+        (browser) => browser.navigate(`${fixture.url}/challenge`),
+      ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+      expect(fixture.paths).toEqual([
+        "/challenge",
+        "/challenge.js",
+        "/verify",
+        "/challenge",
+      ]);
+      expect(fixture.verifyMethods).toEqual(["getToken"]);
+      expect(page.status).toBe(200);
+    }),
+  );
+
+  const awsFailureCases = [
+    {
+      name: "a missing external asset",
+      behavior: "asset-404",
+      pageAcquisition: true,
+      freezeSdk: false,
+      acquisition: undefined,
+      paths: ["/challenge", "/challenge.js"],
+      methods: [],
+    },
+    {
+      name: "a rejected page acquisition",
+      behavior: "rejected",
+      pageAcquisition: true,
+      freezeSdk: false,
+      acquisition: undefined,
+      paths: ["/challenge", "/challenge.js", "/verify"],
+      methods: ["forceRefreshToken"],
+    },
+    {
+      name: "an empty public token",
+      behavior: "empty-token",
+      pageAcquisition: false,
+      freezeSdk: false,
+      acquisition: "getToken",
+      paths: ["/challenge", "/challenge.js", "/verify"],
+      methods: ["getToken"],
+    },
+    {
+      name: "a failed location.reload continuation",
+      behavior: "reload",
+      pageAcquisition: true,
+      freezeSdk: false,
+      acquisition: undefined,
+      paths: ["/challenge", "/challenge.js", "/verify"],
+      methods: ["forceRefreshToken"],
+    },
+    {
+      name: "a page with no observed acquisition",
+      behavior: "success",
+      pageAcquisition: false,
+      freezeSdk: false,
+      acquisition: undefined,
+      paths: ["/challenge", "/challenge.js"],
+      methods: [],
+    },
+  ] as const;
+
+  it.live.each(awsFailureCases)(
+    "$name fails visibly as BrowserScriptError without retry",
+    (testCase) =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(() =>
+          startAwsWafFixture({
+            behavior: testCase.behavior,
+            freezeSdk: testCase.freezeSdk,
+            pageAcquisition: testCase.pageAcquisition,
+          }),
+        );
+        const result = yield* withChallengeBrowser(
+          fixture,
+          awsWafHandler(fixture, testCase.acquisition),
+          (browser) =>
+            Effect.result(browser.navigate(`${fixture.url}/challenge`)),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") {
+          expect(result.failure).toMatchObject({
+            _tag: "BrowserScriptError",
+          });
+        }
+        expect(fixture.paths).toEqual(testCase.paths);
+        expect(fixture.verifyMethods).toEqual(testCase.methods);
+      }),
+  );
+
+  it.live("leaves a nonempty getToken result without a cookie visible", () =>
+    Effect.gen(function* () {
+      const fixture = yield* Effect.promise(() =>
+        startAwsWafFixture({
+          behavior: "no-cookie",
+          pageAcquisition: false,
+        }),
+      );
+      const page = yield* withChallengeBrowser(
+        fixture,
+        awsWafHandler(fixture, "getToken"),
+        (browser) => browser.navigate(`${fixture.url}/challenge`),
+      ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+      expect(page.status).toBe(202);
+      expect(page.challenge?.kind).toBe("AwsWaf");
+      expect(fixture.paths).toEqual(["/challenge", "/challenge.js", "/verify"]);
+      expect(fixture.verifyMethods).toEqual(["getToken"]);
+      expect(fixture.challengeCookies).toEqual([""]);
+      expect(fixture.tokenWrites).toEqual([]);
+    }),
+  );
+
+  it.live("fails page mode when frozen SDK methods cannot be observed", () =>
+    Effect.gen(function* () {
+      const fixture = yield* Effect.promise(() =>
+        startAwsWafFixture({ freezeSdk: true }),
+      );
+      const result = yield* withChallengeBrowser(
+        fixture,
+        awsWafHandler(fixture),
+        (browser) =>
+          Effect.result(browser.navigate(`${fixture.url}/challenge`)),
+      ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toMatchObject({
+          _tag: "BrowserScriptError",
+          reason: expect.stringContaining("cannot be observed"),
+        });
+      }
+      expect(fixture.paths).toEqual(["/challenge", "/challenge.js"]);
+      expect(fixture.verifyMethods).toEqual([]);
+      expect(fixture.tokenWrites).toEqual([]);
+      expect(fixture.challengeCookies).toEqual([""]);
+    }),
+  );
+
+  it.live(
+    "keeps handler origin trust separate from BrowserMock network policy",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(() =>
+          startAwsWafFixture({ crossOriginAsset: true }),
+        );
+        const result = yield* withChallengeBrowser(
+          fixture,
+          awsWafHandler(fixture),
+          (browser) =>
+            Effect.result(browser.navigate(`${fixture.url}/challenge`)),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") {
+          expect(result.failure).toMatchObject({
+            _tag: "BrowserScriptError",
+            reason: expect.stringContaining(
+              "script network origin is not allowed",
+            ),
+          });
+        }
+        expect(fixture.paths).toEqual(["/challenge"]);
+        expect(fixture.assetPaths).toEqual([]);
+      }),
+  );
+
+  it.live("enforces the existing 1 MiB AWS script-asset quota", () =>
+    Effect.gen(function* () {
+      const fixture = yield* Effect.promise(() =>
+        startAwsWafFixture({ behavior: "asset-too-large" }),
+      );
+      const result = yield* withChallengeBrowser(
+        fixture,
+        awsWafHandler(fixture),
+        (browser) =>
+          Effect.result(browser.navigate(`${fixture.url}/challenge`)),
+      ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+      expect(result._tag).toBe("Failure");
+      expect(result).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "BrowserScriptError" },
+      });
+      if (
+        result._tag === "Failure" &&
+        result.failure._tag === "BrowserScriptError"
+      ) {
+        expect(result.failure.reason).toContain(
+          "script asset exceeds the 1 MiB limit",
+        );
+      }
+      expect(fixture.paths).toEqual(["/challenge", "/challenge.js"]);
+      expect(fixture.verifyMethods).toEqual([]);
+    }),
+  );
+
+  it.live("caps AWS challenge retries at the configured limit", () =>
+    Effect.gen(function* () {
+      const fixture = yield* Effect.promise(() =>
+        startAwsWafFixture({ behavior: "always-challenge" }),
+      );
+      const page = yield* withChallengeBrowser(
+        fixture,
+        awsWafHandler(fixture),
+        (browser) => browser.navigate(`${fixture.url}/challenge`),
+      ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+      expect(fixture.paths).toEqual([
+        "/challenge",
+        "/challenge.js",
+        "/verify",
+        "/challenge",
+        "/challenge.js",
+        "/verify",
+        "/challenge",
+      ]);
+      expect(fixture.verifyMethods).toEqual([
+        "forceRefreshToken",
+        "forceRefreshToken",
+      ]);
+      expect(fixture.challengeCookies).toHaveLength(3);
+      expect(fixture.challengeCookies[1]).toContain(
+        "aws-waf-token=synthetic-1",
+      );
+      expect(fixture.challengeCookies[2]).toContain(
+        "aws-waf-token=synthetic-2",
+      );
+      expect(page.status).toBe(202);
     }),
   );
 });
