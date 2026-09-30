@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { createCipheriv } from "node:crypto";
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Fiber, Layer, Stream } from "effect";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import { NodeServices } from "@effect/platform-node";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import * as Cookies from "effect/unstable/http/Cookies";
 import type { TlsResponse, TlsSession } from "../src/TlsClient.js";
 import {
@@ -13,10 +15,12 @@ import {
   Chrome152Identity,
   fromSession,
   navigationHeaders,
+  reviewedChallengeHandler,
   runBoundedScript,
   xhrHeaders,
   type BrowserScriptHost,
   type BrowserScriptRuntime,
+  type ReviewedChallengeOptions,
 } from "../src/browser/index.js";
 
 const bodyBytes = (body: string): Uint8Array => new TextEncoder().encode(body);
@@ -184,6 +188,7 @@ const SCRIPT_URL_INPUT_LIMIT = 8_192;
 const session = (
   calls: Array<Call>,
   respond: (url: string) => TlsResponse,
+  readCookies: TlsSession["cookies"] = () => Effect.die("unused"),
 ): TlsSession => ({
   id: "browser-test",
   request: (url, options) =>
@@ -193,7 +198,7 @@ const session = (
       return respond(requestUrl);
     }),
   webSocket: () => Effect.die("unused"),
-  cookies: () => Effect.die("unused"),
+  cookies: readCookies,
   setCookies: () => Effect.die("unused"),
   scriptCookies: () => Effect.succeed(""),
   exportCookies: Effect.die("unused"),
@@ -202,6 +207,18 @@ const session = (
   resetBandwidth: Effect.void,
   setProxy: () => Effect.die("unused"),
 });
+
+const cookieReader = (
+  values: ReadonlyArray<Cookies.Cookies>,
+  urls: Array<string>,
+): TlsSession["cookies"] => {
+  let index = 0;
+  return (url) =>
+    Effect.sync(() => {
+      urls.push(url);
+      return values[index++] ?? Cookies.empty;
+    });
+};
 
 describe("browser layer", () => {
   it("applies strict-origin referrer policy", () => {
@@ -225,10 +242,12 @@ describe("browser layer", () => {
     () => {
       const calls: Call[] = [];
       let scriptReferrer = "";
+      let scriptLanguages: ReadonlyArray<string> | undefined;
       const runtime: BrowserScriptRuntime = {
         evaluate: (_source, context) =>
           Effect.sync(() => {
             scriptReferrer = context?.referrer ?? "";
+            scriptLanguages = context?.languages;
             return { value: "ok", setCookies: [] };
           }),
       };
@@ -252,6 +271,7 @@ describe("browser layer", () => {
         });
         expect(page.status).toBe(202);
         expect(scriptReferrer).toBe("https://source.example.test");
+        expect(scriptLanguages).toEqual(["fr-FR", "fr", "en-US", "en"]);
         expect(calls[0]?.options?.headers).toContainEqual([
           "referer",
           "https://source.example.test",
@@ -557,6 +577,309 @@ describe("browser layer", () => {
     });
   });
 
+  it.effect("does not evaluate scripts without a challenge handler", () => {
+    const calls: Array<Call> = [];
+    let evaluated = 0;
+    const browser = fromSession(
+      session(calls, (url) =>
+        response(url, 202, "challenge", [["x-amzn-waf-action", "challenge"]]),
+      ),
+      Chrome152Identity,
+      {
+        scriptRuntime: hostRuntime([], () =>
+          Effect.sync(() => {
+            evaluated += 1;
+            return "unused";
+          }),
+        ),
+      },
+    );
+
+    return Effect.gen(function* () {
+      const page = yield* browser.navigate("https://example.test/");
+      expect(page.challenge?.kind).toBe("AwsWaf");
+      expect(evaluated).toBe(0);
+      expect(calls).toHaveLength(1);
+      yield* page.close;
+    });
+  });
+
+  it.effect("fails without a runtime and does not retry", () => {
+    const calls: Array<Call> = [];
+    const cookieUrls: Array<string> = [];
+    const url = "https://example.test/";
+    const browser = fromSession(
+      session(
+        calls,
+        (requestUrl) =>
+          response(requestUrl, 202, "challenge", [
+            ["x-amzn-waf-action", "challenge"],
+          ]),
+        cookieReader(
+          [Cookies.fromSetCookie("clearance=before; Path=/")],
+          cookieUrls,
+        ),
+      ),
+      Chrome152Identity,
+      {
+        challengeHandler: reviewedChallengeHandler({
+          source: "solve challenge",
+          cookieNames: ["clearance"],
+        }),
+      },
+    );
+
+    return Effect.gen(function* () {
+      const error = yield* Effect.flip(browser.navigate(url));
+      expect(error).toBeInstanceOf(BrowserScriptError);
+      if (error._tag === "BrowserScriptError") {
+        expect(error.reason).toBe("script runtime unavailable");
+      }
+      expect(calls.map(({ url: requestUrl }) => requestUrl)).toEqual([url]);
+      expect(cookieUrls).toEqual([url]);
+    });
+  });
+
+  it.effect("rejects invalid reviewed challenge options as Config", () => {
+    const emptyCookieNames: ReviewedChallengeOptions = {
+      source: "solve challenge",
+      cookieNames: ["clearance"],
+    };
+    const nonStringSource: ReviewedChallengeOptions = {
+      source: "solve challenge",
+      cookieNames: ["clearance"],
+    };
+    // Model JavaScript callers bypassing the compile-time type without casts.
+    Reflect.set(emptyCookieNames, "cookieNames", []);
+    Reflect.set(nonStringSource, "source", 42);
+
+    return Effect.gen(function* () {
+      for (const options of [emptyCookieNames, nonStringSource]) {
+        const calls: Array<Call> = [];
+        let evaluated = 0;
+        let closed = 0;
+        const browser = fromSession(
+          session(calls, (url) =>
+            response(
+              url,
+              202,
+              "challenge",
+              [["x-amzn-waf-action", "challenge"]],
+              () => {
+                closed += 1;
+              },
+            ),
+          ),
+          Chrome152Identity,
+          {
+            challengeHandler: reviewedChallengeHandler(options),
+            scriptRuntime: hostRuntime([], () =>
+              Effect.sync(() => {
+                evaluated += 1;
+                return "unused";
+              }),
+            ),
+          },
+        );
+        const error = yield* Effect.flip(
+          browser.navigate("https://example.test/"),
+        );
+
+        expect(error).toBeInstanceOf(BrowserSessionError);
+        if (error._tag === "BrowserSessionError") {
+          expect(error.kind).toBe("Config");
+        }
+        expect(evaluated).toBe(0);
+        expect(calls).toHaveLength(1);
+        expect(closed).toBe(1);
+      }
+    });
+  });
+
+  it.effect("retries the same URL after configured cookies change", () => {
+    const calls: Array<Call> = [];
+    const cookieUrls: Array<string> = [];
+    const scriptSources: Array<string> = [];
+    let evaluated = false;
+    const url = "https://example.test/";
+    const options: ReviewedChallengeOptions = {
+      source: "solve challenge",
+      cookieNames: ["clearance"],
+    };
+    const browser = fromSession(
+      session(
+        calls,
+        (requestUrl) =>
+          calls.length === 1
+            ? response(requestUrl, 202, "challenge", [
+                ["x-amzn-waf-action", "challenge"],
+              ])
+            : response(requestUrl, 200, "final"),
+        (requestUrl) =>
+          Effect.sync(() => {
+            cookieUrls.push(requestUrl);
+            return Cookies.fromSetCookie(
+              `clearance=${evaluated ? "after" : "before"}; Path=/`,
+            );
+          }),
+      ),
+      Chrome152Identity,
+      {
+        challengeHandler: reviewedChallengeHandler(options),
+        scriptRuntime: {
+          evaluate: (source) =>
+            Effect.sync(() => {
+              scriptSources.push(source);
+              evaluated = true;
+              return { value: "evaluated", setCookies: [] };
+            }),
+        },
+      },
+    );
+
+    return Effect.gen(function* () {
+      const page = yield* browser.navigate(url);
+      expect(page.status).toBe(200);
+      expect(page.body).toBe("final");
+      expect(calls.map(({ url: requestUrl }) => requestUrl)).toEqual([
+        url,
+        url,
+      ]);
+      expect(cookieUrls).toEqual([url, url]);
+      expect(scriptSources).toEqual([options.source]);
+      yield* page.close;
+    });
+  });
+
+  it.effect(
+    "declines missing, empty, unchanged, or incomplete cookie changes",
+    () => {
+      const cases: ReadonlyArray<{
+        readonly cookieNames: ReviewedChallengeOptions["cookieNames"];
+        readonly before: Cookies.Cookies;
+        readonly after: Cookies.Cookies;
+      }> = [
+        {
+          cookieNames: ["clearance"],
+          before: Cookies.fromSetCookie("clearance=before; Path=/"),
+          after: Cookies.empty,
+        },
+        {
+          cookieNames: ["clearance"],
+          before: Cookies.fromSetCookie("clearance=before; Path=/"),
+          after: Cookies.fromSetCookie("clearance=; Path=/"),
+        },
+        {
+          cookieNames: ["clearance"],
+          before: Cookies.fromSetCookie("clearance=same; Path=/"),
+          after: Cookies.fromSetCookie("clearance=same; Path=/"),
+        },
+        {
+          cookieNames: ["clearance", "device"],
+          before: Cookies.fromSetCookie([
+            "clearance=before; Path=/",
+            "device=before; Path=/",
+          ]),
+          after: Cookies.fromSetCookie("clearance=changed; Path=/"),
+        },
+      ];
+
+      return Effect.gen(function* () {
+        for (const testCase of cases) {
+          const calls: Array<Call> = [];
+          const cookieUrls: Array<string> = [];
+          let evaluated = 0;
+          const url = "https://example.test/";
+          const browser = fromSession(
+            session(
+              calls,
+              (requestUrl) =>
+                response(requestUrl, 202, "challenge", [
+                  ["x-amzn-waf-action", "challenge"],
+                ]),
+              cookieReader([testCase.before, testCase.after], cookieUrls),
+            ),
+            Chrome152Identity,
+            {
+              challengeHandler: reviewedChallengeHandler({
+                source: "solve challenge",
+                cookieNames: testCase.cookieNames,
+              }),
+              scriptRuntime: hostRuntime([], () =>
+                Effect.sync(() => {
+                  evaluated += 1;
+                  return "evaluated";
+                }),
+              ),
+            },
+          );
+          const page = yield* browser.navigate(url);
+
+          expect(page.status).toBe(202);
+          expect(page.challenge?.kind).toBe("AwsWaf");
+          expect(evaluated).toBe(1);
+          expect(calls.map(({ url: requestUrl }) => requestUrl)).toEqual([url]);
+          expect(cookieUrls).toEqual([url, url]);
+          yield* page.close;
+        }
+      });
+    },
+  );
+
+  it.effect(
+    "closes the challenge response when script evaluation rejects",
+    () => {
+      const calls: Array<Call> = [];
+      const cookieUrls: Array<string> = [];
+      let closed = 0;
+      const browser = fromSession(
+        session(
+          calls,
+          (url) =>
+            response(
+              url,
+              202,
+              "challenge",
+              [["x-amzn-waf-action", "challenge"]],
+              () => {
+                closed += 1;
+              },
+            ),
+          cookieReader(
+            [Cookies.fromSetCookie("clearance=before; Path=/")],
+            cookieUrls,
+          ),
+        ),
+        Chrome152Identity,
+        {
+          challengeHandler: reviewedChallengeHandler({
+            source: "solve challenge",
+            cookieNames: ["clearance"],
+          }),
+          scriptRuntime: {
+            evaluate: () =>
+              Effect.fail(
+                new BrowserScriptError({ reason: "evaluation failed" }),
+              ),
+          },
+        },
+      );
+
+      return Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          browser.navigate("https://example.test/"),
+        );
+        expect(error).toBeInstanceOf(BrowserScriptError);
+        if (error._tag === "BrowserScriptError") {
+          expect(error.reason).toBe("evaluation failed");
+        }
+        expect(calls).toHaveLength(1);
+        expect(cookieUrls).toHaveLength(1);
+        expect(closed).toBe(1);
+      });
+    },
+  );
+
   it.effect("rejects Cookie headers in the browser identity", () => {
     const calls: Array<Call> = [];
     const browser = fromSession(
@@ -821,6 +1144,94 @@ describe("browser layer", () => {
       expect(hidden.value).toBe(
         "undefined|undefined|undefined|function|function|function",
       );
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.effect(
+    "rejects oversized UTF-8 language startup input before spawning",
+    () => {
+      const controlLimitBytes = 128 * 1024;
+      const source = 'return "unused";';
+      const url = "http://localhost/";
+      const cookie = "";
+      const userAgent = "fixture";
+      const language = "☃".repeat(44_000);
+      const languages = [language];
+      const preliminaryCodeUnits =
+        source.length +
+        url.length +
+        cookie.length +
+        userAgent.length +
+        language.length;
+      const serializedStartLineBytes =
+        new TextEncoder().encode(
+          JSON.stringify({
+            type: "start",
+            source,
+            url,
+            cookie,
+            userAgent,
+            languages,
+            referrer: "",
+            authoritativeCookies: false,
+          }),
+        ).byteLength + 1;
+      let spawnCount = 0;
+      const spawnerLayer = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => {
+          spawnCount += 1;
+          return Effect.fail(
+            PlatformError.systemError({
+              _tag: "Unknown",
+              module: "process",
+              method: "spawn",
+            }),
+          );
+        }),
+      );
+
+      return Effect.gen(function* () {
+        expect(preliminaryCodeUnits).toBeLessThan(controlLimitBytes);
+        expect(serializedStartLineBytes).toBeGreaterThan(controlLimitBytes);
+        const runtime = yield* BrowserMock;
+        const error = yield* Effect.flip(
+          runtime.evaluate(source, { url, cookie, userAgent, languages }),
+        );
+        expect(error).toBeInstanceOf(BrowserScriptError);
+        expect(error.reason).toBe(
+          "script IPC start input exceeds its 128 KiB limit",
+        );
+        expect(spawnCount).toBe(0);
+      }).pipe(
+        Effect.provide(BrowserMock.layer().pipe(Layer.provide(spawnerLayer))),
+      );
+    },
+  );
+
+  it.effect("passes languages through BrowserMock and defaults to en-US", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const source =
+        'return `${navigator.language}|${navigator.languages.join(",")}|${Object.isFrozen(navigator.languages)}|${typeof __languages}`;';
+      const explicit = yield* runtime.evaluate(source, {
+        url: "http://localhost/",
+        cookie: "",
+        userAgent: "fixture",
+        languages: ["fr-FR", "fr", "en-US", "en"],
+      });
+      expect(explicit.value).toBe("fr-FR|fr-FR,fr,en-US,en|true|undefined");
+
+      const fallback = yield* runtime.evaluate(source, {
+        url: "http://localhost/",
+        cookie: "",
+        userAgent: "fixture",
+      });
+      expect(fallback.value).toBe("en-US|en-US|true|undefined");
     }).pipe(
       Effect.provide(
         BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),

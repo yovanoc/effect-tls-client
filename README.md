@@ -53,7 +53,9 @@ const program = Effect.scoped(
 );
 
 await Effect.runPromise(
-  program.pipe(Effect.provide(TlsClient.layer.pipe(Layer.provide(NodeServices.layer)))),
+  program.pipe(
+    Effect.provide(TlsClient.layer.pipe(Layer.provide(NodeServices.layer))),
+  ),
 );
 ```
 
@@ -87,7 +89,9 @@ const app = Effect.scoped(
 await Effect.runPromise(
   app.pipe(
     Effect.provide(
-      TlsHttpClient.layer({ profile: "chrome_146" }).pipe(Layer.provide(NodeServices.layer)),
+      TlsHttpClient.layer({ profile: "chrome_146" }).pipe(
+        Layer.provide(NodeServices.layer),
+      ),
     ),
   ),
 );
@@ -120,12 +124,14 @@ The Go Jar is the source of truth, including redirects and WebSocket
 handshakes:
 
 ```ts
-const cookies = yield * session.cookies(url);
-yield * session.setCookies(url, cookies);
-const snapshot = yield * session.exportCookies;
-yield * session.importCookies(snapshot);
-yield * session.setProxy("socks5://127.0.0.1:1080");
-yield * session.setProxy(null); // direct routing
+const program = Effect.gen(function* () {
+  const cookies = yield* session.cookies(url);
+  yield* session.setCookies(url, cookies);
+  const snapshot = yield* session.exportCookies;
+  yield* session.importCookies(snapshot);
+  yield* session.setProxy("socks5://127.0.0.1:1080");
+  yield* session.setProxy(null); // direct routing
+});
 ```
 
 Use `setCookies` rather than manually adding a `Cookie` header so domain, path,
@@ -142,6 +148,15 @@ infer redirects from scripts or form fields, or execute page JavaScript
 automatically. The Go-side cookie jar remains authoritative; browser requests
 reject manually supplied `Cookie` headers.
 
+For `chrome_146`, `chrome_146_PSK`, `chrome_152`, and `chrome_152_PSK`,
+`Browser.open` derives the matching identity when `identity` is omitted. An
+explicit identity remains available for customization, but for known Chrome
+profiles only its User-Agent's Chrome major is checked; this does not guarantee
+full fingerprint or platform consistency. A major mismatch fails with
+`BrowserSessionError` kind `Config`. Other and custom profiles require an
+explicit identity. `Browser.fromSession` always takes one because an existing
+`TlsSession`'s fixed identity is opaque and must be kept caller-aligned.
+
 ```ts
 import { Effect, Layer } from "effect";
 import { NodeServices } from "@effect/platform-node";
@@ -152,7 +167,6 @@ const program = Effect.scoped(
   Effect.gen(function* () {
     const browser = yield* Browser.open({
       transport: { profile: "chrome_152_PSK" },
-      identity: Browser.Chrome152Identity,
     });
     const page = yield* browser.navigate("https://example.com/");
     console.log(page.status, page.url, page.body.slice(0, 240));
@@ -160,7 +174,9 @@ const program = Effect.scoped(
 );
 
 await Effect.runPromise(
-  program.pipe(Effect.provide(TlsClient.layer.pipe(Layer.provide(NodeServices.layer)))),
+  program.pipe(
+    Effect.provide(TlsClient.layer.pipe(Layer.provide(NodeServices.layer))),
+  ),
 );
 ```
 
@@ -174,14 +190,19 @@ frames remain distinct, and the socket participates in scope cleanup and credit
 flow control:
 
 ```ts
+import { Effect } from "effect";
 import * as Socket from "effect/unstable/socket/Socket";
 
-const socket = yield * session.webSocket("wss://example.test/echo");
-const reader = yield * socket.reader;
-const writer = yield * socket.writer;
-yield * writer.write("hello");
-const [reply] = yield * reader.pull;
-yield * writer.write(new Socket.CloseEvent(1000, "done"));
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const socket = yield* session.webSocket("wss://example.test/echo");
+    const reader = yield* socket.reader;
+    const writer = yield* socket.writer;
+    yield* writer.write("hello");
+    const [reply] = yield* reader.pull;
+    yield* writer.write(new Socket.CloseEvent(1000, "done"));
+  }),
+);
 ```
 
 Use `Effect.retry` around a complete handshake/session operation when a
@@ -235,14 +256,18 @@ No operation is retried implicitly. The exported
 import { Effect, Schedule } from "effect";
 import { isTransientRequestKind, TlsRequestError } from "effect-tls-client";
 
-const response =
-  yield *
-  session.request(url).pipe(
+const program = Effect.gen(function* () {
+  const response = yield* session.request(url).pipe(
     Effect.retry({
-      schedule: Schedule.exponential("100 millis").pipe(Schedule.upTo({ times: 3 })),
-      while: (error) => error instanceof TlsRequestError && isTransientRequestKind(error.kind),
+      schedule: Schedule.exponential("100 millis").pipe(
+        Schedule.upTo({ times: 3 }),
+      ),
+      while: (error) =>
+        error instanceof TlsRequestError && isTransientRequestKind(error.kind),
     }),
   );
+  return response;
+});
 ```
 
 Choose idempotency, backoff, and reconnect scope in the application. Do not
@@ -254,11 +279,13 @@ application-level HTTP response by default.
 Bandwidth is measured as TLS-level byte deltas without extra wire requests:
 
 ```ts
-const before = yield * session.bandwidth;
-const response = yield * session.request(url);
-console.log(yield * response.bytesRead, yield * response.bytesWritten);
-const total = yield * session.bandwidth;
-yield * session.resetBandwidth;
+const program = Effect.gen(function* () {
+  const before = yield* session.bandwidth;
+  const response = yield* session.request(url);
+  console.log(yield* response.bytesRead, yield* response.bytesWritten);
+  const total = yield* session.bandwidth;
+  yield* session.resetBandwidth;
+});
 ```
 
 The package exports `TlsClientMetrics.bytesRead`, `bytesWritten`, `requests`,

@@ -178,6 +178,8 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const initialUrl = String(__pageUrl);
   const initialReferrer = String(__referrer);
   const userAgent = String(__userAgent);
+  const languages = Object.freeze(jsonParse(__languages));
+  delete globalThis.__languages;
   const authoritativeCookies = Boolean(__authoritativeCookies);
   const MAX_REQUEST_BODY_BYTES = ${limits.maxRequestBodyBytes};
   const MAX_NETWORK_REQUESTS = ${limits.maxNetworkRequests};
@@ -1462,7 +1464,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (value.status < 200 || value.status >= 300) throw new TypeError("script load failed with HTTP " + value.status);
     return undefined;
   });
-  const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
+  const navigator = Object.freeze({ userAgent, language: languages[0] ?? "", languages, cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
   Object.assign(window, { document, location, navigator, console, performance, crypto, TextEncoder, CryptoKey, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Request, Response, Event, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
@@ -1679,6 +1681,7 @@ const start = (input) => {
     __referrer: String(input.referrer),
     __cookie: String(input.cookie),
     __userAgent: String(input.userAgent),
+    __languages: JSON.stringify(input.languages ?? ["en-US"]),
     __authoritativeCookies: input.authoritativeCookies,
     __performanceNow: hostMonotonicNow,
     __performanceTimeOrigin: hostTimeOrigin,
@@ -1697,6 +1700,7 @@ const start = (input) => {
   delete sandbox.__referrer;
   delete sandbox.__cookie;
   delete sandbox.__userAgent;
+  delete sandbox.__languages;
   delete sandbox.__receive;
   delete sandbox.__performanceNow;
   delete sandbox.__performanceTimeOrigin;

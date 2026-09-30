@@ -15,34 +15,43 @@ bun examples/browser.mjs
 ```
 
 Set `TLS_CLIENT_EXAMPLE_URL` and `TLS_CLIENT_EXAMPLE_PROFILE` to change the
-request. The example accepts `chrome_146`, `chrome_152`, and `chrome_152_PSK`
-and maps each profile to its matching Chrome identity. It uses the
-platform-neutral `examples/runtime.mjs` loader.
+request. The example accepts `chrome_146`, `chrome_146_PSK`, `chrome_152`, and
+`chrome_152_PSK`; `Browser.open` derives the matching Chrome identity from the
+selected profile. It uses the platform-neutral `examples/runtime.mjs` loader.
 
 ## Session and identity
 
 Create a browser session with `Browser.open` and a `BrowserSessionConfig`:
 
 ```ts
+import { Effect } from "effect";
 import * as Browser from "effect-tls-client/browser";
 
-const browser =
-  yield *
-  Browser.open({
-    transport: { profile: "chrome_152_PSK" },
-    identity: Browser.Chrome152Identity,
-  });
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const browser = yield* Browser.open({
+      transport: { profile: "chrome_152_PSK" },
+    });
+    const page = yield* browser.navigate("https://example.test/");
+    console.log(page.status, page.url);
+  }),
+);
 ```
 
-`Browser.fromSession` wraps an already-scoped `TlsSession` when the application
-needs to compose transport setup itself. The existing transport identity is
-fixed and cannot be inspected or rewritten here, so create it without a
-`Cookie` header and keep it aligned with the supplied browser identity. Both
-paths use the supplied identity for fixed headers and header order. Browser
-requests also reject manually supplied `Cookie` headers. `browser.get` stamps
-XHR/fetch-style headers; `browser.post` can use those headers or navigation-style
-headers with `navigation: true`; `browser.navigate` uses document navigation
-headers.
+When `identity` is omitted, `Browser.open` derives the Chrome identity for
+`chrome_146`, `chrome_146_PSK`, `chrome_152`, and `chrome_152_PSK`. An explicit
+identity is a customization escape hatch, but for known Chrome profiles only
+its User-Agent's Chrome major is checked; this does not guarantee full
+fingerprint or platform consistency. A major mismatch fails with
+`BrowserSessionError` kind `Config`. Other and custom profiles require an
+explicit identity. `Browser.fromSession` always requires one: the existing
+`TlsSession` is opaque, so the caller must keep the supplied identity aligned
+with its fixed headers and header order; Browser cannot verify the alignment.
+Create the transport without a `Cookie` header. Both APIs keep the Go Jar
+authoritative, and browser requests reject manually supplied `Cookie` headers.
+`browser.get` stamps XHR/fetch-style headers; `browser.post` can use those
+headers or navigation-style headers with `navigation: true`; `browser.navigate`
+uses document navigation headers.
 
 Navigation follows `Location` only for 301, 302, 303, 307, and 308 responses,
 plus actual HTML `<meta http-equiv="refresh">` directives. It does not infer
@@ -66,13 +75,44 @@ cookie changes so `HttpOnly`, domain, path, expiry, and redirect behavior stay
 correct:
 
 ```ts
+import { Effect } from "effect";
 import { Cookies } from "effect/unstable/http";
 
-yield *
-  browser.transport.setCookies(
+const program = Effect.gen(function* () {
+  yield* browser.transport.setCookies(
     "http://example.test/",
     Cookies.fromSetCookie("consent=yes; Path=/"),
   );
+});
+```
+
+## WebSockets
+
+Use the existing transport socket from the browser facade; it shares the same
+scoped Go session, TLS profile, proxy, Jar, and fixed identity headers selected
+by `Browser.open`. Go performs an HTTP/1.1 WebSocket upgrade (not HTTP/3).
+Neither the Browser facade nor `BrowserMock` provides WebSocket support or
+synthesizes an `Origin` or `Referer` header; supply `Origin` explicitly when
+needed. With `fromSession`, the transport identity remains opaque as described
+above.
+
+```ts
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const browser = yield* Browser.open({
+      transport: { profile: "chrome_152_PSK" },
+    });
+    const socket = yield* browser.transport.webSocket(
+      "wss://example.test/socket",
+      { headers: [["origin", "https://example.test"]] },
+    );
+    const reader = yield* socket.reader; // opens the handshake
+    const writer = yield* socket.writer;
+    yield* writer.write("ping");
+    const [reply] = yield* reader.pull; // next batch
+    console.log(reply);
+  }),
+);
 ```
 
 ## Challenge and script boundary
@@ -84,16 +124,21 @@ CloudFront `403` is exposed through `page.cloudFrontForbidden`; it is not
 reported as a solved challenge.
 
 ```ts
-import { Effect, Option } from "effect";
+import { Effect } from "effect";
 
-const browser =
-  yield *
-  Browser.open(config, {
-    challengeHandler: (challenge, context) => {
-      // Solve only with an application-owned, externally reviewed integration.
-      return Effect.succeedNone;
-    },
-  });
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    yield* Browser.open(
+      { transport: { profile: "chrome_152_PSK" } },
+      {
+        challengeHandler: (_challenge, _context) => {
+          // Solve only with an application-owned, externally reviewed integration.
+          return Effect.succeedNone;
+        },
+      },
+    );
+  }),
+);
 ```
 
 `BrowserMock` is an optional process-backed runtime for reviewed challenge
@@ -106,7 +151,13 @@ only read-only `href`, `origin`, `protocol`, `host`, `hostname`, `port`,
 HTTPS and HTTP loopback URLs (`localhost`/`.localhost`, including trailing-dot
 hostnames, IPv4 `127.0.0.0/8`, or `[::1]`) and false for ordinary HTTP; other URL
 schemes are not modeled as secure
-contexts. The VM also exposes a small `navigator` and `console`, and a context-local
+contexts. The VM's `navigator.userAgent` comes from the resolved identity's
+`User-Agent` header, while `navigator.language` and `navigator.languages` come
+from its `Accept-Language` header. For a `Browser.open` identity, absent or
+invalid `Accept-Language` yields `language: ""` and `languages: []`; a
+standalone `BrowserMock` evaluation with omitted `languages` instead defaults
+to `en-US`. It does not synthesize platform or hardware properties. The VM also
+exposes a small `console` and a context-local
 `performance` with only
 monotonic `now()` and numeric `timeOrigin` backed by the runner's real monotonic
 clock. It exposes context-local `URL` and `URLSearchParams` backed by a private,
@@ -198,23 +249,58 @@ const runtimeLayer = Browser.BrowserMock.layer({
 });
 ```
 
+### Opt-in reviewed challenge handler
+
+`reviewedChallengeHandler` runs only the source you supply, never extracts or
+executes page JavaScript automatically. This synthetic fixture example requires
+no network assets:
+
 ```ts
-const scriptRuntime = yield * Browser.BrowserMock;
-const browser =
-  yield *
-  Browser.open(config, {
-    scriptRuntime,
-    challengeHandler: (_challenge, context) =>
-      Effect.gen(function* () {
-        const result = yield* context.evaluate(
-          'document.cookie = "clearance=ok; Path=/"; return "ready";',
-        );
-        return result === "ready"
-          ? Option.some({ url: "http://example.test/" })
-          : Option.none();
-      }),
-  });
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const scriptRuntime = yield* Browser.BrowserMock;
+    yield* Browser.open(
+      { transport: { profile: "chrome_152_PSK" } },
+      {
+        scriptRuntime,
+        challengeHandler: Browser.reviewedChallengeHandler({
+          source: `
+            window.acquireFixtureCookie = async () => {
+              document.cookie = "fixture-clearance=ready; Path=/";
+            };
+            await window.acquireFixtureCookie();
+            return "fixture finished";
+          `,
+          cookieNames: ["fixture-clearance"],
+        }),
+      },
+    );
+  }),
+);
 ```
+
+Options are Schema-validated when the handler executes; invalid options fail
+with `BrowserSessionError` kind `Config` before evaluation. `cookieNames` is a
+nonempty readonly tuple of nonempty names, and `source` must be nonempty. The
+handler reads the Go Jar for `context.response.url` before and after awaiting
+`context.evaluate` (which flushes pending cookie writes). It requests a
+same-URL retry only if every named cookie has a nonempty value afterward and
+at least one value changed or was newly created. Script return strings never
+count as clearance. Missing, empty, or unchanged cookies leave the challenge
+visible; runtime and transport failures retain their existing typed errors.
+Retries remain bounded by `maxChallengeRetries`. Cookie presence and freshness
+are retry evidence, not proof that the page is solved: inspect the follow-up
+page and its challenge/status yourself.
+
+If reviewed source uses `document.loadScript`, await the actual acquisition
+operation too, not just asset loading. Assign shared entry points to `window`
+globals: evaluated source runs inside an async wrapper, so local declarations
+are not shared globals. Unawaited work ends when evaluation completes. The
+runtime defaults to a 2-second hard deadline; navigation also caps the whole
+handler at 5 seconds. Origin review/allowlisting does not provide an exact-byte
+asset integrity pin. Existing source, input, body, origin, credential, and
+network quotas still apply. For advanced per-response configuration, use the
+existing custom `challengeHandler` rather than a separate callback API.
 
 The bridge is intentionally small: up to 8 network requests per evaluation.
 Host-side network requests are serialized to preserve authoritative cookie

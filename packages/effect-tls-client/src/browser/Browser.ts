@@ -99,7 +99,7 @@ export type BrowserIdentity = Schema.Schema.Type<typeof BrowserIdentity>;
 /** Configuration for a scoped browser session backed by one TlsSession. */
 export const BrowserSessionConfig = Schema.Struct({
   transport: SessionConfig,
-  identity: BrowserIdentity,
+  identity: Schema.optionalKey(BrowserIdentity),
   maxRedirects: Schema.optionalKey(RedirectCount),
   maxChallengeRetries: Schema.optionalKey(ChallengeCount),
 });
@@ -290,6 +290,77 @@ const headerValue = (
   name: string,
 ): string | undefined =>
   headers.find(([headerName]) => headerName.toLowerCase() === name)?.[1];
+
+const resolveIdentity = Effect.fnUntraced(function* (
+  config: BrowserSessionConfig,
+) {
+  const profile = config.transport.profile;
+  const preset =
+    profile === "chrome_146" || profile === "chrome_146_PSK"
+      ? Chrome146Identity
+      : profile === "chrome_152" || profile === "chrome_152_PSK"
+        ? Chrome152Identity
+        : undefined;
+  const identity = config.identity ?? preset;
+  if (identity === undefined) {
+    return yield* BrowserSessionError.make({
+      operation: "browser identity",
+      kind: "Config",
+      message:
+        "an explicit browser identity is required for this transport profile",
+    });
+  }
+  if (preset !== undefined) {
+    const chromeMajor = (value: BrowserIdentity) =>
+      /\bChrome\/(\d+)\./u.exec(
+        headerValue(value.headers, "user-agent") ?? "",
+      )?.[1];
+    if (chromeMajor(identity) !== chromeMajor(preset)) {
+      return yield* BrowserSessionError.make({
+        operation: "browser identity",
+        kind: "Config",
+        message: `browser User-Agent must match the Chrome major of ${profile}`,
+      });
+    }
+  }
+  return identity;
+});
+
+const identityLanguages = (
+  identity: BrowserIdentity,
+): ReadonlyArray<string> => {
+  const preferences = (headerValue(identity.headers, "accept-language") ?? "")
+    .split(",")
+    .map((entry) => {
+      const [range = "", ...parameters] = entry.trim().split(";");
+      const language = range.trim();
+      const quality =
+        parameters.length === 0
+          ? "1"
+          : (/^q\s*=\s*(.*)$/iu.exec(parameters.join(";").trim())?.[1] ?? "");
+      return {
+        language,
+        quality: /^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/u.test(quality)
+          ? Number(quality)
+          : 0,
+      };
+    })
+    .filter(
+      ({ language, quality }) =>
+        quality > 0 && /^[a-z]{1,8}(?:-[a-z0-9]{1,8})*$/iu.test(language),
+    )
+    .sort((left, right) => right.quality - left.quality);
+  const languages: Array<string> = [];
+  for (const { language } of preferences) {
+    if (
+      !languages.some((value) => value.toLowerCase() === language.toLowerCase())
+    ) {
+      languages.push(language);
+      if (languages.length === 16) break;
+    }
+  }
+  return languages;
+};
 
 const mergeHeaders = (
   base: ReadonlyArray<Pair>,
@@ -928,6 +999,7 @@ const makeBrowserSession = (
           url: response.url,
           cookie: visibleCookie,
           userAgent: headerValue(identity.headers, "user-agent") ?? "",
+          languages: identityLanguages(identity),
           referrer,
         },
         host,
@@ -1171,12 +1243,13 @@ export const open = Effect.fn("BrowserSession.open")(function* (
         }),
     ),
   );
-  yield* validateHeaders("browser identity", config.identity.headers);
+  const identity = yield* resolveIdentity(config);
+  yield* validateHeaders("browser identity", identity.headers);
   const client = yield* TlsClient;
   const transportConfig: SessionConfigType = {
     ...config.transport,
-    identity: config.identity,
+    identity,
   };
   const transport = yield* client.session(transportConfig);
-  return makeBrowserSession(transport, config.identity, config, handlers, true);
+  return makeBrowserSession(transport, identity, config, handlers, true);
 });

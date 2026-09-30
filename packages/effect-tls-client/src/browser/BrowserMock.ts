@@ -52,6 +52,7 @@ const RunnerStart = Schema.Struct({
   url: Schema.String,
   cookie: Schema.String,
   userAgent: Schema.String,
+  languages: BrowserScriptContext.fields.languages,
   referrer: Schema.String,
   authoritativeCookies: Schema.Boolean,
 });
@@ -200,6 +201,10 @@ const makeEvaluate = (
         context.url.length +
         context.cookie.length +
         context.userAgent.length +
+        (context.languages?.reduce(
+          (total, language) => total + language.length,
+          0,
+        ) ?? 0) +
         (context.referrer?.length ?? 0) >
         MAX_CONTROL_INPUT_LINE_BYTES
     ) {
@@ -213,6 +218,9 @@ const makeEvaluate = (
       url: context.url,
       cookie: context.cookie,
       userAgent: context.userAgent,
+      ...(context.languages === undefined
+        ? {}
+        : { languages: context.languages }),
       referrer: context.referrer ?? "",
       authoritativeCookies: host !== undefined,
     }).pipe(

@@ -6,7 +6,14 @@ import path from "node:path";
 import { createServer, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { ConfigProvider, Effect, Layer, Option, Schema } from "effect";
+import {
+  ConfigProvider,
+  Effect,
+  Layer,
+  Option,
+  Schema,
+  type Scope,
+} from "effect";
 import * as Browser from "../src/browser/index.js";
 import { TlsClient } from "../src/index.js";
 
@@ -170,6 +177,152 @@ const startFixture = async (): Promise<{
     close: () => close(server),
   };
 };
+
+type AcquisitionMode =
+  | "accepted-cookie"
+  | "no-cookie"
+  | "rejection"
+  | "rotating-always-rejected"
+  | "constant-always-rejected";
+
+const startAcquisitionFixture = async (
+  mode: AcquisitionMode,
+): Promise<{
+  readonly url: string;
+  readonly paths: Array<string>;
+  readonly close: () => Promise<void>;
+}> => {
+  const paths: Array<string> = [];
+  let verificationCount = 0;
+  const server = createServer((request, response) => {
+    const route = new URL(request.url ?? "/", "http://localhost").pathname;
+    paths.push(route);
+    if (route === "/challenge") {
+      const clearanceAccepted =
+        mode === "accepted-cookie" &&
+        (request.headers.cookie ?? "")
+          .split(";")
+          .some((cookie) => cookie.trim() === "clearance=approved");
+      response.statusCode = clearanceAccepted ? 200 : 202;
+      if (!clearanceAccepted) {
+        response.setHeader("x-amzn-waf-action", "challenge");
+      }
+      response.end(clearanceAccepted ? "clearance accepted" : "challenge");
+      return;
+    }
+    if (route === "/acq.js") {
+      response.setHeader("content-type", "text/javascript");
+      response.end(`
+        if (typeof window.pageCfg?.verifyUrl !== "string") {
+          throw new Error("pageCfg must be initialized before loading acquisition script");
+        }
+        window.Acq = Object.freeze({
+          start() {
+            return new Promise((resolve, reject) => {
+              setTimeout(async () => {
+                try {
+                  const result = await fetch(window.pageCfg.verifyUrl, { method: "POST" });
+                  if (result.status < 200 || result.status >= 300) {
+                    throw new Error("acquisition rejected");
+                  }
+                  document.cookie = "acquisition-marker=complete; Path=/";
+                  resolve("complete");
+                } catch (error) {
+                  reject(error);
+                }
+              }, 25);
+            });
+          },
+        });
+      `);
+      return;
+    }
+    if (route === "/verify" && request.method === "POST") {
+      verificationCount += 1;
+      if (mode === "rejection") {
+        response.statusCode = 403;
+        response.end("rejected");
+        return;
+      }
+      if (mode === "accepted-cookie") {
+        response.setHeader(
+          "set-cookie",
+          "clearance=approved; Path=/; HttpOnly",
+        );
+      } else if (mode === "rotating-always-rejected") {
+        response.setHeader(
+          "set-cookie",
+          `clearance=rotation-${verificationCount}; Path=/; HttpOnly`,
+        );
+      } else if (mode === "constant-always-rejected") {
+        response.setHeader(
+          "set-cookie",
+          "clearance=constant; Path=/; HttpOnly",
+        );
+      }
+      response.end("verified");
+      return;
+    }
+    response.statusCode = 404;
+    response.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("acquisition fixture did not expose an address");
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    paths,
+    close: () => close(server),
+  };
+};
+
+const browserServices = (url: string) => {
+  const platform = Layer.mergeAll(
+    NodeServices.layer,
+    ConfigProvider.layer(
+      ConfigProvider.fromUnknown({ TLS_CLIENT_BRIDGE_PATH: bridgePath }),
+    ),
+  );
+  return Layer.mergeAll(
+    TlsClient.layer.pipe(Layer.provide(platform)),
+    Browser.BrowserMock.layer({ allowedOrigins: [url] }).pipe(
+      Layer.provide(platform),
+    ),
+  );
+};
+
+const acquisitionSource = (url: string, awaitStart = true): string =>
+  [
+    `window.pageCfg = { verifyUrl: ${JSON.stringify(`${url}/verify`)} };`,
+    `await document.loadScript(${JSON.stringify(`${url}/acq.js`)});`,
+    awaitStart ? "await window.Acq.start();" : "void window.Acq.start();",
+    'return "acquisition complete";',
+  ].join("\n");
+
+const withChallengeBrowser = <A, E>(
+  fixture: Awaited<ReturnType<typeof startAcquisitionFixture>>,
+  challengeHandler: Browser.BrowserChallengeHandler,
+  use: (browser: Browser.BrowserSession) => Effect.Effect<A, E, Scope.Scope>,
+): Effect.Effect<A, E | Browser.BrowserOperationError> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const runtime = yield* Browser.BrowserMock;
+      const browser = yield* Browser.open(
+        {
+          transport: { profile: "chrome_146", forceHttp1: true },
+          identity: Browser.Chrome146Identity,
+          maxChallengeRetries: 2,
+        },
+        { scriptRuntime: runtime, challengeHandler },
+      );
+      return yield* use(browser);
+    }).pipe(Effect.provide(browserServices(fixture.url))),
+  );
 
 const listenLocal = (server: Server): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -633,5 +786,213 @@ describeRealIntegration("real BrowserMock integration", () => {
         ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
       }),
     browserExampleTestTimeoutMs,
+  );
+
+  it.live(
+    "awaits reviewed acquisition and retries with Go-authoritative cookies",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(() =>
+          startAcquisitionFixture("accepted-cookie"),
+        );
+        const result = yield* withChallengeBrowser(
+          fixture,
+          Browser.reviewedChallengeHandler({
+            source: acquisitionSource(fixture.url),
+            cookieNames: ["clearance"],
+          }),
+          (browser) =>
+            Effect.gen(function* () {
+              const page = yield* browser.navigate(`${fixture.url}/challenge`);
+              const cookies = yield* Schema.decodeEffect(ExportedCookies)(
+                yield* browser.transport.exportCookies,
+              );
+              return { page, cookies };
+            }),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+        expect(fixture.paths).toEqual([
+          "/challenge",
+          "/acq.js",
+          "/verify",
+          "/challenge",
+        ]);
+        expect(result.page.status).toBe(200);
+        expect(result.page.body).toBe("clearance accepted");
+        expect(result.cookies).toContainEqual(
+          expect.objectContaining({
+            name: "clearance",
+            value: "approved",
+            path: "/",
+            httpOnly: true,
+          }),
+        );
+        expect(result.cookies).toContainEqual(
+          expect.objectContaining({
+            name: "acquisition-marker",
+            value: "complete",
+            path: "/",
+            httpOnly: false,
+          }),
+        );
+      }),
+  );
+
+  it.live("does not wait for an unawaited acquisition", () =>
+    Effect.gen(function* () {
+      const fixture = yield* Effect.promise(() =>
+        startAcquisitionFixture("no-cookie"),
+      );
+      const result = yield* withChallengeBrowser(
+        fixture,
+        Browser.reviewedChallengeHandler({
+          source: acquisitionSource(fixture.url, false),
+          cookieNames: ["clearance"],
+        }),
+        (browser) =>
+          Effect.gen(function* () {
+            const page = yield* browser.navigate(`${fixture.url}/challenge`);
+            const cookies = yield* Schema.decodeEffect(ExportedCookies)(
+              yield* browser.transport.exportCookies,
+            );
+            return { page, cookies };
+          }),
+      ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+      expect(result.page.status).toBe(202);
+      expect(fixture.paths).toEqual(["/challenge", "/acq.js"]);
+      expect(result.cookies).not.toContainEqual(
+        expect.objectContaining({ name: "clearance" }),
+      );
+      expect(result.cookies).not.toContainEqual(
+        expect.objectContaining({ name: "acquisition-marker" }),
+      );
+    }),
+  );
+
+  it.live(
+    "surfaces rejected acquisition as BrowserScriptError without retry",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(() =>
+          startAcquisitionFixture("rejection"),
+        );
+        const result = yield* withChallengeBrowser(
+          fixture,
+          Browser.reviewedChallengeHandler({
+            source: acquisitionSource(fixture.url),
+            cookieNames: ["clearance"],
+          }),
+          (browser) =>
+            Effect.result(browser.navigate(`${fixture.url}/challenge`)),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") {
+          expect(result.failure).toMatchObject({ _tag: "BrowserScriptError" });
+        }
+        expect(fixture.paths).toEqual(["/challenge", "/acq.js", "/verify"]);
+      }),
+  );
+
+  it.live(
+    "rejects acquisition scripts that load before page configuration",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(() =>
+          startAcquisitionFixture("no-cookie"),
+        );
+        const result = yield* withChallengeBrowser(
+          fixture,
+          Browser.reviewedChallengeHandler({
+            source: `await document.loadScript(${JSON.stringify(`${fixture.url}/acq.js`)});`,
+            cookieNames: ["clearance"],
+          }),
+          (browser) =>
+            Effect.result(browser.navigate(`${fixture.url}/challenge`)),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") {
+          expect(result.failure).toMatchObject({ _tag: "BrowserScriptError" });
+        }
+        expect(fixture.paths).toEqual(["/challenge", "/acq.js"]);
+      }),
+  );
+
+  it.live(
+    "leaves the challenge visible when acquisition returns no clearance",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(() =>
+          startAcquisitionFixture("no-cookie"),
+        );
+        const page = yield* withChallengeBrowser(
+          fixture,
+          Browser.reviewedChallengeHandler({
+            source: acquisitionSource(fixture.url),
+            cookieNames: ["clearance"],
+          }),
+          (browser) => browser.navigate(`${fixture.url}/challenge`),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+        expect(page.status).toBe(202);
+        expect(fixture.paths).toEqual(["/challenge", "/acq.js", "/verify"]);
+      }),
+  );
+
+  it.live(
+    "caps rotating clearance retries at the configured challenge limit",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* Effect.promise(() =>
+          startAcquisitionFixture("rotating-always-rejected"),
+        );
+        const page = yield* withChallengeBrowser(
+          fixture,
+          Browser.reviewedChallengeHandler({
+            source: acquisitionSource(fixture.url),
+            cookieNames: ["clearance"],
+          }),
+          (browser) => browser.navigate(`${fixture.url}/challenge`),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+        expect(page.status).toBe(202);
+        expect(fixture.paths).toEqual([
+          "/challenge",
+          "/acq.js",
+          "/verify",
+          "/challenge",
+          "/acq.js",
+          "/verify",
+          "/challenge",
+        ]);
+      }),
+  );
+
+  it.live("stops retrying when the required clearance is unchanged", () =>
+    Effect.gen(function* () {
+      const fixture = yield* Effect.promise(() =>
+        startAcquisitionFixture("constant-always-rejected"),
+      );
+      const page = yield* withChallengeBrowser(
+        fixture,
+        Browser.reviewedChallengeHandler({
+          source: acquisitionSource(fixture.url),
+          cookieNames: ["clearance"],
+        }),
+        (browser) => browser.navigate(`${fixture.url}/challenge`),
+      ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+
+      expect(page.status).toBe(202);
+      expect(fixture.paths).toEqual([
+        "/challenge",
+        "/acq.js",
+        "/verify",
+        "/challenge",
+        "/acq.js",
+        "/verify",
+      ]);
+    }),
   );
 });
