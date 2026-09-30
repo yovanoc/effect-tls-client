@@ -1,4 +1,5 @@
 interface RunnerLimits {
+  readonly maxTimeoutMs: number;
   readonly maxInputLineBytes: number;
   readonly maxControlInputLineBytes: number;
   readonly maxOutputLineBytes: number;
@@ -18,6 +19,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const bootstrap = String.raw`
 (() => {
   const post = __post;
+  const childRealm = __childRealm;
+  const consumeBudget = __consumeBudget;
+  delete globalThis.__childRealm; delete globalThis.__consumeBudget;
   // Host helpers exchange only primitives; no host objects enter the VM.
   const hostUrlOperation = __urlOperation;
   delete globalThis.__urlOperation;
@@ -141,6 +145,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   let cryptoOperations = 0;
   const consumeCryptoOperation = () => {
     if (cryptoOperations >= MAX_CRYPTO_OPERATIONS) throw new NativeRangeError("crypto operation budget exceeded");
+    if (!consumeBudget("crypto", 1)) throw new NativeRangeError("crypto operation budget exceeded");
     cryptoOperations += 1;
   };
   const getRandomValues = (array) => {
@@ -861,6 +866,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     else visibleCookies.set(name, value);
   };
   const setCookie = (value) => {
+    if (childRealm) throw new NativeTypeError("frame cookie writes are unsupported");
     const text = String(value);
     if (/(?:^|;)\s*httponly(?:\s*=|;|$)/i.test(text)) return;
     const first = text.split(";", 1)[0] || "";
@@ -901,6 +907,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     return new Promise((resolve, reject) => cookieWaiters.push({ version: cookieVersion, resolve, reject }));
   };
   const request = (kind, url, method, headers, body) => flushCookies().then(() => new Promise((resolve, reject) => {
+    if (childRealm) { reject(new NativeTypeError("frame network APIs are unsupported")); return; }
     try {
       if (outgoingNetworkRequests >= MAX_NETWORK_REQUESTS) throw new NativeTypeError("script network request budget exceeded");
       if (headers.values.length > MAX_HEADERS) throw new NativeTypeError("script request exceeds the header-count limit");
@@ -956,7 +963,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const fireTimer = (id) => {
     const timer = timers.get(id);
     if (!timer) return;
-    if (timer.interval === undefined) timers.delete(id);
+    if (timer.interval === undefined) { timers.delete(id); send({ type: "timer.clear", id }); }
     try { timer.callback(...timer.args); }
     catch (cause) { send({ type: "script.error", reason: safeMessage(cause) }); }
     if (timer.interval !== undefined && timers.get(id) === timer) {
@@ -976,6 +983,14 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     if (message.type === "fatal") {
       send({ type: "script.error", reason: String(message.reason) });
+      return;
+    }
+    if (message.type === "frame.reply") {
+      const task = pending.get(message.id);
+      if (!task || task.kind !== "frame") return;
+      pending.delete(message.id);
+      if (message.error) task.reject(new NativeTypeError(String(message.error)));
+      else task.resolve();
       return;
     }
     if (message.type !== "reply") return;
@@ -1151,6 +1166,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     this._headers.append(name, value);
   };
   XMLHttpRequest.prototype.send = function(body = null) {
+    if (childRealm) throw new NativeTypeError("frame network APIs are unsupported");
     if (this.readyState !== 1) throw new TypeError("open() must be called before send()");
     if (body instanceof FormData) {
       const multipart = serializeFormData(body);
@@ -1294,6 +1310,23 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     };
     return target;
   };
+  const bindEventHandlers = (target, types) => {
+    for (const type of types) {
+      let callback = null;
+      let listener = null;
+      Object.defineProperty(target, "on" + type, {
+        enumerable: true,
+        configurable: true,
+        get: () => callback,
+        set: (value) => {
+          if (listener !== null) target.removeEventListener(type, listener);
+          callback = typeof value === "function" ? value : null;
+          listener = callback === null ? null : (event) => callback.call(target, event);
+          if (listener !== null) target.addEventListener(type, listener);
+        },
+      });
+    }
+  };
   const fileReaderState = new WeakMap();
   const getFileReaderState = (reader) => {
     const state = fileReaderState.get(reader);
@@ -1417,21 +1450,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
         task: null,
       });
       makeEventTarget(this);
-      for (const type of ["loadstart", "progress", "load", "error", "abort", "loadend"]) {
-        let callback = null;
-        let listener = null;
-        Object.defineProperty(this, "on" + type, {
-          enumerable: true,
-          configurable: true,
-          get: () => callback,
-          set: (value) => {
-            if (listener !== null) this.removeEventListener(type, listener);
-            callback = typeof value === "function" ? value : null;
-            listener = callback === null ? null : (event) => callback.call(this, event);
-            if (listener !== null) this.addEventListener(type, listener);
-          },
-        });
-      }
+      bindEventHandlers(this, ["loadstart", "progress", "load", "error", "abort", "loadend"]);
     }
     get readyState() { return getFileReaderState(this).readyState; }
     get result() { return getFileReaderState(this).result; }
@@ -1447,7 +1466,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     get: () => authoritativeCookies ? visibleCookies : Array.from(visibleCookies, ([name, value]) => name + "=" + value).join("; "),
     set: setCookie,
   });
-  const location = Object.freeze({
+  const location = {
     href: pageLocationData[0],
     origin: pageLocationData[1],
     protocol: pageLocationData[2],
@@ -1457,20 +1476,184 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     pathname: pageLocationData[6],
     search: pageLocationData[7],
     hash: pageLocationData[8],
-  });
-  Object.defineProperty(document, "location", { value: location, enumerable: true });
-  document.referrer = initialReferrer;
+  };
+  if (childRealm) {
+    for (const key of Object.keys(location)) {
+      const value = location[key]; Object.defineProperty(location, key, { get: () => value, set: () => { throw new NativeTypeError("frame navigation is unsupported"); }, enumerable: true });
+    }
+  }
+  Object.freeze(location);
+  Object.defineProperty(document, "location", childRealm
+    ? { get: () => location, set: () => { throw new NativeTypeError("frame navigation is unsupported"); }, enumerable: true }
+    : { value: location, enumerable: true });
+  Object.defineProperty(document, "referrer", { value: initialReferrer, enumerable: true });
   document.loadScript = (url) => request("script", String(url), "GET", new Headers([["accept", "text/javascript, application/javascript, */*"]]), null).then((value) => {
     if (value.status < 200 || value.status >= 300) throw new TypeError("script load failed with HTTP " + value.status);
     return undefined;
   });
+  // Only external async classic scripts, not a DOM. New ceilings do not enlarge network budgets.
+  const MAX_SCRIPT_NODES = 32;
+  const MAX_SCRIPT_ATTRIBUTE_BYTES = 16 * 1024;
+  const scriptNodes = new WeakMap();
+  let scriptNodeCount = 0;
+  let scriptAttributeBytes = 0;
+  const scriptAttributeNames = ["src", "type", "integrity", "crossorigin", "async", "defer", "nomodule", "id", "nonce"];
+  const appendScript = (element) => {
+    const frameState = frameNodes.get(element);
+    if (frameState !== undefined) return appendFrame(element, frameState);
+    const state = scriptNodes.get(element);
+    if (state === undefined) throw new NativeTypeError("BrowserMock appendChild accepts script elements only");
+    if (state.started) return element;
+    if (childRealm) throw new NativeTypeError("frame dynamic scripts are unsupported");
+    const src = state.attributes.get("src");
+    if (!src) throw new NativeTypeError("BrowserMock requires an external script src; inline scripts are unsupported");
+    state.started = true;
+    apply(promiseThen, loadExternalScript(src), [
+      () => element.dispatchEvent(new Event("load")),
+      () => element.dispatchEvent(new Event("error")),
+    ]);
+    return element;
+  };
+  // Capture the existing loader: replies execute in this VM before its promise resolves.
+  const loadExternalScript = document.loadScript;
+  document.createElement = (name, ...options) => {
+    if (NativeString(name).toLowerCase() === "iframe" && options.length === 0) return createFrame();
+    if (NativeString(name).toLowerCase() !== "script" || options.length !== 0) {
+      throw new NativeTypeError("BrowserMock createElement supports script only, without options");
+    }
+    if (scriptNodeCount >= MAX_SCRIPT_NODES) throw new NativeRangeError("script element budget exceeded (32 nodes)");
+    if (!consumeBudget("node", 1)) throw new NativeRangeError("script element budget exceeded (32 nodes)");
+    scriptNodeCount += 1;
+    const attributes = new Map();
+    const element = makeEventTarget({ tagName: "SCRIPT", nodeName: "SCRIPT" });
+    const setAttribute = (name, value) => {
+      const key = NativeString(name).toLowerCase();
+      if (!scriptAttributeNames.includes(key)) throw new NativeTypeError("unsupported script attribute: " + key);
+      const text = NativeString(value);
+      if (text.length > MAX_URL_INPUT_LENGTH) throw new NativeRangeError("script attribute exceeds 8192 characters");
+      const bytes = utf8Length(key) + utf8Length(text);
+      if (scriptAttributeBytes + bytes > MAX_SCRIPT_ATTRIBUTE_BYTES) throw new NativeRangeError("script attribute budget exceeded (16 KiB)");
+      if (key === "type" && !["", "text/javascript", "application/javascript"].includes(text.trim().toLowerCase())) {
+        throw new NativeTypeError("module and non-JavaScript scripts are unsupported");
+      }
+      if (key === "integrity" && text !== "") throw new NativeTypeError("script integrity is unsupported; SRI is not checked");
+      if (key === "crossorigin") throw new NativeTypeError("script crossorigin modes are unsupported");
+      if (key === "defer" || key === "nomodule") throw new NativeTypeError("ordered and conditional script modes are unsupported");
+      if (!consumeBudget("attribute", bytes)) throw new NativeRangeError("script attribute budget exceeded (16 KiB)");
+      scriptAttributeBytes += bytes;
+      attributes.set(key, text);
+    };
+    element.setAttribute = setAttribute;
+    element.getAttribute = (name) => attributes.get(NativeString(name).toLowerCase()) ?? null;
+    element.removeAttribute = (name) => { attributes.delete(NativeString(name).toLowerCase()); };
+    for (const key of ["src", "type", "integrity", "crossOrigin", "id", "nonce"]) {
+      const attribute = key.toLowerCase();
+      Object.defineProperty(element, key, {
+        enumerable: true,
+        get: () => {
+          const value = attributes.get(attribute);
+          return key === "src" && value ? new URL(value, initialUrl).href : value ?? (key === "crossOrigin" ? null : "");
+        },
+        set: (value) => setAttribute(attribute, value),
+      });
+    }
+    for (const key of ["async", "defer", "noModule"]) {
+      Object.defineProperty(element, key, {
+        enumerable: true,
+        get: () => key === "async",
+        set: (value) => {
+          if (Boolean(value) !== (key === "async")) throw new NativeTypeError("only async classic scripts are supported");
+          if (key === "async") setAttribute("async", "");
+        },
+      });
+    }
+    for (const key of ["text", "textContent", "innerHTML"]) {
+      Object.defineProperty(element, key, {
+        enumerable: true,
+        get: () => "",
+        set: (value) => {
+          if (NativeString(value) !== "") throw new NativeTypeError("inline script content is unsupported");
+        },
+      });
+    }
+    bindEventHandlers(element, ["load", "error"]);
+    scriptNodes.set(element, { attributes, started: false });
+    return objectFreeze(element);
+  };
+  const unsupportedFrameOperation = () => { throw new NativeTypeError("frame messaging and navigation are unsupported"); };
+  const opaqueWindow = () => objectFreeze({ postMessage: unsupportedFrameOperation });
+  const frameNodes = new WeakMap();
+  const appendFrame = (element, state) => {
+    if (state.started) return element;
+    if (!state.src) throw new NativeTypeError("frame requires an HTTP(S) src");
+    state.started = true;
+    const id = ++nextRequestId;
+    const task = new NativePromise((resolve, reject) => {
+      pending.set(id, { resolve, reject, kind: "frame" });
+      if (!postLine(jsonStringify({ type: "frame.load", id, url: state.src }))) {
+        pending.delete(id); reject(new NativeTypeError("frame IPC budget exceeded"));
+      }
+    });
+    apply(promiseThen, task, [() => {
+      state.window = opaqueWindow();
+      element.dispatchEvent(new Event("load"));
+    }, () => {
+      // Denials expose only an error event and no child identity or fake SDK message.
+      element.dispatchEvent(new Event("error"));
+    }]);
+    return element;
+  };
+  const createFrame = () => {
+    if (childRealm) throw new NativeTypeError("nested frames are unsupported");
+    if (!consumeBudget("frame", 1)) throw new NativeRangeError("frame budget exceeded (4 frames)");
+    if (!consumeBudget("node", 1)) throw new NativeRangeError("script element budget exceeded (32 nodes)");
+    const state = { src: "", started: false, window: null };
+    const attributes = new Map();
+    const element = makeEventTarget({ tagName: "IFRAME", nodeName: "IFRAME" });
+    const setAttribute = (name, value) => {
+      const key = NativeString(name).toLowerCase();
+      if (!["src", "id", "name"].includes(key)) throw new NativeTypeError("unsupported frame attribute: " + key);
+      if (state.started) throw new NativeTypeError("frame navigation is unsupported");
+      const text = requireUrlString(value);
+      if (key === "src") {
+        const url = new URL(text, initialUrl);
+        if (url.protocol !== "http:" && url.protocol !== "https:") throw new NativeTypeError("frame requires an HTTP(S) src");
+        if (/^https?:\/\/[^/]*@/i.test(url.href)) throw new NativeTypeError("frame URL credentials are unsupported");
+        state.src = url.href;
+      }
+      if (!consumeBudget("attribute", utf8Length(key) + utf8Length(text))) throw new NativeRangeError("script attribute budget exceeded (16 KiB)");
+      attributes.set(key, text);
+    };
+    element.setAttribute = setAttribute;
+    element.getAttribute = (name) => attributes.get(NativeString(name).toLowerCase()) ?? null;
+    for (const key of ["src", "id", "name"]) Object.defineProperty(element, key, {
+      enumerable: true, get: () => key === "src" ? state.src : attributes.get(key) ?? "", set: (value) => setAttribute(key, value),
+    });
+    for (const key of ["srcdoc", "sandbox", "credentialless", "crossOrigin", "referrerPolicy"]) Object.defineProperty(element, key, {
+      set: () => { throw new NativeTypeError("unsupported frame attribute: " + key); },
+    });
+    Object.defineProperties(element, {
+      contentWindow: { get: () => state.window },
+      contentDocument: { get: () => null },
+    });
+    bindEventHandlers(element, ["load", "error"]);
+    frameNodes.set(element, state);
+    return objectFreeze(element);
+  };
+  document.head = objectFreeze({ appendChild: appendScript });
+  document.body = objectFreeze({ appendChild: appendScript });
   const navigator = Object.freeze({ userAgent, language: languages[0] ?? "", languages, cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
   Object.assign(window, { document, location, navigator, console, performance, crypto, TextEncoder, CryptoKey, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Request, Response, Event, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
-  Object.defineProperty(window, "location", { value: location, enumerable: true, writable: false, configurable: false });
+  Object.defineProperty(window, "location", childRealm
+    ? { get: () => location, set: unsupportedFrameOperation, enumerable: true, configurable: false }
+    : { value: location, enumerable: true, writable: false, configurable: false });
   Object.defineProperty(window, "isSecureContext", { value: pageLocationData[9], enumerable: true });
   window.window = window; window.self = window; window.globalThis = window;
+  if (childRealm) {
+    Object.defineProperties(window, { parent: { value: opaqueWindow() }, top: { value: opaqueWindow() }, postMessage: { value: unsupportedFrameOperation } });
+  }
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
     configurable: true,
@@ -1555,6 +1738,7 @@ const MAX_HOST_CRYPTO_CALLS = 64;
 const hostCryptoKeys = new Map();
 const hostCryptoKeyIds = new Set();
 let hostCryptoCalls = 0;
+let nextOwnedCryptoKeyId = 0;
 const CRYPTO_FAILURE = '{"ok":false}';
 const hostCryptoOperation = (encoded) => {
   const fail = () => Promise.resolve(CRYPTO_FAILURE);
@@ -1618,8 +1802,26 @@ const MAX_OUTPUT_LINE_BYTES = ${limits.maxOutputLineBytes};
 const MAX_OUTPUT_BYTES = ${limits.maxOutputBytes};
 let outputBytes = 0;
 const pendingKinds = new Map();
+const frames = new Map();
+const receivers = new WeakMap();
+const timerOwners = new Map();
+let nextOuterTimerId = 0;
+let nextFrameId = 0;
+const budget = { node: 0, attribute: 0, frame: 0, crypto: 0 };
+const ceilings = { node: 32, attribute: 16384, frame: 4, crypto: 64 };
+const consumeBudget = (kind, amount) => {
+  if (!Object.hasOwn(ceilings, kind) || !Number.isSafeInteger(amount) || amount < 0 || budget[kind] + amount > ceilings[kind]) return false;
+  budget[kind] += amount; return true;
+};
+let rootInput;
+let deadline;
+const run = (source, realm) => vm.runInContext(source, realm, { timeout: Math.max(1, Math.ceil(deadline - hostMonotonicNow())) });
+const deliverTo = (realm, line) => {
+  realm.__incoming = line; realm.__dispatch = receivers.get(realm);
+  try { run("{ const receive = __dispatch; const incoming = __incoming; delete globalThis.__dispatch; delete globalThis.__incoming; receive(incoming); }", realm); }
+  finally { delete realm.__incoming; delete realm.__dispatch; }
+};
 let context;
-let deliver;
 let finished = false;
 const safeMessage = (cause) => {
   try {
@@ -1631,16 +1833,40 @@ const safeMessage = (cause) => {
 const writeFinal = (output) => {
   if (finished) return;
   finished = true;
+  frames.clear(); timerOwners.clear();
   hostCryptoKeys.clear();
   hostCryptoKeyIds.clear();
   process.stdout.end(JSON.stringify({ type: "result", output }) + "\n", () => process.exit(0));
 };
-const post = (line) => {
+const post = (line, owner = context) => {
   try {
-    const bytes = Buffer.byteLength(line) + 1;
+    let bytes = Buffer.byteLength(line) + 1;
     if (typeof line !== "string" || bytes - 1 > MAX_OUTPUT_LINE_BYTES || outputBytes + bytes > MAX_OUTPUT_BYTES) return false;
     const message = JSON.parse(line);
-    if (message.type === "network") pendingKinds.set(message.id, message.kind);
+    if (message.type === "frame.load") {
+      if (owner !== context || ++nextFrameId > 4) return false;
+      frames.set(message.id, { id: nextFrameId, parent: owner, url: message.url });
+    }
+    if (message.type === "timer.set") {
+      let entry = [...timerOwners.entries()].find(([, value]) => value.owner === owner && value.localId === message.id);
+      if (!entry) {
+        if (timerOwners.size >= ${limits.maxTimers}) { writeFinal({ ok: false, reason: "script timer budget exceeded" }); return false; }
+        entry = [++nextOuterTimerId, { owner, localId: message.id }]; timerOwners.set(...entry);
+      }
+      message.id = entry[0]; line = JSON.stringify(message);
+    }
+    if (message.type === "timer.clear") {
+      const entry = [...timerOwners.entries()].find(([, value]) => value.owner === owner && value.localId === message.id);
+      if (!entry) return true;
+      timerOwners.delete(entry[0]); message.id = entry[0]; line = JSON.stringify(message);
+    }
+    if (message.type === "network") {
+      if (owner !== context) return false;
+      pendingKinds.set(message.id, message.kind);
+    }
+    if (message.type === "cookie.write" && owner !== context) return false;
+    bytes = Buffer.byteLength(line) + 1;
+    if (bytes - 1 > MAX_OUTPUT_LINE_BYTES || outputBytes + bytes > MAX_OUTPUT_BYTES) return false;
     outputBytes += bytes;
     process.stdout.write(line + "\n");
     return true;
@@ -1655,12 +1881,38 @@ const handleParentLine = (line) => {
       writeFinal({ ok: false, reason: String(message.reason) });
       return;
     }
+    if (message.type === "timer.fire") {
+      const entry = timerOwners.get(message.id);
+      if (!entry) return;
+      message.id = entry.localId;
+      // Retain ownership for interval re-registration; the VM clears one-shots.
+      deliverTo(entry.owner, JSON.stringify(message)); return;
+    }
+    if (message.type === "frame.reply") {
+      const entry = frames.get(message.id);
+      if (!entry || entry.child) throw new Error("invalid frame reply ownership");
+      if (message.error) { frames.delete(message.id); deliverTo(context, JSON.stringify(message)); return; }
+      const frame = message.frame;
+      entry.source = Object.freeze({ url: frame.url, origin: frame.origin, cookie: frame.cookie });
+      const parent = new URL(frame.parentUrl); parent.username = ""; parent.password = ""; parent.hash = "";
+      const referrer = parent.origin === frame.origin ? parent.href : parent.origin + "/";
+      entry.child = createRealm({ ...rootInput, url: frame.url, cookie: frame.cookie ?? "", referrer, authoritativeCookies: true }, true);
+      const child = entry.child;
+      const execute = async () => { for (const source of frame.scripts) await run(source, child); };
+      execute().then(() => {
+        if (!finished) {
+          try { deliverTo(context, JSON.stringify({ type: "frame.reply", id: message.id })); }
+          catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
+        }
+      }, (cause) => writeFinal({ ok: false, reason: "frame script failed: " + safeMessage(cause) }));
+      return;
+    }
     if (message.type === "reply") {
       const kind = pendingKinds.get(message.id);
       pendingKinds.delete(message.id);
       if (message.ok && kind === "script") {
         if (!message.response.error && message.response.status >= 200 && message.response.status < 300) {
-          try { vm.runInContext(message.response.body, context); }
+          try { run(message.response.body, context); }
           catch (cause) {
             message = { type: "reply", id: message.id, ok: false, error: "loaded script failed: " + safeMessage(cause) };
           }
@@ -1668,13 +1920,37 @@ const handleParentLine = (line) => {
         if (message.ok) message.response.body = "";
       }
     }
-    deliver(JSON.stringify(message));
+    deliverTo(context, JSON.stringify(message));
   } catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
 };
-const start = (input) => {
+const createRealm = (input, childRealm) => {
+  // Local handles never name another realm's native keys; the eight-key cap stays global.
+  const ownedKeys = new Map();
+  const realmCryptoOperation = (encoded) => {
+    try {
+      const request = JSON.parse(encoded);
+      const localId = request.id;
+      if (request.op === "import") {
+        if (!Number.isSafeInteger(localId) || localId < 1 || ownedKeys.has(localId)) return Promise.resolve(CRYPTO_FAILURE);
+        ownedKeys.set(localId, ++nextOwnedCryptoKeyId);
+      }
+      const nativeId = ownedKeys.get(localId);
+      if (nativeId === undefined) return Promise.resolve(CRYPTO_FAILURE);
+      request.id = nativeId;
+      return hostCryptoOperation(JSON.stringify(request)).then((reply) => {
+        try {
+          const result = JSON.parse(reply);
+          if (result.ok && request.op === "import") result.id = localId;
+          return JSON.stringify(result);
+        } catch { return CRYPTO_FAILURE; }
+      });
+    } catch { return Promise.resolve(CRYPTO_FAILURE); }
+  };
   const pageLocation = hostPageLocation(String(input.url));
   const sandbox = Object.assign(Object.create(null), {
-    __post: post,
+    __post: (line) => post(line, realm),
+    __childRealm: childRealm,
+    __consumeBudget: consumeBudget,
     __urlOperation: hostUrlOperation,
     __pageUrl: String(input.url),
     __pageLocation: pageLocation,
@@ -1686,13 +1962,12 @@ const start = (input) => {
     __performanceNow: hostMonotonicNow,
     __performanceTimeOrigin: hostTimeOrigin,
     __randomBytes: hostRandomBytes,
-    __cryptoOperation: hostCryptoOperation,
+    __cryptoOperation: realmCryptoOperation,
     __encodeBlobText: hostEncodeBlobText,
     __decodeBlobText: hostDecodeBlobText,
   });
-  context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
-  vm.runInContext(bootstrap, context);
-  deliver = vm.runInContext("__receive", context);
+  const realm = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
+  run(bootstrap, realm);
   delete sandbox.__post;
   delete sandbox.__urlOperation;
   delete sandbox.__pageUrl;
@@ -1701,6 +1976,7 @@ const start = (input) => {
   delete sandbox.__cookie;
   delete sandbox.__userAgent;
   delete sandbox.__languages;
+  receivers.set(realm, run("__receive", realm));
   delete sandbox.__receive;
   delete sandbox.__performanceNow;
   delete sandbox.__performanceTimeOrigin;
@@ -1708,6 +1984,14 @@ const start = (input) => {
   delete sandbox.__cryptoOperation;
   delete sandbox.__encodeBlobText;
   delete sandbox.__decodeBlobText;
+  if (childRealm) { delete sandbox.__cookieSnapshot; delete sandbox.__cookieFlush; delete sandbox.__safeMessage; }
+  return realm;
+};
+const start = (input) => {
+  if (!Number.isInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > ${limits.maxTimeoutMs}) throw new Error("invalid script evaluation timeout");
+  rootInput = input; deadline = hostMonotonicNow() + input.timeoutMs;
+  setTimeout(() => writeFinal({ ok: false, reason: "script evaluation timed out" }), Math.max(1, Math.ceil(deadline - hostMonotonicNow())));
+  context = createRealm(input, false);
   const wrapper = "(async function () {\n" +
     "  const snapshot = __cookieSnapshot; const flush = __cookieFlush; const describe = __safeMessage;\n" +
     "  delete globalThis.__cookieSnapshot; delete globalThis.__cookieFlush; delete globalThis.__safeMessage;\n" +
@@ -1717,7 +2001,7 @@ const start = (input) => {
     "  } catch (cause) { try { await flush(); } catch (flushCause) { cause = flushCause; } const state = JSON.parse(snapshot()); return JSON.stringify({ ok: false, reason: describe(cause), setCookies: state.setCookies }); }\n" +
     "})()";
   try {
-    Promise.resolve(vm.runInContext(wrapper, context)).then((encoded) => {
+    Promise.resolve(run(wrapper, context)).then((encoded) => {
       try { writeFinal(JSON.parse(encoded)); }
       catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
     }, (cause) => writeFinal({ ok: false, reason: safeMessage(cause) }));

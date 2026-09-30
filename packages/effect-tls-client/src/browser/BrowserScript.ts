@@ -1,4 +1,4 @@
-import { Duration, Effect, Schema } from "effect";
+import { Duration, Effect, Schema, type Option } from "effect";
 
 const MAX_SOURCE_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
@@ -59,8 +59,61 @@ export interface BrowserScriptNetworkResponse {
   readonly error?: string;
 }
 
+/** Untrusted HTML evidence; never automatically extracted or executed. */
+export const UntrustedFrameCandidate = Schema.Struct({
+  parentUrl: Schema.String,
+  url: Schema.String,
+  origin: Schema.String,
+  status: Schema.Int,
+  headers: Schema.Array(Schema.Tuple([Schema.String, Schema.String])),
+  body: Schema.String,
+});
+export interface UntrustedFrameCandidate extends Schema.Schema.Type<
+  typeof UntrustedFrameCandidate
+> {}
+
+/** Only caller-selected source may leave the host. Cookies are read-only. */
+export const ReviewedFrame = Schema.Struct({
+  scripts: Schema.Array(Schema.String).check(
+    Schema.isMaxLength(8),
+    Schema.makeFilter(
+      (scripts) =>
+        scripts.reduce(
+          (bytes, source) =>
+            bytes + new TextEncoder().encode(source).byteLength,
+          0,
+        ) <= MAX_SOURCE_BYTES || "frame scripts exceed the 64 KiB limit",
+    ),
+  ),
+  cookiePolicy: Schema.optionalKey(Schema.Literals(["none", "same-origin"])),
+});
+export interface ReviewedFrame extends Schema.Schema.Type<
+  typeof ReviewedFrame
+> {}
+
+export type BrowserFrameReviewer = (
+  candidate: UntrustedFrameCandidate,
+) => Effect.Effect<Option.Option<ReviewedFrame>, BrowserScriptError>;
+
+export const FrameLoadResult = Schema.Struct({
+  parentUrl: UntrustedFrameCandidate.fields.parentUrl,
+  url: UntrustedFrameCandidate.fields.url,
+  origin: UntrustedFrameCandidate.fields.origin,
+  status: UntrustedFrameCandidate.fields.status,
+  headers: UntrustedFrameCandidate.fields.headers,
+  scripts: ReviewedFrame.fields.scripts,
+  cookie: Schema.NullOr(Schema.String),
+});
+export interface FrameLoadResult extends Schema.Schema.Type<
+  typeof FrameLoadResult
+> {}
+
 /** Host capabilities are serialized through the runner; no callback enters the VM. */
 export interface BrowserScriptHost {
+  /** Absent unless the caller explicitly supplies a trusted reviewer. */
+  readonly loadFrame?: (
+    url: string,
+  ) => Effect.Effect<FrameLoadResult, BrowserScriptError>;
   readonly request: (
     request: BrowserScriptRequest,
   ) => Effect.Effect<BrowserScriptNetworkResponse, BrowserScriptError>;

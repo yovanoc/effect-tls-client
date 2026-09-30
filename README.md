@@ -181,10 +181,18 @@ await Effect.runPromise(
 ```
 
 See [docs/browser.md](docs/browser.md) for the runnable Node/Bun example,
-cookie ownership, and challenge limitations. AWS WAF support is a separate,
-experimental import from `effect-tls-client/challenges/aws-waf`; it does not
-change default browser behavior or enter the core barrel. The browser guide has
-an explicit-origin, reviewed-bootstrap example and its limitations.
+cookie ownership, and challenge limitations. Navigation recognizes explicit
+provider headers only: AWS WAF's `x-amzn-waf-action: challenge` takes priority
+over Cloudflare's `cf-mitigated: challenge`; this is not a generic 403/page
+guess or an automatic Cloudflare resolver. The optional AWS WAF adapter remains
+a separate experimental import from `effect-tls-client/challenges/aws-waf` and
+does not change default behavior or enter the core barrel. `BrowserMock`'s
+process-backed script runtime requires Node 25+ (also when hosted from Bun); the
+transport remains supported on Node 22+ and Bun 1.4+. An optional
+`frameReviewer` adds experimental, load-only iframe support: it runs only
+caller-selected source in a separate VM realm, not a rendered browser, provider
+SDK integration, or clearance. The browser guide has explicit-origin,
+reviewed-bootstrap and iframe examples, with their limitations.
 
 ### WebSockets
 

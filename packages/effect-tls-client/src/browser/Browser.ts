@@ -15,6 +15,10 @@ import {
 import type { BridgeError } from "../internal/Errors.js";
 import {
   BrowserScriptError,
+  UntrustedFrameCandidate,
+  ReviewedFrame,
+  FrameLoadResult,
+  type BrowserFrameReviewer,
   runBoundedScript,
   type BrowserScriptHost,
   type BrowserScriptNetworkResponse,
@@ -167,17 +171,24 @@ const decodeBrowserNavigateOptions = (
     ),
   );
 
-/** A recognized AWS WAF challenge response. */
-export const BrowserChallenge = Schema.Struct({
-  kind: Schema.Literals(["AwsWaf"]),
-  status: Schema.Int,
-  url: Schema.String,
-  headers: Schema.Array(PairSchema),
-  evidence: Schema.Literals(["x-amzn-waf-action"]),
-});
-export interface BrowserChallenge extends Schema.Schema.Type<
-  typeof BrowserChallenge
-> {}
+/** A challenge identified by an explicit provider response header, not clearance. */
+export const BrowserChallenge = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("AwsWaf"),
+    status: Schema.Int,
+    url: Schema.String,
+    headers: Schema.Array(PairSchema),
+    evidence: Schema.Literal("x-amzn-waf-action"),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("Cloudflare"),
+    status: Schema.Int,
+    url: Schema.String,
+    headers: Schema.Array(PairSchema),
+    evidence: Schema.Literal("cf-mitigated"),
+  }),
+]);
+export type BrowserChallenge = typeof BrowserChallenge.Type;
 
 /** A retry request returned by an application-provided challenge handler. */
 export interface BrowserChallengeResolution {
@@ -212,6 +223,7 @@ export type BrowserChallengeHandler = (
 export interface BrowserHandlers {
   readonly challengeHandler?: BrowserChallengeHandler;
   readonly scriptRuntime?: BrowserScriptRuntime;
+  readonly frameReviewer?: BrowserFrameReviewer;
 }
 
 /** A page returned by navigation after redirects and HTML redirects settle. */
@@ -525,6 +537,21 @@ export const recognizeAwsWafChallenge = (
       })
     : undefined;
 
+/** Recognizes documented response markers only; AWS WAF takes precedence. */
+export const recognizeChallenge = (
+  response: Pick<TlsResponse, "status" | "url" | "headers">,
+): BrowserChallenge | undefined =>
+  recognizeAwsWafChallenge(response) ??
+  (headerValue(response.headers, "cf-mitigated")?.trim() === "challenge"
+    ? BrowserChallenge.make({
+        kind: "Cloudflare",
+        status: response.status,
+        url: response.url,
+        headers: response.headers,
+        evidence: "cf-mitigated",
+      })
+    : undefined);
+
 /** Identifies the observed CloudFront 403 without calling it a completed challenge. */
 export const isCloudFrontForbidden = (
   response: Pick<TlsResponse, "status" | "headers">,
@@ -588,6 +615,7 @@ const readScriptBody = (
   response: TlsResponse,
   maxBytes: number,
   limitReason: string,
+  networkAllowance = maxBytes,
 ): Effect.Effect<ScriptBody, BrowserScriptError> =>
   response.stream.pipe(
     Stream.runFoldEffect(
@@ -597,7 +625,11 @@ const readScriptBody = (
         if (bytes > maxBytes) {
           return Effect.fail(new BrowserScriptError({ reason: limitReason }));
         }
-        state.chunks.push(chunk);
+        // Count up to the asset cap for precise failure precedence, but never
+        // retain chunks beyond the remaining shared network allowance.
+        if (bytes <= networkAllowance) {
+          state.chunks.push(chunk);
+        }
         state.bytes = bytes;
         return Effect.succeed(state);
       },
@@ -610,14 +642,21 @@ const readScriptBody = (
             cause,
           }),
     ),
-    Effect.map(({ chunks, bytes }) => {
+    Effect.flatMap(({ chunks, bytes }) => {
+      if (bytes > networkAllowance) {
+        return Effect.fail(
+          new BrowserScriptError({
+            reason: "script network byte budget exceeded",
+          }),
+        );
+      }
       const output = new Uint8Array(bytes);
       let offset = 0;
       for (const chunk of chunks) {
         output.set(chunk, offset);
         offset += chunk.byteLength;
       }
-      return { text: new TextDecoder().decode(output), bytes };
+      return Effect.succeed({ text: new TextDecoder().decode(output), bytes });
     }),
   );
 
@@ -627,7 +666,10 @@ const makeScriptHost = (
   identityHeaders: ReadonlyArray<Pair>,
   headerOrder: ReadonlyArray<string> | undefined,
   allowedOrigins: ReadonlyArray<string>,
+  frameReviewer: BrowserFrameReviewer | undefined,
+  rootSourceBytes: number,
 ): BrowserScriptHost => {
+  let sourceBytes = rootSourceBytes;
   let requestCount = 0;
   let networkBytes = 0;
   const setCookie = (value: string) =>
@@ -640,7 +682,11 @@ const makeScriptHost = (
           }),
       ),
     );
-  const request = (input: BrowserScriptRequest) =>
+  const request = (
+    input: Omit<BrowserScriptRequest, "kind"> & {
+      readonly kind: BrowserScriptRequest["kind"] | "frame";
+    },
+  ) =>
     Effect.scoped(
       Effect.gen(function* () {
         const validated = yield* Effect.try({
@@ -715,7 +761,17 @@ const makeScriptHost = (
             }),
         });
         let target = yield* Effect.try({
-          try: () => resolveAllowedUrl(input.url, pageUrl, allowedOrigins),
+          try: () => {
+            const url = resolveAllowedUrl(input.url, pageUrl, allowedOrigins);
+            if (
+              input.kind === "frame" &&
+              scriptOrigin(pageUrl).startsWith("https://") &&
+              url.protocol === "http:"
+            ) {
+              throw new TypeError("frame cannot downgrade from HTTPS to HTTP");
+            }
+            return url;
+          },
           catch: (cause) =>
             new BrowserScriptError({
               reason:
@@ -748,13 +804,26 @@ const makeScriptHost = (
             input.kind === "fetch" && method !== "GET" && method !== "HEAD"
               ? pageOrigin
               : "";
-          const outgoingHeaders = xhrHeaders(
-            identityHeaders,
-            target.toString(),
-            referer,
-            requestOrigin,
-            headers,
-          );
+          const outgoingHeaders =
+            input.kind === "frame"
+              ? navigationHeaders(identityHeaders, target.toString(), referer)
+                  .filter(
+                    ([name]) =>
+                      !["sec-fetch-user", "origin"].includes(
+                        name.toLowerCase(),
+                      ),
+                  )
+                  .map(([name, value]): Pair => [
+                    name,
+                    name.toLowerCase() === "sec-fetch-dest" ? "iframe" : value,
+                  ])
+              : xhrHeaders(
+                  identityHeaders,
+                  target.toString(),
+                  referer,
+                  requestOrigin,
+                  headers,
+                );
           const omitCredentials = target.origin !== pageOrigin;
           const requestBytes = new TextEncoder().encode(
             JSON.stringify({
@@ -815,6 +884,29 @@ const makeScriptHost = (
             }
             networkBytes += responseHeaderBytes;
 
+            const finalUrl = yield* Effect.try({
+              try: () => {
+                const final = resolveAllowedUrl(
+                  response.url,
+                  target.toString(),
+                  allowedOrigins,
+                );
+                if (
+                  final.origin !== target.origin ||
+                  (target.protocol === "https:" && final.protocol === "http:")
+                ) {
+                  throw new TypeError(
+                    "script response URL does not match the requested origin",
+                  );
+                }
+                return final.toString();
+              },
+              catch: (cause) =>
+                new BrowserScriptError({
+                  reason: "invalid script response URL",
+                  cause,
+                }),
+            });
             const location = headerValue(response.headers, "location");
             if (
               LOCATION_REDIRECT_STATUSES.has(response.status) &&
@@ -846,6 +938,14 @@ const makeScriptHost = (
                   reason: "script redirect cannot downgrade from HTTPS to HTTP",
                 });
               }
+              if (input.kind === "frame") {
+                const redirectBody = yield* readScriptBody(
+                  response,
+                  MAX_SCRIPT_NETWORK_BYTES - networkBytes,
+                  "script network byte budget exceeded",
+                );
+                networkBytes += redirectBody.bytes;
+              }
               return { next } as const;
             }
 
@@ -858,10 +958,20 @@ const makeScriptHost = (
               response,
               input.kind === "script"
                 ? MAX_SCRIPT_ASSET_BYTES
-                : MAX_FETCH_RESPONSE_BYTES,
+                : input.kind === "frame"
+                  ? Math.min(
+                      MAX_SCRIPT_ASSET_BYTES,
+                      MAX_SCRIPT_NETWORK_BYTES - networkBytes,
+                    )
+                  : MAX_FETCH_RESPONSE_BYTES,
               input.kind === "script"
                 ? "script asset exceeds the 1 MiB limit"
-                : "script fetch response exceeds the 64 KiB limit",
+                : input.kind === "frame"
+                  ? "script asset or network byte budget exceeds the 1 MiB limit"
+                  : "script fetch response exceeds the 64 KiB limit",
+              input.kind === "script"
+                ? MAX_SCRIPT_NETWORK_BYTES - networkBytes
+                : undefined,
             );
             if (networkBytes + bodyResult.bytes > MAX_SCRIPT_NETWORK_BYTES) {
               return yield* new BrowserScriptError({
@@ -869,19 +979,22 @@ const makeScriptHost = (
               });
             }
             networkBytes += bodyResult.bytes;
-            const cookie = yield* transport.scriptCookies(pageUrl).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new BrowserScriptError({
-                    reason: "failed to read script cookies",
-                    cause,
-                  }),
-              ),
-            );
+            const cookie =
+              input.kind === "frame"
+                ? ""
+                : yield* transport.scriptCookies(pageUrl).pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new BrowserScriptError({
+                          reason: "failed to read script cookies",
+                          cause,
+                        }),
+                    ),
+                  );
             return {
               result: {
                 status: response.status,
-                url: response.url,
+                url: finalUrl,
                 headers: safeHeaders,
                 body: bodyResult.text,
                 cookie,
@@ -918,7 +1031,123 @@ const makeScriptHost = (
         }
       }),
     );
-  return { request, setCookie };
+  const loadFrame =
+    frameReviewer === undefined
+      ? undefined
+      : Effect.fnUntraced(function* (input: string) {
+          const url = yield* Schema.decodeEffect(Schema.String)(input).pipe(
+            Effect.mapError(
+              (cause) =>
+                new BrowserScriptError({ reason: "invalid frame URL", cause }),
+            ),
+          );
+          const frame = yield* request({
+            kind: "frame",
+            url,
+            method: "GET",
+            headers: [],
+            body: null,
+            bodyBytes: null,
+          });
+          const candidate = yield* UntrustedFrameCandidate.makeEffect({
+            parentUrl: pageUrl,
+            url: frame.url,
+            origin: scriptOrigin(frame.url),
+            status: frame.status,
+            headers: frame.headers,
+            body: frame.body,
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new BrowserScriptError({
+                  reason: "invalid frame candidate",
+                  cause,
+                }),
+            ),
+          );
+          const decision = yield* Effect.try({
+            try: () => frameReviewer(candidate),
+            catch: (cause) =>
+              new BrowserScriptError({ reason: "frame reviewer threw", cause }),
+          }).pipe(
+            Effect.flatMap((effect) =>
+              Effect.isEffect(effect)
+                ? effect
+                : new BrowserScriptError({
+                    reason: "frame reviewer returned a non-Effect",
+                  }),
+            ),
+          );
+          const reviewed = yield* Schema.decodeEffect(
+            Schema.Option(ReviewedFrame),
+          )(decision, { onExcessProperty: "error" }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new BrowserScriptError({
+                  reason: "invalid reviewed frame",
+                  cause,
+                }),
+            ),
+          );
+          if (Option.isNone(reviewed)) {
+            return yield* new BrowserScriptError({
+              reason: "frame reviewer declined",
+            });
+          }
+          if (
+            reviewed.value.cookiePolicy === "same-origin" &&
+            candidate.origin !== scriptOrigin(pageUrl)
+          ) {
+            return yield* new BrowserScriptError({
+              reason: "frame cookie projection requires the parent origin",
+            });
+          }
+          const selectedBytes = reviewed.value.scripts.reduce(
+            (bytes, source) =>
+              bytes + new TextEncoder().encode(source).byteLength,
+            0,
+          );
+          if (sourceBytes + selectedBytes > 64 * 1024) {
+            return yield* new BrowserScriptError({
+              reason: "shared script source budget exceeds the 64 KiB limit",
+            });
+          }
+          sourceBytes += selectedBytes;
+          const cookie =
+            reviewed.value.cookiePolicy === "same-origin"
+              ? yield* transport.scriptCookies(candidate.url).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new BrowserScriptError({
+                        reason: "failed to read frame cookies",
+                        cause,
+                      }),
+                  ),
+                )
+              : null;
+          return yield* FrameLoadResult.makeEffect({
+            parentUrl: candidate.parentUrl,
+            url: candidate.url,
+            origin: candidate.origin,
+            status: candidate.status,
+            headers: candidate.headers,
+            scripts: reviewed.value.scripts,
+            cookie,
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new BrowserScriptError({
+                  reason: "invalid frame load result",
+                  cause,
+                }),
+            ),
+          );
+        });
+  return {
+    request,
+    setCookie,
+    ...(loadFrame === undefined ? {} : { loadFrame }),
+  };
 };
 
 interface Step {
@@ -984,6 +1213,17 @@ const makeBrowserSession = (
             cause,
           }),
       });
+      const rootSource = yield* Schema.decodeUnknownEffect(Schema.String)(
+        source,
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new BrowserScriptError({
+              reason: "script source is not a string",
+              cause,
+            }),
+        ),
+      );
       const visibleCookie = yield* transport.scriptCookies(response.url);
       const host = makeScriptHost(
         transport,
@@ -991,6 +1231,8 @@ const makeBrowserSession = (
         requestIdentityHeaders,
         requestHeaderOrder,
         allowedOrigins,
+        handlers.frameReviewer,
+        new TextEncoder().encode(rootSource).byteLength,
       );
       const result = yield* runBoundedScript(
         runtime,
@@ -1110,10 +1352,11 @@ const makeBrowserSession = (
             : { headerOrder: requestHeaderOrder }),
           followRedirects: false,
         });
+        const challenge = recognizeChallenge(response);
         const location = LOCATION_REDIRECT_STATUSES.has(response.status)
           ? headerValue(response.headers, "location")
           : undefined;
-        if (location !== undefined) {
+        if (challenge === undefined && location !== undefined) {
           const next = yield* absoluteUrl(location, input.current).pipe(
             Effect.ensuring(response.close),
           );
@@ -1131,7 +1374,6 @@ const makeBrowserSession = (
             Exit.isFailure(exit) ? response.close : Effect.void,
           ),
         );
-        const challenge = recognizeAwsWafChallenge(response);
         if (
           challenge !== undefined &&
           handlers.challengeHandler !== undefined &&
@@ -1177,6 +1419,10 @@ const makeBrowserSession = (
               challengeRetries: input.challengeRetries + 1,
             });
           }
+        }
+
+        if (challenge !== undefined) {
+          return pageFrom(response, body, challenge);
         }
 
         const htmlTarget = redirectTarget(response, body);

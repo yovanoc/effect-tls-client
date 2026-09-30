@@ -11,6 +11,7 @@ import {
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import {
+  FrameLoadResult,
   BrowserScriptContext,
   BrowserScriptError,
   BrowserScriptResult,
@@ -18,9 +19,17 @@ import {
   type BrowserScriptRuntime,
 } from "./BrowserScript.js";
 import { makeBrowserScriptRunnerSource } from "./BrowserScriptRunner.js";
-import { normalizeAllowedOrigins, resolveAllowedUrl } from "./ScriptPolicy.js";
+import {
+  normalizeAllowedOrigins,
+  resolveAllowedUrl,
+  scriptOrigin,
+} from "./ScriptPolicy.js";
 
 const DEFAULT_TIMEOUT_MS = 2_000;
+const MAX_TIMEOUT_MS = 120_000;
+const TimeoutMs = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
+  Schema.isLessThanOrEqualTo(MAX_TIMEOUT_MS),
+);
 const MAX_SOURCE_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
@@ -48,6 +57,7 @@ const timeoutError = () =>
 
 const RunnerStart = Schema.Struct({
   type: Schema.Literal("start"),
+  timeoutMs: TimeoutMs,
   source: Schema.String,
   url: Schema.String,
   cookie: Schema.String,
@@ -75,6 +85,11 @@ const RunnerRequestBody = Schema.NullOr(
   ]),
 );
 const RunnerMessage = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("frame.load"),
+    id: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+    url: Schema.String,
+  }),
   Schema.Struct({
     type: Schema.Literal("network"),
     id: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
@@ -116,6 +131,16 @@ const RunnerNetworkResponse = Schema.Struct({
 });
 const RunnerInputMessage = Schema.Union([
   Schema.Struct({
+    type: Schema.Literal("frame.reply"),
+    id: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+    frame: FrameLoadResult,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("frame.reply"),
+    id: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+    error: Schema.String,
+  }),
+  Schema.Struct({
     type: Schema.Literal("cookie.sync"),
     cookie: Schema.String,
     version: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -144,6 +169,7 @@ const RunnerStartJson = Schema.fromJsonString(RunnerStart);
 const RunnerMessageJson = Schema.fromJsonString(RunnerMessage);
 
 const RUNNER_SOURCE = makeBrowserScriptRunnerSource({
+  maxTimeoutMs: MAX_TIMEOUT_MS,
   maxInputLineBytes: MAX_INPUT_LINE_BYTES,
   maxControlInputLineBytes: MAX_CONTROL_INPUT_LINE_BYTES,
   maxOutputLineBytes: MAX_OUTPUT_LINE_BYTES,
@@ -214,6 +240,7 @@ const makeEvaluate = (
     }
     const start = yield* Schema.encodeEffect(RunnerStartJson)({
       type: "start",
+      timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       source,
       url: context.url,
       cookie: context.cookie,
@@ -287,6 +314,8 @@ const makeEvaluate = (
         let cookieWriteCount = 0;
         let cookieBytes = 0;
         let appliedCookieVersion = 0;
+        let frameCount = 0;
+        let selectedSourceBytes = lineBytes(source);
 
         const writeInput = (
           message: unknown,
@@ -565,6 +594,125 @@ const makeEvaluate = (
             if (event.type === "script.error") {
               return yield* new BrowserScriptError({ reason: event.reason });
             }
+            if (event.type === "frame.load") {
+              const perform = Effect.gen(function* () {
+                if (++frameCount > 4)
+                  return yield* new BrowserScriptError({
+                    reason: "frame budget exceeded (4 frames)",
+                  });
+                if (++networkRequests > MAX_NETWORK_REQUESTS)
+                  return yield* new BrowserScriptError({
+                    reason: "script network request budget exceeded",
+                  });
+                if (activeRequests >= MAX_CONCURRENT_REQUESTS)
+                  return yield* new BrowserScriptError({
+                    reason: "script request concurrency exceeded",
+                  });
+                const requestBytes = lineBytes(line);
+                networkBytes += requestBytes;
+                if (networkBytes > MAX_TOTAL_NETWORK_BYTES)
+                  return yield* new BrowserScriptError({
+                    reason: "script network byte budget exceeded",
+                  });
+                const url = yield* Effect.try({
+                  try: () =>
+                    resolveAllowedUrl(
+                      event.url,
+                      context.url,
+                      options.allowedOrigins ?? [],
+                    ).href,
+                  catch: (cause) =>
+                    new BrowserScriptError({
+                      reason:
+                        cause instanceof Error
+                          ? cause.message
+                          : "frame origin is not allowed",
+                      cause,
+                    }),
+                });
+                if (host?.loadFrame === undefined)
+                  return yield* new BrowserScriptError({
+                    reason: "frame reviewer is unavailable",
+                  });
+                activeRequests += 1;
+                const frame = yield* host.loadFrame(url).pipe(
+                  Effect.flatMap(Schema.decodeUnknownEffect(FrameLoadResult)),
+                  Effect.mapError((cause) =>
+                    cause instanceof BrowserScriptError
+                      ? cause
+                      : new BrowserScriptError({
+                          reason: "invalid reviewed frame",
+                          cause,
+                        }),
+                  ),
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      activeRequests -= 1;
+                    }),
+                  ),
+                );
+                yield* Effect.try({
+                  try: () => {
+                    const finalUrl = resolveAllowedUrl(
+                      frame.url,
+                      context.url,
+                      options.allowedOrigins ?? [],
+                    );
+                    if (
+                      frame.parentUrl !== context.url ||
+                      frame.origin !== finalUrl.origin ||
+                      (frame.cookie !== null &&
+                        finalUrl.origin !== scriptOrigin(context.url))
+                    )
+                      throw new BrowserScriptError({
+                        reason: "invalid frame ownership or cookie projection",
+                      });
+                  },
+                  catch: (cause) =>
+                    new BrowserScriptError({
+                      reason: "invalid frame ownership or cookie projection",
+                      cause,
+                    }),
+                });
+                if (frame.status < 200 || frame.status >= 300)
+                  return yield* new BrowserScriptError({
+                    reason: `frame load failed with HTTP ${frame.status}`,
+                  });
+                selectedSourceBytes += frame.scripts.reduce(
+                  (bytes, script) => bytes + lineBytes(script),
+                  0,
+                );
+                if (selectedSourceBytes > MAX_SOURCE_BYTES)
+                  return yield* new BrowserScriptError({
+                    reason: "aggregate script source exceeds the 64 KiB limit",
+                  });
+                networkBytes += lineBytes(JSON.stringify(frame));
+                if (networkBytes > MAX_TOTAL_NETWORK_BYTES)
+                  return yield* new BrowserScriptError({
+                    reason: "script network byte budget exceeded",
+                  });
+                if (frame.cookie !== null && exceedsCookieLimit(frame.cookie))
+                  return yield* new BrowserScriptError({
+                    reason: "frame cookie exceeds the 64 KiB limit",
+                  });
+                yield* writeInput(
+                  { type: "frame.reply", id: event.id, frame },
+                  MAX_INPUT_LINE_BYTES,
+                );
+              }).pipe(
+                Effect.catch((error) =>
+                  writeInput({
+                    type: "frame.reply",
+                    id: event.id,
+                    error: error.reason,
+                  }),
+                ),
+              );
+              yield* Effect.forkScoped(
+                hostRequestSemaphore.withPermit(perform),
+              );
+              return { bytes };
+            }
             if (event.type === "cookie.write") {
               if (
                 ++cookieWriteCount > MAX_COOKIE_WRITES ||
@@ -737,11 +885,7 @@ const makeEvaluate = (
 export const BrowserMockOptions = Schema.Struct({
   executable: Schema.optionalKey(Schema.String),
   allowedOrigins: Schema.optionalKey(Schema.Array(Schema.String)),
-  timeoutMs: Schema.optionalKey(
-    Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
-      Schema.isLessThanOrEqualTo(120_000),
-    ),
-  ),
+  timeoutMs: Schema.optionalKey(TimeoutMs),
 });
 export interface BrowserMockOptions extends Schema.Schema.Type<
   typeof BrowserMockOptions

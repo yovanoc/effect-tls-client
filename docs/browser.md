@@ -117,11 +117,24 @@ const program = Effect.scoped(
 
 ## Challenge and script boundary
 
-An explicit `x-amzn-waf-action: challenge` response is surfaced as
-`page.challenge`. An optional `challengeHandler` can inspect the page body and
-return a retry request, or `None` to leave the challenge visible. A
-CloudFront `403` is exposed through `page.cloudFrontForbidden`; it is not
-reported as a solved challenge.
+`Browser.navigate` surfaces only explicit challenge response markers as
+`page.challenge`: AWS WAF's trimmed `x-amzn-waf-action` value is matched
+case-insensitively to `challenge` first; otherwise Cloudflare's trimmed
+`cf-mitigated` value must be exactly lowercase `challenge`. Header names are
+case-insensitive. A
+generic status/body or `cf-ray` alone is not evidence. Without a handler, or
+when a handler returns `None`, the original response and body are preserved;
+recognition alone neither evaluates scripts nor retries. An optional
+`challengeHandler` may explicitly inspect the response and request a bounded
+retry. A CloudFront `403` is exposed separately through
+`page.cloudFrontForbidden`, not reported as a solved challenge.
+
+The [Cloudflare research notes](research/cloudflare-integration.md) cover
+Turnstile and clearance limits, including the lack of a public iframe
+`postMessage` acquisition contract. The [DataDome notes](research/datadome-integration.md)
+cover Device Check's browser/device assessment. The experimental iframe path
+below is load-only; it supplies neither a renderer nor a provider's iframe
+SDK/messaging protocol.
 
 ```ts
 import { Effect } from "effect";
@@ -140,6 +153,36 @@ const program = Effect.scoped(
   }),
 );
 ```
+
+### Composing challenge handlers
+
+Use `composeChallengeHandlers` to try application-defined handlers in order:
+
+```ts
+import {
+  composeChallengeHandlers,
+  type BrowserChallengeHandler,
+} from "effect-tls-client/browser";
+
+// Implement these in your application; these are not built-in adapters.
+declare const primaryHandler: BrowserChallengeHandler;
+declare const fallbackHandler: BrowserChallengeHandler;
+
+const challengeHandler = composeChallengeHandlers(
+  primaryHandler,
+  fallbackHandler,
+);
+// Pass { challengeHandler } to Browser.open or Browser.fromSession.
+```
+
+Each handler receives the same challenge and context, once per combined-handler
+invocation. `None` falls through; the first `Some` retry decision is returned
+unchanged and skips later handlers. Empty or all-declining compositions return
+`None`. Typed failures and interruption propagate immediately: a failed handler
+is not a decline, so errors do not trigger fallback. Navigation's existing
+5-second whole-handler deadline and `maxChallengeRetries` cover the entire
+composition; this helper adds no deadlines or retries. A retry decision is not
+proof of clearance—inspect the follow-up page.
 
 `BrowserMock` is an optional process-backed runtime for reviewed challenge
 scripts. A fresh VM context exposes `document.cookie`, `document.referrer` from
@@ -236,6 +279,80 @@ WebSocket, or general DOM APIs. Network operations
 are serialized to the host and made through the same scoped `TlsSession`; Go
 remains authoritative for cookies.
 
+The only DOM-like script support is VM-local external asynchronous classic
+`<script>` elements: `document.createElement("script")`, plus
+`document.head.appendChild` and `document.body.appendChild`. Appending returns
+the same element and starts that element at most once. Synthetic `load` and
+`error` events fire after the existing loader has completed execution or failed.
+This is not acquisition or clearance evidence. At most 32 script elements may
+be created per evaluation; cumulative script-attribute data is capped at 16 KiB,
+and each attribute value at 8,192 characters. Inline content, module or other
+non-JavaScript types, nonempty `integrity` (SRI is rejected, not ignored), any
+`crossorigin`, `defer`/`nomodule`, and setting `async = false` are unsupported
+and reject. `document.createElement` also accepts `"iframe"` as described
+below; other elements (including `div` and `canvas`) remain unsupported. This
+is not a general DOM or renderer and adds no `postMessage` API.
+
+### Experimental reviewed iframe loading
+
+The optional `BrowserHandlers.frameReviewer` lets `BrowserMock` load an
+HTTP(S) frame candidate through the same scoped `TlsSession`. The reviewer
+receives a Schema-validated `UntrustedFrameCandidate` (`parentUrl`, `url`,
+`origin`, `status`, `headers`, and untrusted HTML `body`) and must return a
+Schema-checked `Option.some({ scripts })` to grant specific source strings, or
+`Option.none()` to deny. Page scripts are never extracted or selected
+automatically. `BrowserMock.layer({ allowedOrigins })` separately allowlists
+exact network origins: allowing a fetch does not grant code execution.
+
+This synthetic example selects only its own fixture source:
+
+```ts
+import { Effect, Option } from "effect";
+import * as Browser from "effect-tls-client/browser";
+
+const frameReviewer: Browser.BrowserFrameReviewer = (candidate) =>
+  candidate.origin === "https://example.test" &&
+  candidate.url === "https://example.test/frame"
+    ? Effect.succeed(
+        Option.some({ scripts: ["window.syntheticFixture = true;"] }),
+      )
+    : Effect.succeed(Option.none());
+
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const scriptRuntime = yield* Browser.BrowserMock;
+    return yield* Browser.open(
+      { transport: { profile: "chrome_152_PSK" } },
+      { scriptRuntime, frameReviewer },
+    );
+  }),
+);
+```
+
+Provide `BrowserMock.layer({ allowedOrigins: ["https://example.test"] })`
+and `TlsClient.layer` as usual. The origin grant permits the frame request;
+the reviewer independently grants the selected source. Frames accept only
+HTTP(S) `src` URLs without credentials and `src`/`id`/`name` attributes. Per
+evaluation limits are four frames, 32 combined script/frame nodes, 16 KiB of
+attribute data (8,192 characters per value), at most eight selected scripts per
+frame, and 64 KiB of aggregate source including the parent script. Frame loads
+share the existing eight-request and 1 MiB network-data budgets, the default
+2-second `BrowserMock` process deadline, and the 5-second whole challenge-handler
+deadline.
+
+By default the reviewed frame cookie is `null`, so child `document.cookie` is
+empty. Only an explicit `cookiePolicy: "same-origin"` grant for a frame whose
+origin matches the parent provides a read-only Go-Jar projection; child cookie
+writes still reject. Cross-origin frame requests omit credentials and ignore
+response `Set-Cookie`. The child realm has separate globals, intrinsics, and
+read-only location; `parent`, `top`, and `contentWindow` are opaque. Child
+`fetch`, XHR, `document.loadScript`, cookie writes, navigation, and `postMessage`
+are unsupported. There is no rendering or general DOM. A synthetic `load`
+event is not SDK completion or clearance evidence, and no vendor success
+message is forged. This is experimental load-only support, not full iframe,
+Turnstile, DataDome Device Check, or clearance support. Existing frame fixtures
+are synthetic and do not establish cross-platform Node 25+ coverage.
+
 Network access is denied unless each origin is explicitly configured. HTTPS
 origins must be allowlisted; plain HTTP is allowed only for loopback origins.
 Redirects are followed manually, each hop must satisfy the same policy,
@@ -278,6 +395,29 @@ const program = Effect.scoped(
   }),
 );
 ```
+
+### Await external script loading and acquisition separately
+
+For example, a reviewed synthetic asset at `https://challenge.example.test/acquire.js`
+may define `window.acquireFixture` as its own asynchronous acquisition operation.
+Within the explicitly evaluated source, wait for both steps:
+
+```js
+const script = document.createElement("script");
+script.src = "https://challenge.example.test/acquire.js";
+const loaded = new Promise((resolve, reject) => {
+  script.addEventListener("load", resolve, { once: true });
+  script.addEventListener("error", reject, { once: true });
+});
+document.head.appendChild(script);
+await loaded; // Fetch and script execution finished; this is not clearance.
+await window.acquireFixture(); // Separate, fixture-defined acquisition promise.
+```
+
+Awaiting `load` alone does not mean acquisition succeeded. The external asset
+must be reviewed and its exact origin allowed; verify the actual follow-up page
+rather than treating a load event or returned value as clearance. Unawaited load
+or acquisition work ends when evaluation completes.
 
 Options are Schema-validated when the handler executes; invalid options fail
 with `BrowserSessionError` kind `Config` before evaluation. `cookieNames` is a
@@ -468,11 +608,13 @@ compatibility details—not public adapter options or a universal resolution
 contract. `forceRefreshToken` is observed only when the reviewed page calls it. The existing BrowserMock 2-second VM deadline and 5-second whole
 handler deadline are unchanged.
 
-This is not a complete HTML/JavaScript engine or browser. Script discovery is
-bounded and recognizes only a subset of classic `<script>` elements; ambiguous
-markup and unsupported attributes/types (including `async`/`defer`) are not
-reproduced. Active `<base>` elements make discovery unsupported rather than
-resolving relative URLs against the wrong base. Attribute separators use HTML
+This is not a complete HTML/JavaScript engine or browser. The AWS adapter's
+static HTML script discovery is bounded and recognizes only a subset of classic
+`<script>` elements; ambiguous markup and unsupported attributes/types (including
+`async`/`defer`) are not reproduced. This is separate from the limited dynamic
+VM script-element support described above. Active `<base>` elements make
+static discovery unsupported rather than resolving relative URLs against the
+wrong base. Attribute separators use HTML
 ASCII whitespace; NBSP in an unquoted value is preserved, not treated as a separator. Inline code runs in a function scope, so lexical declarations are
 not shared globals; explicitly assign shared entry points to `window`. Work
 that is not awaited ends when evaluation completes, and script/acquisition
