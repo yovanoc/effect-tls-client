@@ -21,7 +21,12 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   // Host helpers exchange only primitives; no host objects enter the VM.
   const hostUrlOperation = __urlOperation;
   delete globalThis.__urlOperation;
+  const hostCryptoOperation = __cryptoOperation;
+  delete globalThis.__cryptoOperation;
   const jsonParse = JSON.parse;
+  const jsonStringify = JSON.stringify;
+  const pageLocationData = jsonParse(__pageLocation);
+  delete globalThis.__pageLocation;
   const hostRandomBytes = __randomBytes;
   const hostEncodeBlobText = __encodeBlobText;
   const hostDecodeBlobText = __decodeBlobText;
@@ -30,10 +35,19 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const NativePromise = Promise;
   const NativeError = Error;
   const NativeTypeError = TypeError;
+  const NativeRangeError = RangeError;
   const NativeString = String;
   const NativeNumber = Number;
   const mathTrunc = Math.trunc;
   const apply = Reflect.apply;
+  const objectFreeze = Object.freeze;
+  const objectDefineProperties = Object.defineProperties;
+  const arrayIsArray = Array.isArray;
+  const objectCreate = Object.create;
+  const numberIsInteger = Number.isInteger;
+  const promiseThen = NativePromise.prototype.then;
+  const weakMapGet = WeakMap.prototype.get;
+  const weakMapSet = WeakMap.prototype.set;
   const isView = NativeArrayBuffer.isView;
   const typedArrayPrototype = Object.getPrototypeOf(NativeUint8Array.prototype);
   const typedArrayTag = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag).get;
@@ -46,6 +60,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const arrayBufferByteLength = Object.getOwnPropertyDescriptor(NativeArrayBuffer.prototype, "byteLength").get;
   const stringCharCodeAt = String.prototype.charCodeAt;
   const stringFromCharCode = String.fromCharCode;
+  const stringSlice = String.prototype.slice;
   const numberToString = Number.prototype.toString;
   const MAX_URL_INPUT_LENGTH = 8192;
   const MAX_URL_RESULT_LENGTH = 65536;
@@ -121,6 +136,13 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
       set: readOnlyUrl,
     });
   }
+  const MAX_CRYPTO_OPERATIONS = 64;
+  const MAX_CRYPTO_BYTES = 65536;
+  let cryptoOperations = 0;
+  const consumeCryptoOperation = () => {
+    if (cryptoOperations >= MAX_CRYPTO_OPERATIONS) throw new NativeRangeError("crypto operation budget exceeded");
+    cryptoOperations += 1;
+  };
   const getRandomValues = (array) => {
     if (!isView(array)) throw new NativeTypeError("crypto.getRandomValues expects an integer typed array");
     const tag = apply(typedArrayTag, array, []);
@@ -147,7 +169,6 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     return array;
   };
-  const crypto = Object.freeze({ getRandomValues });
   // Keep the host clock closure private; only the local wrapper is script-visible.
   const monotonicNow = __performanceNow;
   const performance = Object.freeze({
@@ -155,6 +176,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     now: () => monotonicNow(),
   });
   const initialUrl = String(__pageUrl);
+  const initialReferrer = String(__referrer);
   const userAgent = String(__userAgent);
   const authoritativeCookies = Boolean(__authoritativeCookies);
   const MAX_REQUEST_BODY_BYTES = ${limits.maxRequestBodyBytes};
@@ -165,7 +187,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const MAX_HEADERS = ${limits.maxHeaders};
   const MAX_HEADER_BYTES = ${limits.maxHeaderBytes};
   const utf8Length = (value) => {
-    const text = String(value);
+    const text = NativeString(value);
     let bytes = 0;
     for (let index = 0; index < text.length; index += 1) {
       const code = apply(stringCharCodeAt, text, [index]);
@@ -178,6 +200,248 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     return bytes;
   };
+  const writeUtf8 = (text, destination, capacity) => {
+    let read = 0;
+    let written = 0;
+    while (read < text.length) {
+      const first = apply(stringCharCodeAt, text, [read]);
+      let codePoint = first;
+      let units = 1;
+      if (first >= 0xd800 && first <= 0xdbff) {
+        const second = read + 1 < text.length ? apply(stringCharCodeAt, text, [read + 1]) : 0;
+        if (second >= 0xdc00 && second <= 0xdfff) {
+          codePoint = 0x10000 + ((first - 0xd800) << 10) + (second - 0xdc00);
+          units = 2;
+        } else codePoint = 0xfffd;
+      } else if (first >= 0xdc00 && first <= 0xdfff) codePoint = 0xfffd;
+      const count = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+      if (written + count > capacity) break;
+      if (count === 1) destination[written++] = codePoint;
+      else if (count === 2) {
+        destination[written++] = 0xc0 | (codePoint >> 6);
+        destination[written++] = 0x80 | (codePoint & 0x3f);
+      } else if (count === 3) {
+        destination[written++] = 0xe0 | (codePoint >> 12);
+        destination[written++] = 0x80 | ((codePoint >> 6) & 0x3f);
+        destination[written++] = 0x80 | (codePoint & 0x3f);
+      } else {
+        destination[written++] = 0xf0 | (codePoint >> 18);
+        destination[written++] = 0x80 | ((codePoint >> 12) & 0x3f);
+        destination[written++] = 0x80 | ((codePoint >> 6) & 0x3f);
+        destination[written++] = 0x80 | (codePoint & 0x3f);
+      }
+      read += units;
+    }
+    return { read, written };
+  };
+  const encodeInto = (input, destination) => {
+    let byteLength;
+    try {
+      if (apply(typedArrayTag, destination, []) !== "Uint8Array") throw new NativeTypeError("TextEncoder.encodeInto expects a Uint8Array");
+      byteLength = apply(typedArrayByteLength, destination, []);
+    } catch {
+      throw new NativeTypeError("TextEncoder.encodeInto expects a Uint8Array");
+    }
+    return writeUtf8(NativeString(input), destination, byteLength);
+  };
+  class TextEncoder {
+    get encoding() { return "utf-8"; }
+    encode(input = "") {
+      const text = NativeString(input);
+      const bytes = new NativeUint8Array(utf8Length(text));
+      writeUtf8(text, bytes, apply(typedArrayByteLength, bytes, []));
+      return bytes;
+    }
+    encodeInto(input, destination) { return encodeInto(input, destination); }
+  }
+  const copyBufferSource = (input, label) => {
+    let buffer;
+    let byteOffset = 0;
+    let byteLength;
+    if (isView(input)) {
+      try {
+        buffer = apply(typedArrayBuffer, input, []);
+        byteOffset = apply(typedArrayByteOffset, input, []);
+        byteLength = apply(typedArrayByteLength, input, []);
+      } catch {
+        try {
+          buffer = apply(dataViewBuffer, input, []);
+          byteOffset = apply(dataViewByteOffset, input, []);
+          byteLength = apply(dataViewByteLength, input, []);
+        } catch {
+          throw new NativeTypeError("Web Crypto expects an ArrayBuffer or view");
+        }
+      }
+    } else {
+      try { byteLength = apply(arrayBufferByteLength, input, []); }
+      catch { throw new NativeTypeError("Web Crypto expects an ArrayBuffer or view"); }
+      buffer = input;
+    }
+    if (byteLength > MAX_CRYPTO_BYTES) throw new NativeTypeError("Web Crypto " + label + " exceeds the 64 KiB limit");
+    let source;
+    try { source = new NativeUint8Array(buffer, byteOffset, byteLength); }
+    catch { throw new NativeTypeError("Web Crypto input is detached or invalid"); }
+    const copy = new NativeUint8Array(byteLength);
+    for (let index = 0; index < byteLength; index += 1) copy[index] = source[index];
+    return copy;
+  };
+  const bytesToString = (bytes) => {
+    let value = "";
+    for (let index = 0; index < apply(typedArrayByteLength, bytes, []); index += 1) {
+      value += apply(stringFromCharCode, NativeString, [bytes[index]]);
+    }
+    return value;
+  };
+  const performCrypto = (request) => new NativePromise((resolve, reject) => {
+    let hostTask;
+    try { hostTask = hostCryptoOperation(request); }
+    catch { reject(new NativeError("Web Crypto operation failed")); return; }
+    try {
+      apply(hostTask.then, hostTask, [
+        (encoded) => {
+          try {
+            if (typeof encoded !== "string" || encoded.length > 1200000) throw new NativeError("invalid Web Crypto response");
+            const result = jsonParse(encoded);
+            if (result === null || typeof result !== "object" || result.ok !== true) throw new NativeError("Web Crypto operation failed");
+            resolve(result);
+          } catch { reject(new NativeError("Web Crypto operation failed")); }
+        },
+        () => reject(new NativeError("Web Crypto operation failed")),
+      ]);
+    } catch { reject(new NativeError("Web Crypto operation failed")); }
+  });
+  const cryptoKeyData = new WeakMap();
+  const cryptoKeyToken = {};
+  class CryptoKey {
+    constructor(token, id, length) {
+      if (token !== cryptoKeyToken) throw new NativeTypeError("CryptoKey cannot be constructed directly");
+      apply(weakMapSet, cryptoKeyData, [this, id]);
+      objectDefineProperties(this, {
+        type: { value: "secret", enumerable: true },
+        extractable: { value: false, enumerable: true },
+        algorithm: { value: objectFreeze({ name: "AES-GCM", length }), enumerable: true },
+        usages: { value: objectFreeze(["encrypt"]), enumerable: true },
+      });
+      objectFreeze(this);
+    }
+  }
+  objectFreeze(CryptoKey.prototype);
+  const localCryptoKey = (id, length) => new CryptoKey(cryptoKeyToken, id, length);
+  const getCryptoKeyId = (key) => {
+    try {
+      const id = apply(weakMapGet, cryptoKeyData, [key]);
+      return numberIsInteger(id) && id > 0 && id <= 8 ? id : null;
+    } catch { return null; }
+  };
+  let nextCryptoKeyId = 0;
+  const importKey = (format, keyData, algorithm, extractable, usages) => new NativePromise((resolve, reject) => {
+    try { consumeCryptoOperation(); }
+    catch { reject(new NativeRangeError("crypto operation budget exceeded")); return; }
+    let raw;
+    let id;
+    try {
+      if (format !== "raw" || algorithm === null || typeof algorithm !== "object" || algorithm.name !== "AES-GCM" || extractable !== false ||
+          !arrayIsArray(usages) || usages.length !== 1 || usages[0] !== "encrypt" || nextCryptoKeyId >= 8) {
+        throw new NativeTypeError("unsupported raw AES-GCM import");
+      }
+      raw = copyBufferSource(keyData, "key");
+      const length = apply(typedArrayByteLength, raw, []);
+      if (length !== 16 && length !== 24 && length !== 32) throw new NativeTypeError("invalid AES-GCM key length");
+      id = ++nextCryptoKeyId;
+    } catch {
+      reject(new NativeTypeError("unsupported raw AES-GCM import"));
+      return;
+    }
+    const request = objectCreate(null);
+    request.op = "import";
+    request.id = id;
+    request.raw = bytesToString(raw);
+    const task = performCrypto(jsonStringify(request));
+    apply(promiseThen, task, [
+      (result) => {
+        if (result.id !== id || result.length !== apply(typedArrayByteLength, raw, []) * 8) {
+          reject(new NativeError("Web Crypto operation failed"));
+          return;
+        }
+        try { resolve(localCryptoKey(id, result.length)); }
+        catch { reject(new NativeError("Web Crypto operation failed")); }
+      },
+      () => reject(new NativeError("Web Crypto operation failed")),
+    ]);
+  });
+  const encrypt = (algorithm, key, data) => new NativePromise((resolve, reject) => {
+    try { consumeCryptoOperation(); }
+    catch { reject(new NativeRangeError("crypto operation budget exceeded")); return; }
+    let id;
+    let iv;
+    let additionalData;
+    let plaintext;
+    let tagLength;
+    try {
+      if (algorithm === null || typeof algorithm !== "object" || algorithm.name !== "AES-GCM") {
+        throw new NativeTypeError("only AES-GCM encryption is supported");
+      }
+      id = getCryptoKeyId(key);
+      if (id === null) throw new NativeTypeError("invalid CryptoKey");
+      iv = copyBufferSource(algorithm.iv, "IV");
+      if (apply(typedArrayByteLength, iv, []) === 0) throw new NativeTypeError("AES-GCM IV must not be empty");
+      additionalData = algorithm.additionalData === undefined
+        ? new NativeUint8Array(0)
+        : copyBufferSource(algorithm.additionalData, "additionalData");
+      plaintext = copyBufferSource(data, "data");
+      tagLength = algorithm.tagLength === undefined ? 128 : algorithm.tagLength;
+      if (!numberIsInteger(tagLength) ||
+          (tagLength !== 32 && tagLength !== 64 && tagLength !== 96 && tagLength !== 104 &&
+           tagLength !== 112 && tagLength !== 120 && tagLength !== 128)) {
+        throw new NativeTypeError("unsupported AES-GCM tag length");
+      }
+    } catch {
+      reject(new NativeTypeError("unsupported AES-GCM encryption input"));
+      return;
+    }
+    const request = objectCreate(null);
+    request.op = "encrypt";
+    request.id = id;
+    request.iv = bytesToString(iv);
+    request.additionalData = bytesToString(additionalData);
+    request.data = bytesToString(plaintext);
+    request.tagLength = tagLength;
+    const task = performCrypto(jsonStringify(request));
+    apply(promiseThen, task, [
+      (result) => {
+        if (typeof result.data !== "string" || result.data.length > MAX_CRYPTO_BYTES + 16) {
+          reject(new NativeError("Web Crypto operation failed"));
+          return;
+        }
+        const bytes = new NativeUint8Array(result.data.length);
+        for (let index = 0; index < result.data.length; index += 1) {
+          const code = apply(stringCharCodeAt, result.data, [index]);
+          if (code > 255) {
+            reject(new NativeError("Web Crypto operation failed"));
+            return;
+          }
+          bytes[index] = code;
+        }
+        resolve(apply(typedArrayBuffer, bytes, []));
+      },
+      () => reject(new NativeError("Web Crypto operation failed")),
+    ]);
+  });
+  const subtle = objectFreeze({ importKey, encrypt });
+  const randomUUID = () => {
+    const bytes = new NativeUint8Array(16);
+    getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = "";
+    for (let index = 0; index < bytes.length; index += 1) {
+      const part = apply(numberToString, bytes[index], [16]);
+      hex += part.length === 1 ? "0" + part : part;
+    }
+    return apply(stringSlice, hex, [0, 8]) + "-" + apply(stringSlice, hex, [8, 12]) + "-" +
+      apply(stringSlice, hex, [12, 16]) + "-" + apply(stringSlice, hex, [16, 20]) + "-" + apply(stringSlice, hex, [20, 32]);
+  };
+  const crypto = objectFreeze({ getRandomValues, randomUUID, subtle });
   const MAX_BLOB_BYTES = 1024 * 1024;
   const blobData = new WeakMap();
   let blobBytesAllocated = 0;
@@ -754,6 +1018,47 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     entries() { return this.values[Symbol.iterator](); }
     [Symbol.iterator]() { return this.entries(); }
   }
+  const requestStates = new WeakMap();
+  const getRequestState = (value) => apply(weakMapGet, requestStates, [value]);
+  class Request {
+    constructor(input, init = {}) {
+      const source = input instanceof Request ? getRequestState(input) : undefined;
+      if (source?.bodyUsed) throw new TypeError("Request body is already used");
+      const rawUrl = source?.url ?? (typeof input === "string" ? input : input instanceof URL ? input.href : undefined);
+      if (typeof rawUrl !== "string") throw new TypeError("Request expects a URL string, URL, or Request");
+      const options = init ?? {};
+      const url = rawUrl;
+      const method = String(options.method ?? source?.method ?? "GET").toUpperCase();
+      const headers = new Headers(options.headers ?? source?.headers);
+      const bodyOption = options.body;
+      const body = bodyOption !== undefined ? bodyOption : source?.body ?? null;
+      const credentials = options.credentials ?? source?.credentials ?? "same-origin";
+      const redirect = options.redirect ?? source?.redirect ?? "follow";
+      const mode = options.mode ?? source?.mode ?? "cors";
+      if (credentials !== "same-origin") throw new TypeError("fetch credentials mode is not supported");
+      if (redirect !== "follow") throw new TypeError("fetch redirect mode is not supported");
+      if (options.mode !== undefined) throw new TypeError("fetch mode is not supported");
+      if (body != null && typeof body !== "string" && !(body instanceof FormData)) throw new TypeError("Request supports string and FormData bodies only");
+      if ((method === "GET" || method === "HEAD") && body != null) throw new TypeError("GET and HEAD cannot have a body");
+      apply(weakMapSet, requestStates, [this, { url, method, headers, body, credentials, redirect, mode, bodyUsed: false }]);
+      if (source && bodyOption === undefined && source.body != null) source.bodyUsed = true;
+    }
+    get url() { return getRequestState(this).url; }
+    get method() { return getRequestState(this).method; }
+    get headers() { return getRequestState(this).headers; }
+    get body() { return getRequestState(this).body; }
+    get credentials() { return getRequestState(this).credentials; }
+    get redirect() { return getRequestState(this).redirect; }
+    get mode() { return getRequestState(this).mode; }
+    get bodyUsed() { return getRequestState(this).bodyUsed; }
+    clone() {
+      const state = getRequestState(this);
+      if (state.bodyUsed) throw new TypeError("Request body is already used");
+      const clone = objectCreate(Request.prototype);
+      apply(weakMapSet, requestStates, [clone, { ...state, headers: new Headers(state.headers), bodyUsed: false }]);
+      return clone;
+    }
+  }
   class Response {
     constructor(value) {
       this.status = value.status;
@@ -773,24 +1078,23 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   }
   const fetch = (input, init = {}) => {
     try {
-      if (init.credentials !== undefined && init.credentials !== "same-origin") throw new TypeError("fetch credentials mode is not supported");
-      if (init.redirect !== undefined && init.redirect !== "follow") throw new TypeError("fetch redirect mode is not supported");
-      if (init.mode !== undefined) throw new TypeError("fetch mode is not supported");
-      const url = typeof input === "string" ? input : input && input.url;
-      if (typeof url !== "string") throw new TypeError("fetch expects a URL string");
-      const method = String(init.method || "GET").toUpperCase();
-      const headers = new Headers(init.headers);
+      const requestInput = input && typeof input === "object" && !(input instanceof Request) && !(input instanceof URL) && typeof input.url === "string" ? input.url : input;
+      const requestObject = new Request(requestInput, init);
+      const state = getRequestState(requestObject);
+      const { url, method } = state;
+      const headers = new Headers(state.headers);
       let body = null;
-      if (init.body instanceof FormData) {
+      if (state.body instanceof FormData) {
         if (method === "GET" || method === "HEAD") throw new TypeError("GET and HEAD cannot have a body");
-        const multipart = serializeFormData(init.body);
+        const multipart = serializeFormData(state.body);
         body = multipart.bytes;
         if (!headers.has("content-type")) headers.set("content-type", multipart.contentType);
-      } else if (init.body != null) {
-        if (typeof init.body !== "string") throw new TypeError("fetch supports string and FormData request bodies only");
-        body = init.body;
+      } else if (state.body != null) {
+        if (typeof state.body !== "string") throw new TypeError("fetch supports string and FormData request bodies only");
+        body = state.body;
       }
       if ((method === "GET" || method === "HEAD") && body !== null) throw new TypeError("GET and HEAD cannot have a body");
+      if (body !== null) state.bodyUsed = true;
       return request("fetch", url, method, headers, body).then((value) => new Response(value));
     } catch (cause) { return Promise.reject(cause); }
   };
@@ -1141,8 +1445,19 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     get: () => authoritativeCookies ? visibleCookies : Array.from(visibleCookies, ([name, value]) => name + "=" + value).join("; "),
     set: setCookie,
   });
-  document.location = Object.freeze({ href: initialUrl });
-  document.referrer = "";
+  const location = Object.freeze({
+    href: pageLocationData[0],
+    origin: pageLocationData[1],
+    protocol: pageLocationData[2],
+    host: pageLocationData[3],
+    hostname: pageLocationData[4],
+    port: pageLocationData[5],
+    pathname: pageLocationData[6],
+    search: pageLocationData[7],
+    hash: pageLocationData[8],
+  });
+  Object.defineProperty(document, "location", { value: location, enumerable: true });
+  document.referrer = initialReferrer;
   document.loadScript = (url) => request("script", String(url), "GET", new Headers([["accept", "text/javascript, application/javascript, */*"]]), null).then((value) => {
     if (value.status < 200 || value.status >= 300) throw new TypeError("script load failed with HTTP " + value.status);
     return undefined;
@@ -1150,7 +1465,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: "en-US", languages: Object.freeze(["en-US"]), cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location: document.location, navigator, console, performance, crypto, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Response, Event, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
+  Object.assign(window, { document, location, navigator, console, performance, crypto, TextEncoder, CryptoKey, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Request, Response, Event, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
+  Object.defineProperty(window, "location", { value: location, enumerable: true, writable: false, configurable: false });
+  Object.defineProperty(window, "isSecureContext", { value: pageLocationData[9], enumerable: true });
   window.window = window; window.self = window; window.globalThis = window;
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
@@ -1179,7 +1496,7 @@ const hostDecodeBlobText = (bytes) => {
   try { return typeof bytes === "string" ? new TextDecoder().decode(Buffer.from(bytes, "latin1")) : null; }
   catch { return null; }
 };
-const { randomFillSync: hostRandomFillSync } = require("node:crypto");
+const { randomFillSync: hostRandomFillSync, webcrypto: hostWebCrypto } = require("node:crypto");
 const hostUrlOperation = (() => {
   const { URL: NodeURL, URLSearchParams: NodeURLSearchParams } = require("node:url");
   const MAX_URL_INPUT_LENGTH = 8192;
@@ -1202,12 +1519,96 @@ const hostUrlOperation = (() => {
     } catch { return null; }
   };
 })();
+const hostPageLocation = (inputUrl) => {
+  const href = String(inputUrl);
+  try {
+    const { URL: NodeURL } = require("node:url");
+    const url = new NodeURL(href);
+    const hostname = url.hostname.toLowerCase();
+    const localHostname = hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
+    const ipv4 = localHostname.split(".");
+    const loopbackIpv4 = ipv4.length === 4 && ipv4[0] === "127" &&
+      ipv4.every((part) => /^\d{1,3}$/u.test(part) && Number(part) <= 255);
+    const loopback = localHostname === "localhost" || localHostname.endsWith(".localhost") ||
+      loopbackIpv4 || localHostname === "[::1]" || localHostname === "::1";
+    return JSON.stringify([
+      url.href, url.origin, url.protocol, url.host, url.hostname, url.port,
+      url.pathname, url.search, url.hash,
+      url.protocol === "https:" || (url.protocol === "http:" && loopback),
+    ]);
+  } catch {
+    return JSON.stringify([href, "null", "", "", "", "", "", "", "", false]);
+  }
+};
 const MAX_RANDOM_BYTES = 65536;
 const hostRandomBytes = (byteLength) => {
   try {
     if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > MAX_RANDOM_BYTES) return null;
     return hostRandomFillSync(Buffer.allocUnsafe(byteLength)).toString("latin1");
   } catch { return null; }
+};
+const MAX_HOST_CRYPTO_BYTES = 65536;
+const MAX_HOST_CRYPTO_KEYS = 8;
+const MAX_HOST_CRYPTO_CALLS = 64;
+const hostCryptoKeys = new Map();
+const hostCryptoKeyIds = new Set();
+let hostCryptoCalls = 0;
+const CRYPTO_FAILURE = '{"ok":false}';
+const hostCryptoOperation = (encoded) => {
+  const fail = () => Promise.resolve(CRYPTO_FAILURE);
+  try {
+    if (typeof encoded !== "string" || Buffer.byteLength(encoded, "utf8") > 1200000 || hostCryptoCalls >= MAX_HOST_CRYPTO_CALLS) return fail();
+    hostCryptoCalls += 1;
+    const request = JSON.parse(encoded);
+    if (request.op === "import") {
+      if (!Number.isSafeInteger(request.id) || request.id < 1 || request.id > MAX_HOST_CRYPTO_KEYS ||
+          hostCryptoKeyIds.size >= MAX_HOST_CRYPTO_KEYS || hostCryptoKeyIds.has(request.id) ||
+          typeof request.raw !== "string" || request.raw.length > MAX_HOST_CRYPTO_BYTES) return fail();
+      const raw = Buffer.from(request.raw, "latin1");
+      if (raw.length !== 16 && raw.length !== 24 && raw.length !== 32) return fail();
+      hostCryptoKeyIds.add(request.id);
+      return hostWebCrypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt"]).then(
+        (key) => {
+          try {
+            if (finished) {
+              hostCryptoKeyIds.delete(request.id);
+              return CRYPTO_FAILURE;
+            }
+            hostCryptoKeys.set(request.id, key);
+            return JSON.stringify({ ok: true, id: request.id, length: raw.length * 8 });
+          } catch {
+            hostCryptoKeyIds.delete(request.id);
+            return CRYPTO_FAILURE;
+          }
+        },
+        () => {
+          hostCryptoKeyIds.delete(request.id);
+          return CRYPTO_FAILURE;
+        },
+      );
+    }
+    if (request.op !== "encrypt" || !Number.isSafeInteger(request.id) || !hostCryptoKeys.has(request.id) ||
+        typeof request.iv !== "string" || request.iv.length === 0 || request.iv.length > MAX_HOST_CRYPTO_BYTES ||
+        typeof request.additionalData !== "string" || request.additionalData.length > MAX_HOST_CRYPTO_BYTES ||
+        typeof request.data !== "string" || request.data.length > MAX_HOST_CRYPTO_BYTES ||
+        (request.tagLength !== 32 && request.tagLength !== 64 && request.tagLength !== 96 &&
+         request.tagLength !== 104 && request.tagLength !== 112 && request.tagLength !== 120 && request.tagLength !== 128)) return fail();
+    const result = hostWebCrypto.subtle.encrypt({
+      name: "AES-GCM",
+      iv: Buffer.from(request.iv, "latin1"),
+      additionalData: Buffer.from(request.additionalData, "latin1"),
+      tagLength: request.tagLength,
+    }, hostCryptoKeys.get(request.id), Buffer.from(request.data, "latin1"));
+    return result.then(
+      (ciphertext) => {
+        try {
+          const value = JSON.stringify({ ok: true, data: Buffer.from(ciphertext).toString("latin1") });
+          return Buffer.byteLength(value, "utf8") <= 400000 ? value : CRYPTO_FAILURE;
+        } catch { return CRYPTO_FAILURE; }
+      },
+      () => CRYPTO_FAILURE,
+    );
+  } catch { return fail(); }
 };
 const MAX_INPUT_LINE_BYTES = ${limits.maxInputLineBytes};
 const MAX_CONTROL_INPUT_LINE_BYTES = ${limits.maxControlInputLineBytes};
@@ -1228,6 +1629,8 @@ const safeMessage = (cause) => {
 const writeFinal = (output) => {
   if (finished) return;
   finished = true;
+  hostCryptoKeys.clear();
+  hostCryptoKeyIds.clear();
   process.stdout.end(JSON.stringify({ type: "result", output }) + "\n", () => process.exit(0));
 };
 const post = (line) => {
@@ -1267,16 +1670,20 @@ const handleParentLine = (line) => {
   } catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
 };
 const start = (input) => {
+  const pageLocation = hostPageLocation(String(input.url));
   const sandbox = Object.assign(Object.create(null), {
     __post: post,
     __urlOperation: hostUrlOperation,
     __pageUrl: String(input.url),
+    __pageLocation: pageLocation,
+    __referrer: String(input.referrer),
     __cookie: String(input.cookie),
     __userAgent: String(input.userAgent),
     __authoritativeCookies: input.authoritativeCookies,
     __performanceNow: hostMonotonicNow,
     __performanceTimeOrigin: hostTimeOrigin,
     __randomBytes: hostRandomBytes,
+    __cryptoOperation: hostCryptoOperation,
     __encodeBlobText: hostEncodeBlobText,
     __decodeBlobText: hostDecodeBlobText,
   });
@@ -1286,12 +1693,15 @@ const start = (input) => {
   delete sandbox.__post;
   delete sandbox.__urlOperation;
   delete sandbox.__pageUrl;
+  delete sandbox.__pageLocation;
+  delete sandbox.__referrer;
   delete sandbox.__cookie;
   delete sandbox.__userAgent;
   delete sandbox.__receive;
   delete sandbox.__performanceNow;
   delete sandbox.__performanceTimeOrigin;
   delete sandbox.__randomBytes;
+  delete sandbox.__cryptoOperation;
   delete sandbox.__encodeBlobText;
   delete sandbox.__decodeBlobText;
   const wrapper = "(async function () {\n" +

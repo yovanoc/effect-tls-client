@@ -52,6 +52,7 @@ const RunnerStart = Schema.Struct({
   url: Schema.String,
   cookie: Schema.String,
   userAgent: Schema.String,
+  referrer: Schema.String,
   authoritativeCookies: Schema.Boolean,
 });
 const RunnerOutput = Schema.Union([
@@ -198,7 +199,8 @@ const makeEvaluate = (
       source.length +
         context.url.length +
         context.cookie.length +
-        context.userAgent.length >
+        context.userAgent.length +
+        (context.referrer?.length ?? 0) >
         MAX_CONTROL_INPUT_LINE_BYTES
     ) {
       return yield* new BrowserScriptError({
@@ -211,6 +213,7 @@ const makeEvaluate = (
       url: context.url,
       cookie: context.cookie,
       userAgent: context.userAgent,
+      referrer: context.referrer ?? "",
       authoritativeCookies: host !== undefined,
     }).pipe(
       Effect.mapError(

@@ -896,7 +896,7 @@ const makeBrowserSession = (
     "browser identity",
     identity.headers,
   );
-  const evaluate = (response: TlsResponse, source: unknown) => {
+  const evaluate = (response: TlsResponse, source: unknown, referrer = "") => {
     const runtime = handlers.scriptRuntime;
     if (runtime === undefined) {
       return Effect.fail(
@@ -928,6 +928,7 @@ const makeBrowserSession = (
           url: response.url,
           cookie: visibleCookie,
           userAgent: headerValue(identity.headers, "user-agent") ?? "",
+          referrer,
         },
         host,
       );
@@ -1022,14 +1023,16 @@ const makeBrowserSession = (
             message: `navigation exceeded ${maxRedirects} redirects`,
           });
         }
+        const requestHeaders = navigationHeaders(
+          requestIdentityHeaders,
+          input.current,
+          input.referer,
+          input.extraHeaders,
+        );
+        const documentReferrer = headerValue(requestHeaders, "referer") ?? "";
         const response = yield* transport.request(input.current, {
           method: "GET",
-          headers: navigationHeaders(
-            requestIdentityHeaders,
-            input.current,
-            input.referer,
-            input.extraHeaders,
-          ),
+          headers: requestHeaders,
           ...(requestHeaderOrder === undefined
             ? {}
             : { headerOrder: requestHeaderOrder }),
@@ -1067,7 +1070,8 @@ const makeBrowserSession = (
               transport,
               response,
               body,
-              evaluate: (source) => evaluate(response, source),
+              evaluate: (source) =>
+                evaluate(response, source, documentReferrer),
             })
             .pipe(
               Effect.timeoutOrElse({

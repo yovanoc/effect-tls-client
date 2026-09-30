@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createCipheriv } from "node:crypto";
 import { describe, expect, it } from "@effect/vitest";
 import { Context, Deferred, Effect, Fiber, Layer, Stream } from "effect";
 import * as Schema from "effect/Schema";
@@ -161,6 +162,25 @@ const hostRuntime = (
       : evaluate(host).pipe(Effect.map((value) => ({ value, setCookies: [] }))),
 });
 
+const recordingScriptHost = (
+  requests: Parameters<BrowserScriptHost["request"]>[0][],
+): BrowserScriptHost => ({
+  request: (input) =>
+    Effect.sync(() => {
+      requests.push(input);
+      return {
+        body: "ok",
+        cookie: "",
+        headers: [],
+        status: 200,
+        url: input.url,
+      };
+    }),
+  setCookie: () => Effect.succeed(""),
+});
+
+const SCRIPT_URL_INPUT_LIMIT = 8_192;
+
 const session = (
   calls: Array<Call>,
   respond: (url: string) => TlsResponse,
@@ -199,6 +219,47 @@ describe("browser layer", () => {
       referer(navigationHeaders([], "http://example.test/next", source)),
     ).toBeUndefined();
   });
+
+  it.effect(
+    "passes the sanitized navigation referrer into challenge scripts",
+    () => {
+      const calls: Call[] = [];
+      let scriptReferrer = "";
+      const runtime: BrowserScriptRuntime = {
+        evaluate: (_source, context) =>
+          Effect.sync(() => {
+            scriptReferrer = context?.referrer ?? "";
+            return { value: "ok", setCookies: [] };
+          }),
+      };
+      const browser = fromSession(
+        session(calls, (url) =>
+          response(url, 202, "challenge", [["x-amzn-waf-action", "challenge"]]),
+        ),
+        Chrome152Identity,
+        {
+          scriptRuntime: runtime,
+          challengeHandler: (_challenge, context) =>
+            context
+              .evaluate("document.referrer")
+              .pipe(Effect.flatMap(() => Effect.succeedNone)),
+        },
+      );
+
+      return Effect.gen(function* () {
+        const page = yield* browser.navigate("https://auth.example.test/", {
+          referer: "https://source.example.test/private?secret=1",
+        });
+        expect(page.status).toBe(202);
+        expect(scriptReferrer).toBe("https://source.example.test");
+        expect(calls[0]?.options?.headers).toContainEqual([
+          "referer",
+          "https://source.example.test",
+        ]);
+        yield* page.close;
+      });
+    },
+  );
 
   it.effect("applies fromSession identity headers and order", () => {
     const calls: Array<Call> = [];
@@ -718,6 +779,13 @@ describe("browser layer", () => {
       );
       expect(result.value).toBe("visible=yes; clearance=ok|function|undefined");
       expect(result.setCookies).toEqual(["clearance=ok; Path=/"]);
+      const referrer = yield* runtime.evaluate("return document.referrer;", {
+        url: "http://localhost/",
+        cookie: "",
+        userAgent: "fixture",
+        referrer: "https://source.example.test/page",
+      });
+      expect(referrer.value).toBe("https://source.example.test/page");
       const unsupportedFetchCredentials = yield* runtime.evaluate(
         'try { await fetch("https://example.test/", { credentials: "include" }); return "accepted"; } catch (error) { return error.message; }',
       );
@@ -739,13 +807,10 @@ describe("browser layer", () => {
       );
       expect(urlEscape.reason).toContain("Code generation");
       expect(urlEscape.reason).not.toContain(process.version);
-      const typedArrayEscape = yield* Effect.flip(
-        runtime.evaluate(
-          `try { Uint8Array.from = (value) => value; new TextEncoder().encode("x"); } catch (error) { return error.constructor.constructor("return process")().version; }`,
-        ),
+      const typedArrayMutation = yield* runtime.evaluate(
+        `Uint8Array.from = (value) => value; return Array.from(new TextEncoder().encode("x")).join(",");`,
       );
-      expect(typedArrayEscape.reason).toContain("Code generation");
-      expect(typedArrayEscape.reason).not.toContain(process.version);
+      expect(typedArrayMutation.value).toBe("120");
       const functionError = yield* Effect.flip(
         runtime.evaluate("return Function('return 1')();"),
       );
@@ -754,7 +819,7 @@ describe("browser layer", () => {
         "return `${typeof __URL}|${typeof __cookieRead}|${typeof __randomBytes}|${typeof URL}|${typeof TextEncoder}|${typeof setTimeout}`;",
       );
       expect(hidden.value).toBe(
-        "undefined|undefined|undefined|function|undefined|function",
+        "undefined|undefined|undefined|function|function|function",
       );
     }).pipe(
       Effect.provide(
@@ -766,6 +831,134 @@ describe("browser layer", () => {
   it.layer(BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)), {
     excludeTestServices: true,
   })("context-local URL", ({ effect: testEffect }) => {
+    testEffect(
+      "exposes URL-derived read-only location and secure-context state",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const locationSnapshot = Schema.fromJsonString(
+            Schema.Struct({
+              href: Schema.String,
+              origin: Schema.String,
+              protocol: Schema.String,
+              host: Schema.String,
+              hostname: Schema.String,
+              port: Schema.String,
+              pathname: Schema.String,
+              search: Schema.String,
+              hash: Schema.String,
+              same: Schema.Boolean,
+              frozen: Schema.Boolean,
+              locationWritable: Schema.Boolean,
+              documentLocationWritable: Schema.Boolean,
+              isSecureContext: Schema.Boolean,
+              isSecureContextWritable: Schema.Boolean,
+            }),
+          );
+          const decodeLocation = (value: string) =>
+            Schema.decodeEffect(locationSnapshot)(value);
+          const script = `
+          const location = window.location;
+          try { location.href = "https://changed.example/"; } catch {}
+          try { location.pathname = "/changed"; } catch {}
+          try { document.location = {}; } catch {}
+          try { window.location = {}; } catch {}
+          try { window.isSecureContext = false; } catch {}
+          return JSON.stringify({
+            href: document.location.href,
+            origin: location.origin,
+            protocol: location.protocol,
+            host: location.host,
+            hostname: location.hostname,
+            port: location.port,
+            pathname: location.pathname,
+            search: location.search,
+            hash: location.hash,
+            same: window.location === document.location,
+            frozen: Object.isFrozen(location),
+            locationWritable: Object.getOwnPropertyDescriptor(window, "location").writable,
+            documentLocationWritable: Object.getOwnPropertyDescriptor(document, "location").writable,
+            isSecureContext: window.isSecureContext,
+            isSecureContextWritable: Object.getOwnPropertyDescriptor(window, "isSecureContext").writable,
+          });
+        `;
+          const evaluate = (url: string) =>
+            runtime.evaluate(script, { url, cookie: "", userAgent: "fixture" });
+          const https = yield* evaluate(
+            "https://example.test:8443/path?q=one#frag",
+          );
+          const httpsLocation = yield* decodeLocation(https.value);
+          expect(httpsLocation).toEqual({
+            href: "https://example.test:8443/path?q=one#frag",
+            origin: "https://example.test:8443",
+            protocol: "https:",
+            host: "example.test:8443",
+            hostname: "example.test",
+            port: "8443",
+            pathname: "/path",
+            search: "?q=one",
+            hash: "#frag",
+            same: true,
+            frozen: true,
+            locationWritable: false,
+            documentLocationWritable: false,
+            isSecureContext: true,
+            isSecureContextWritable: false,
+          });
+
+          const http = yield* evaluate(
+            "http://example.test:8080/path?q=two#part",
+          );
+          const httpLocation = yield* decodeLocation(http.value);
+          expect(httpLocation.isSecureContext).toBe(false);
+          for (const url of [
+            "http://localhost/",
+            "http://localhost./",
+            "http://service.localhost/",
+            "http://127.10.1.2/",
+            "http://[::1]/",
+          ]) {
+            const loopback = yield* evaluate(url);
+            const loopbackLocation = yield* decodeLocation(loopback.value);
+            expect(loopbackLocation.isSecureContext).toBe(true);
+          }
+          for (const url of [
+            "http://127.example.test/",
+            "http://localhost.evil.test/",
+            "http://evillocalhost/",
+            "http://[::2]/",
+            "http://[::ffff:7f00:1]/",
+            "http://localhost../",
+          ]) {
+            const nonLoopback = yield* evaluate(url);
+            const nonLoopbackLocation = yield* decodeLocation(
+              nonLoopback.value,
+            );
+            expect(nonLoopbackLocation.isSecureContext).toBe(false);
+          }
+
+          const longUrl = `https://example.test/${"x".repeat(9_000)}?q=${"y".repeat(9_000)}`;
+          const longPage = yield* runtime.evaluate(
+            `return JSON.stringify({ href: window.location.href.length, path: window.location.pathname.length, search: window.location.search.length });`,
+            { url: longUrl, cookie: "", userAgent: "fixture" },
+          );
+          const longPageLocation = yield* Schema.decodeEffect(
+            Schema.fromJsonString(
+              Schema.Struct({
+                href: Schema.Finite,
+                path: Schema.Finite,
+                search: Schema.Finite,
+              }),
+            ),
+          )(longPage.value);
+          expect(longPageLocation).toEqual({
+            href: longUrl.length,
+            path: 9_001,
+            search: 9_003,
+          });
+        }),
+    );
+
     testEffect("provides bounded, read-only URL APIs", () =>
       Effect.gen(function* () {
         const runtime = yield* BrowserMock;
@@ -811,6 +1004,135 @@ describe("browser layer", () => {
       }),
     );
   });
+
+  it.live("supports the bounded context-local Request subset", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+      const host: BrowserScriptHost = {
+        request: (input) =>
+          Effect.sync(() => {
+            requests.push(input);
+            return {
+              status: 200,
+              url: input.url,
+              headers: [],
+              body: "ok",
+              cookie: "",
+            };
+          }),
+        setCookie: () => Effect.succeed(""),
+      };
+      const result = yield* runtime.evaluate(
+        `
+        const request = new Request("/upload", {
+          method: "post",
+          headers: { "x-base": "first" },
+          body: "payload",
+        });
+        const clone = request.clone();
+        clone.headers.set("x-base", "second");
+        const response = await fetch(clone);
+        const localTypeError = (error) => error instanceof TypeError &&
+          error.constructor === TypeError && Object.getPrototypeOf(error) === TypeError.prototype;
+        let credentialsRejected = false, modeRejected = false, getBodyRejected = false;
+        try { new Request("/", { credentials: "include" }); }
+        catch (error) { credentialsRejected = localTypeError(error); }
+        try { new Request("/", { mode: "cors" }); }
+        catch (error) { modeRejected = localTypeError(error); }
+        try { new Request("/", { body: "payload" }); }
+        catch (error) { getBodyRejected = localTypeError(error); }
+        let usedCloneRejected = false;
+        try { clone.clone(); } catch (error) { usedCloneRejected = localTypeError(error); }
+        let hostEscapeBlocked = false;
+        try { request.constructor.constructor("return process")(); }
+        catch (error) { hostEscapeBlocked = error instanceof EvalError && error.message.includes("Code generation"); }
+        return [
+          Request === window.Request && request instanceof Request && Object.getPrototypeOf(request) === Request.prototype,
+          request.url, request.method, request.credentials, request.redirect, request.mode,
+          request.bodyUsed, clone.bodyUsed, usedCloneRejected, response.status,
+          credentialsRejected, modeRejected, getBodyRejected, hostEscapeBlocked,
+        ].join("|");
+        `,
+        { url: "https://example.test/page", cookie: "", userAgent: "fixture" },
+        host,
+      );
+      expect(result.value).toBe(
+        "true|/upload|POST|same-origin|follow|cors|false|true|true|200|true|true|true|true",
+      );
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.url).toBe("https://example.test/upload");
+      expect(requests[0]?.method).toBe("POST");
+      expect(requests[0]?.headers).toContainEqual(["x-base", "second"]);
+      expect(requests[0]?.body).toBe("payload");
+      expect(requests[0]?.bodyBytes).toBeNull();
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ allowedOrigins: ["https://example.test"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.live("resolves Request URLs on the host with a page URL over 8 KiB", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+      const host = recordingScriptHost(requests);
+      const pageUrl = `https://example.test/${"p".repeat(SCRIPT_URL_INPUT_LIMIT)}`;
+      const result = yield* runtime.evaluate(
+        `await fetch("https://example.test/fetch"); await fetch(new Request("https://example.test/request")); return "done";`,
+        { cookie: "", url: pageUrl, userAgent: "fixture" },
+        host,
+      );
+
+      expect(pageUrl.length).toBeGreaterThan(SCRIPT_URL_INPUT_LIMIT);
+      expect(result.value).toBe("done");
+      expect(requests.map(({ url }) => url)).toEqual([
+        "https://example.test/fetch",
+        "https://example.test/request",
+      ]);
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ allowedOrigins: ["https://example.test"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.live(
+    "keeps a source Request body reusable when an override replaces it",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+        const host = recordingScriptHost(requests);
+        const result = yield* runtime.evaluate(
+          `const source = new Request("/upload", { method: "POST", body: "source" }); const replacement = new Request(source, { body: "replacement" }); const sourceReusable = !source.bodyUsed; const response = await fetch(source); return [sourceReusable, replacement.body, replacement.bodyUsed, response.status].join("|");`,
+          {
+            cookie: "",
+            url: "https://example.test/page",
+            userAgent: "fixture",
+          },
+          host,
+        );
+
+        expect(result.value).toBe("true|replacement|false|200");
+        expect(requests).toHaveLength(1);
+        const [request] = requests;
+        assert.ok(request);
+        expect(request.url).toBe("https://example.test/upload");
+        expect(request.body).toBe("source");
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ allowedOrigins: ["https://example.test"] }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+  );
 
   it.live("implements bounded, context-local Blob operations", () =>
     Effect.gen(function* () {
@@ -1686,6 +2008,258 @@ describe("browser layer", () => {
       );
     },
   );
+
+  it.layer(
+    BrowserMock.layer({ allowedOrigins: ["https://example.test"] }).pipe(
+      Layer.provide(NodeServices.layer),
+    ),
+    { excludeTestServices: true },
+  )("context-local TextEncoder and AES-GCM", ({ effect: testEffect }) => {
+    testEffect("encodes UTF-8 and does not split scalars in encodeInto", () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const result = yield* runtime.evaluate(String.raw`
+          const encoder = new TextEncoder();
+          const input = "Aé☃😀\uD800Z";
+          const bytes = encoder.encode(input);
+          const partialBytes = new Uint8Array(8);
+          const partial = encoder.encodeInto(input, partialBytes);
+          const fullBytes = new Uint8Array(14);
+          const full = encoder.encodeInto(input, fullBytes);
+          const blocked = (value) => {
+            try { value.constructor.constructor("return process")(); return false; }
+            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+          };
+          let invalidDestinationIsLocal = false;
+          try { encoder.encodeInto("x", new DataView(new ArrayBuffer(1))); }
+          catch (error) { invalidDestinationIsLocal = error instanceof TypeError && error.constructor === TypeError; }
+          return JSON.stringify({
+            encoding: encoder.encoding,
+            sameConstructor: TextEncoder === window.TextEncoder && encoder instanceof TextEncoder,
+            bytes: Array.from(bytes),
+            partial: { ...partial, bytes: Array.from(partialBytes) },
+            full: { ...full, bytes: Array.from(fullBytes) },
+            localValues: Object.getPrototypeOf(bytes) === Uint8Array.prototype &&
+              Object.getPrototypeOf(bytes.buffer) === ArrayBuffer.prototype &&
+              Object.getPrototypeOf(partial) === Object.prototype,
+            invalidDestinationIsLocal,
+            hostEscapeBlocked: blocked(encoder) && blocked(bytes) && blocked(bytes.buffer) && blocked(partial),
+          });
+        `);
+        expect(JSON.parse(result.value)).toEqual({
+          encoding: "utf-8",
+          sameConstructor: true,
+          bytes: [
+            65, 195, 169, 226, 152, 131, 240, 159, 152, 128, 239, 191, 189, 90,
+          ],
+          partial: {
+            read: 3,
+            written: 6,
+            bytes: [65, 195, 169, 226, 152, 131, 0, 0],
+          },
+          full: {
+            read: 7,
+            written: 14,
+            bytes: [
+              65, 195, 169, 226, 152, 131, 240, 159, 152, 128, 239, 191, 189,
+              90,
+            ],
+          },
+          localValues: true,
+          invalidDestinationIsLocal: true,
+          hostEscapeBlocked: true,
+        });
+      }),
+    );
+    testEffect(
+      "encrypts with a private AES-GCM key matching the Node oracle",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const key = Buffer.from(
+            Array.from({ length: 32 }, (_, index) => index),
+          );
+          const iv = Buffer.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+          const aad = Buffer.from("fixture associated data", "utf8");
+          const plaintext = Buffer.from(
+            "generic browser crypto fixture",
+            "utf8",
+          );
+          const oracle = createCipheriv("aes-256-gcm", key, iv, {
+            authTagLength: 16,
+          });
+          oracle.setAAD(aad);
+          const expected = Buffer.concat([
+            oracle.update(plaintext),
+            oracle.final(),
+            oracle.getAuthTag(),
+          ]);
+          const result = yield* runtime.evaluate(`
+          const keyBytes = new Uint8Array(${JSON.stringify(Array.from(key))});
+          const iv = new Uint8Array(${JSON.stringify(Array.from(iv))});
+          const input = new TextEncoder().encode("generic browser crypto fixture");
+          const importPromise = crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt"]);
+          const localImportPromise = importPromise instanceof Promise && Object.getPrototypeOf(importPromise) === Promise.prototype;
+          const key = await importPromise;
+          const encryptPromise = crypto.subtle.encrypt({
+            name: "AES-GCM",
+            iv,
+            additionalData: new TextEncoder().encode("fixture associated data"),
+            tagLength: 128,
+          }, key, input);
+          const localEncryptPromise = encryptPromise instanceof Promise && Object.getPrototypeOf(encryptPromise) === Promise.prototype;
+          const output = await encryptPromise;
+          const outputBytes = new Uint8Array(output);
+          const uuid = crypto.randomUUID();
+          const blocked = (value) => {
+            try { value.constructor.constructor("return process")(); return false; }
+            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+          };
+          return JSON.stringify({
+            ciphertext: Array.from(outputBytes),
+            localImportPromise,
+            localEncryptPromise,
+            localValues: CryptoKey === window.CryptoKey && key instanceof CryptoKey &&
+              Object.getPrototypeOf(key) === CryptoKey.prototype && key.algorithm.name === "AES-GCM" &&
+              key.algorithm.length === 256 && key.extractable === false && key.usages.join(",") === "encrypt" &&
+              !Object.hasOwn(key, "id") && Object.getPrototypeOf(output) === ArrayBuffer.prototype &&
+              Object.getPrototypeOf(outputBytes) === Uint8Array.prototype,
+            uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid),
+            sameCrypto: crypto === window.crypto,
+            hostGlobalsAbsent: [typeof __cryptoOperation, typeof process, typeof Buffer, typeof require].every((value) => value === "undefined"),
+            hostEscapeBlocked: blocked(key) && blocked(importPromise) && blocked(encryptPromise) && blocked(output) && blocked(outputBytes),
+          });
+        `);
+          expect(JSON.parse(result.value)).toEqual({
+            ciphertext: Array.from(expected),
+            localImportPromise: true,
+            localEncryptPromise: true,
+            localValues: true,
+            uuid: true,
+            sameCrypto: true,
+            hostGlobalsAbsent: true,
+            hostEscapeBlocked: true,
+          });
+        }),
+    );
+    testEffect(
+      "rejects unsupported algorithms, usages, sizes, and key counts locally",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const result = yield* runtime.evaluate(`
+          const localTypeError = (error) => error instanceof TypeError && error.constructor === TypeError &&
+            Object.getPrototypeOf(error) === TypeError.prototype;
+          const blocked = (value) => {
+            try { value.constructor.constructor("return process")(); return false; }
+            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+          };
+          const rejectsLocally = async (operation) => {
+            try { await operation; return false; }
+            catch (error) { return localTypeError(error) && blocked(error) && !error.message.includes("node:crypto"); }
+          };
+          const material = new Uint8Array(16);
+          const unsupportedAlgorithm = await rejectsLocally(crypto.subtle.importKey("raw", material, { name: "AES-CBC" }, false, ["encrypt"]));
+          const unsupportedUsage = await rejectsLocally(crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["decrypt"]));
+          const unsupportedFormat = await rejectsLocally(crypto.subtle.importKey("jwk", material, { name: "AES-GCM" }, false, ["encrypt"]));
+          const oversizedKey = await rejectsLocally(crypto.subtle.importKey("raw", new Uint8Array(65537), { name: "AES-GCM" }, false, ["encrypt"]));
+          const key = await crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["encrypt"]);
+          const unsupportedEncryptAlgorithm = await rejectsLocally(crypto.subtle.encrypt({ name: "AES-CBC", iv: new Uint8Array([1]) }, key, new Uint8Array()));
+          const unsupportedTagLength = await rejectsLocally(crypto.subtle.encrypt({ name: "AES-GCM", iv: new Uint8Array([1]), tagLength: 80 }, key, new Uint8Array()));
+          const oversizedData = await rejectsLocally(crypto.subtle.encrypt({ name: "AES-GCM", iv: new Uint8Array([1]) }, key, new Uint8Array(65537)));
+          for (let index = 1; index < 8; index += 1) {
+            await crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["encrypt"]);
+          }
+          const ninthKey = await rejectsLocally(crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["encrypt"]));
+          return [unsupportedAlgorithm, unsupportedUsage, unsupportedFormat, oversizedKey, unsupportedEncryptAlgorithm,
+            unsupportedTagLength, oversizedData, ninthKey].every(Boolean).toString();
+        `);
+          expect(result.value).toBe("true");
+        }),
+    );
+    testEffect(
+      "bounds AES-GCM operations without limiting randomness or FormData",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+          const host: BrowserScriptHost = {
+            request: (input) =>
+              Effect.sync(() => {
+                requests.push(input);
+                return {
+                  status: 200,
+                  url: input.url,
+                  headers: [],
+                  body: "ok",
+                  cookie: "",
+                };
+              }),
+            setCookie: () => Effect.succeed(""),
+          };
+          const result = yield* runtime.evaluate(
+            `
+          const key = await crypto.subtle.importKey("raw", new Uint8Array(16), { name: "AES-GCM" }, false, ["encrypt"]);
+          const nonce = (value) => {
+            const iv = new Uint8Array(12);
+            iv[0] = value;
+            return iv;
+          };
+          for (let index = 0; index < 63; index += 1) {
+            await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce(index) }, key, new Uint8Array());
+          }
+          let subtleLimited = false;
+          try { await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce(63) }, key, new Uint8Array()); }
+          catch (error) {
+            subtleLimited = error instanceof RangeError && error.constructor === RangeError &&
+              Object.getPrototypeOf(error) === RangeError.prototype && error.message.includes("budget");
+          }
+          for (let index = 0; index < 100; index += 1) crypto.getRandomValues(new Uint8Array(1));
+          const uuid = crypto.randomUUID();
+          const response = await fetch("https://example.test/upload", { method: "POST", body: new FormData() });
+          return String(subtleLimited) + "|" + uuid.length + "|" + response.status;
+        `,
+            {
+              url: "https://example.test/page",
+              cookie: "",
+              userAgent: "fixture",
+            },
+            host,
+          );
+          expect(result.value).toBe("true|36|200");
+          expect(requests).toHaveLength(1);
+          const request = requests[0];
+          assert(request);
+          const contentType = request.headers.find(
+            ([name]) => name === "content-type",
+          )?.[1];
+          expect(contentType).toMatch(
+            /^multipart\/form-data; boundary=----BrowserMockFormBoundary[0-9a-f]{32}$/u,
+          );
+          expect(multipartRequestBytes(request).byteLength).toBeGreaterThan(0);
+        }),
+    );
+    testEffect(
+      "serializes private crypto requests despite Object.prototype.toJSON",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const result = yield* runtime.evaluate(`
+          Object.prototype.toJSON = () => ({ op: "invalid" });
+          let outputLength = 0;
+          try {
+            const key = await crypto.subtle.importKey("raw", new Uint8Array(16), { name: "AES-GCM" }, false, ["encrypt"]);
+            const output = await crypto.subtle.encrypt({ name: "AES-GCM", iv: new Uint8Array(12) }, key, new Uint8Array());
+            outputLength = output.byteLength;
+          } finally {
+            delete Object.prototype.toJSON;
+          }
+          return String(outputLength);
+        `);
+          expect(result.value).toBe("16");
+        }),
+    );
+  });
 
   it.live("bridges fetch, script loading, cookies, and timers", () =>
     Effect.gen(function* () {

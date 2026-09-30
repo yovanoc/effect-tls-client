@@ -26,10 +26,12 @@ Create a browser session with `Browser.open` and a `BrowserSessionConfig`:
 ```ts
 import * as Browser from "effect-tls-client/browser";
 
-const browser = yield* Browser.open({
-  transport: { profile: "chrome_152_PSK" },
-  identity: Browser.Chrome152Identity,
-});
+const browser =
+  yield *
+  Browser.open({
+    transport: { profile: "chrome_152_PSK" },
+    identity: Browser.Chrome152Identity,
+  });
 ```
 
 `Browser.fromSession` wraps an already-scoped `TlsSession` when the application
@@ -66,10 +68,11 @@ correct:
 ```ts
 import { Cookies } from "effect/unstable/http";
 
-yield* browser.transport.setCookies(
-  "http://example.test/",
-  Cookies.fromSetCookie("consent=yes; Path=/"),
-);
+yield *
+  browser.transport.setCookies(
+    "http://example.test/",
+    Cookies.fromSetCookie("consent=yes; Path=/"),
+  );
 ```
 
 ## Challenge and script boundary
@@ -83,17 +86,28 @@ reported as a solved challenge.
 ```ts
 import { Effect, Option } from "effect";
 
-const browser = yield* Browser.open(config, {
-  challengeHandler: (challenge, context) => {
-    // Solve only with an application-owned, externally reviewed integration.
-    return Effect.succeedNone;
-  },
-});
+const browser =
+  yield *
+  Browser.open(config, {
+    challengeHandler: (challenge, context) => {
+      // Solve only with an application-owned, externally reviewed integration.
+      return Effect.succeedNone;
+    },
+  });
 ```
 
 `BrowserMock` is an optional process-backed runtime for reviewed challenge
-scripts. A fresh VM context exposes `document.cookie`, read-only location data,
-a small `navigator` and `console`, and a context-local `performance` with only
+scripts. A fresh VM context exposes `document.cookie`, `document.referrer` from
+the sanitized navigation `Referer` header (empty when absent), and a frozen
+location snapshot shared by `window.location` and `document.location`. It exposes
+only read-only `href`, `origin`, `protocol`, `host`, `hostname`, `port`,
+`pathname`, `search`, and `hash`; this snapshot is not subject to the context-local
+`URL` helper's 8,192-character input limit. `window.isSecureContext` is true for
+HTTPS and HTTP loopback URLs (`localhost`/`.localhost`, including trailing-dot
+hostnames, IPv4 `127.0.0.0/8`, or `[::1]`) and false for ordinary HTTP; other URL
+schemes are not modeled as secure
+contexts. The VM also exposes a small `navigator` and `console`, and a context-local
+`performance` with only
 monotonic `now()` and numeric `timeOrigin` backed by the runner's real monotonic
 clock. It exposes context-local `URL` and `URLSearchParams` backed by a private,
 string-only Node URL parser closure. URL parsing accepts bounded strings and an
@@ -102,13 +116,23 @@ optional base, and provides `href`, `origin`, `protocol`, `host`, `hostname`,
 accepts a query string and implements `get(name)` only. Both APIs are read-only:
 URL property writes and query mutations throw; non-string initializers and other
 query methods are unsupported. URL inputs are capped at 8,192 UTF-16 code units
-and serialized parser results at 64 KiB. It also exposes a context-local
-`crypto.getRandomValues` backed by Node's secure `node:crypto` random source
-through a private serialized-byte closure. It supports integer typed arrays
-(including BigInt), fills only the supplied view, returns the same view, and
-enforces the 65,536-byte per-call limit; floating-point arrays and `DataView`
-reject with context-local errors. `crypto.subtle` is not exposed. It
-synthesizes no browser fingerprint metrics. The context also provides
+and serialized parser results at 64 KiB. Context-local `TextEncoder` supports
+UTF-8 `encode()` and `encodeInto()`, including replacement of malformed
+surrogates and non-splitting partial writes. `crypto.getRandomValues` uses
+Node's secure random source through a private serialized-byte closure. It
+supports integer typed arrays (including BigInt), fills only the supplied view,
+returns the same view, and enforces the 65,536-byte per-call limit;
+floating-point arrays and `DataView` reject with context-local errors. The
+crypto subset also provides RFC 4122 v4 `crypto.randomUUID()` and
+`crypto.subtle.importKey("raw", ..., { name: "AES-GCM" }, false, ["encrypt"])`
+plus AES-GCM `encrypt()` with optional additional data and supported tag
+lengths. Imported keys are non-extractable and limited to AES-128/192/256;
+`CryptoKey` values, promises, results, and errors are VM-local façades, while
+Node WebCrypto keys stay in a private store. Each evaluation allows at most 8
+keys, 64 AES-GCM import/encrypt operations, and 64 KiB per raw input. This
+operation cap does not count `getRandomValues()` or `randomUUID()`. Other WebCrypto operations
+(including decrypt/export) are unsupported. It synthesizes no browser
+fingerprint metrics. The context also provides
 Promise-based `fetch`, asynchronous `XMLHttpRequest`, `document.loadScript`,
 bounded timeout/interval APIs
 (`setTimeout`/`clearTimeout` and `setInterval`/`clearInterval`), and small
@@ -124,8 +148,15 @@ strings, ArrayBuffers, views, nested Blobs, `size`, `type`, `text()`,
 `arrayBuffer()`, and `slice()`. Its cumulative per-evaluation allocation quota
 is 1 MiB, including Blob data, type metadata, and materialized reads; quota
 failures use context-local `QuotaExceededError`. `Blob.stream()` and native line
-endings explicitly reject. Context-local `FormData` stores ordered duplicate
-fields and supports `append`, `set`, `delete`, `get`, `getAll`, `has`, `keys`,
+endings explicitly reject. Context-local `Request` supports URL/string input,
+method, `Headers`, string or `FormData` bodies, `credentials: "same-origin"`,
+and `redirect: "follow"`; other credential/redirect modes, explicit `mode`,
+streamed bodies, and abort signals are unsupported. `fetch` accepts these Request
+objects and applies the same origin, body, and header limits as URL/init calls.
+Request URL strings are retained for host-side resolution against the page URL.
+A Request retains its FormData body by reference, so mutations before `fetch()`
+are reflected because multipart serialization happens at fetch time. Context-local
+`FormData` stores ordered duplicate fields and supports `append`, `set`, `delete`, `get`, `getAll`, `has`, `keys`,
 `values`, `entries`, iteration, and `forEach`. Values are strings (other values
 are string-coerced) or copied context-local Blobs; Blob types are preserved,
 Blob parts use the default `filename="blob"`, and File metadata or explicit
@@ -168,19 +199,21 @@ const runtimeLayer = Browser.BrowserMock.layer({
 ```
 
 ```ts
-const scriptRuntime = yield* Browser.BrowserMock;
-const browser = yield* Browser.open(config, {
-  scriptRuntime,
-  challengeHandler: (_challenge, context) =>
-    Effect.gen(function* () {
-      const result = yield* context.evaluate(
-        'document.cookie = "clearance=ok; Path=/"; return "ready";',
-      );
-      return result === "ready"
-        ? Option.some({ url: "http://example.test/" })
-        : Option.none();
-    }),
-});
+const scriptRuntime = yield * Browser.BrowserMock;
+const browser =
+  yield *
+  Browser.open(config, {
+    scriptRuntime,
+    challengeHandler: (_challenge, context) =>
+      Effect.gen(function* () {
+        const result = yield* context.evaluate(
+          'document.cookie = "clearance=ok; Path=/"; return "ready";',
+        );
+        return result === "ready"
+          ? Option.some({ url: "http://example.test/" })
+          : Option.none();
+      }),
+  });
 ```
 
 The bridge is intentionally small: up to 8 network requests per evaluation.
