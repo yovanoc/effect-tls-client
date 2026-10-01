@@ -1002,6 +1002,7 @@ describeRealIntegration("real BrowserMock integration", () => {
           "/challenge",
         ]);
         expect(result.page.status).toBe(200);
+        expect(result.page.challenge).toBeUndefined();
         expect(result.page.body).toBe("clearance accepted");
         expect(result.cookies).toContainEqual(
           expect.objectContaining({

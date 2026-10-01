@@ -801,3 +801,36 @@ hash unchanged; runtime gate not rerun.
   mandatory runtime inference; does not revise the incomplete 146 AST traversal.
   Error-158 source-free fixture diagnosis remains outstanding; no source-fix claim
   or vendor/private material persisted.
+
+### Current-runtime Cloudflare receipt (packet 204; source-free)
+
+Packet 204 measured one bounded current-TS/runtime Cloudflare attempt on unchanged
+TS source `d4838beb35e35e2fd6f6d06ade75e292c44f4a14`; no SDK/runtime code changed.
+This is separate from historical packet 157's two-GET budget. Earlier Cloudflare
+campaign totals are unknown; no combined total is inferred. The exact host was
+Node `v25.9.0`. The child executable was requested/mock-configured as v25.9.0 at
+the path in code, but its actual version was **not independently observed**.
+
+| Measurement        | Packet 204 result                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Go transport       | Two Go GETs, both HTTP/2: page `403`, 6,070 body bytes / 2,065 header bytes; original selected SDK `200`, 241,146 body bytes / 263 header bytes. Aggregate body: 247,216 bytes.                                                                                                                                                                                                                                          |
+| Original programs  | Original inline `3,663` bytes; root with unchanged authored observer `4,469` bytes. The inline remained a global classic program; the original SDK URL and SDK program remained unchanged on its own classic dynamic path. No SDK-source concatenation, config/URL reconstruction, or fabricated DOM, canvas, events, messages, history, or metrics.                                                                     |
+| Attempt and result | Script callback / grant / delivery `1/1/1`; natural `LOAD/ERROR` `0/1`. Stop `NATURAL_SCRIPT_ERROR`, author phase `OBSERVED`, category `UNKNOWN`, API `API_UNKNOWN`. Delivery plus natural error supports only an **inferred evaluation attempt**; successful compilation and SDK entry are **not proved**. No next mandatory public API was identified; static AST references are not mandatory execution requirements. |
+| Follow-on work     | Follow-on script / Fetch-XHR / frame / cookie-write callbacks `0/0/0/0`; no protected-resource follow-up, acquisition, or clearance. The acquisition-denied diagnostic is not a proof phase.                                                                                                                                                                                                                             |
+| Cookie observation | `GO_JS_VISIBLE` was false before and after specifically for `browser.transport.scriptCookies(TARGET)`. This is not a full Go-Jar or `HttpOnly` snapshot and does not prove all cookies absent. Do not describe a full Jar as empty or claim fresh-token acquisition. Full acquired Go state/flush and protected non-challenge 2xx remain **UNPROVED**.                                                                   |
+| Limits and elapsed | Existing VM timeout 5s, HTTP 20s, request 30s, parent 90s, shared network 1 MiB, initial source 64 KiB, page 256 KiB, headers 16 KiB, and max two GETs remained unchanged; guest code generation and permissions were not relaxed. Reported elapsed time 1 second; exit 0; scope closed; owned probe-shell survivors 0.                                                                                                  |
+| Bridge identity    | `CGO_ENABLED=0`; Bridge `0.1.0`, tls-client `1.16.0`, Go `1.27.1`, protocol `1`. `packages/bridge-darwin-arm64/bin/bridge` and `bridge/bridge` had main SHA-256 `002bab99cccc76182ad3115835cbd419857bbf561849791b49801766328abd00`. Go source was historical `b65012b`; TS source was `d4838...`. The binary identity does not establish the independently unobserved child version.                                     |
+
+The CLI `--live` path first passed its offline authored fixtures (8 selector, 1
+AST, 9 classifier, 7 VM); these are not provider proof. Recovery was packet 196
+partial, packet 200's public parser dependency, packet 201 regeneration from the
+original packet 157 author command after reading unchanged public source
+(344/b650/TS d4838), and packet 202's stale fixtures corrected in 203. No SDK or
+runtime change followed. AST inventory is now optional diagnostic data with
+`complete: false` on parse exception; mandatory asset status, URL, media, UTF-8,
+aggregate-size, and source-authorization guards remain. Generic node error reason
+is still discarded, preserving `UNKNOWN`; no private-error channel/backchannel
+or task 162/194 refusal reroute was added (both remain paused). The retained
+authored Cloudflare probe remains available for future work and was not removed.
+No vendor source/HTML/configuration, private URL/query, cookie, or raw error was
+persisted.
