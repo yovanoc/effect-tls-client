@@ -13,6 +13,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import {
   FrameLoadResult,
   BrowserScriptContext,
+  BrowserScriptMode,
   BrowserScriptError,
   BrowserScriptResult,
   type BrowserScriptHost,
@@ -59,6 +60,7 @@ const RunnerStart = Schema.Struct({
   type: Schema.Literal("start"),
   timeoutMs: TimeoutMs,
   source: Schema.String,
+  mode: Schema.optionalKey(BrowserScriptMode),
   url: Schema.String,
   cookie: Schema.String,
   userAgent: Schema.String,
@@ -203,6 +205,7 @@ const makeEvaluate = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   options: BrowserMockOptions,
   hostRequestSemaphore: Semaphore.Semaphore,
+  mode: "async" | "classic" = "async",
 ): BrowserScriptRuntime["evaluate"] =>
   Effect.fn("BrowserMock.evaluate")(function* (
     source: string,
@@ -242,6 +245,7 @@ const makeEvaluate = (
       type: "start",
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       source,
+      mode,
       url: context.url,
       cookie: context.cookie,
       userAgent: context.userAgent,
@@ -926,6 +930,12 @@ export class BrowserMock extends Context.Service<
         return BrowserMock.of({
           allowedOrigins,
           timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          evaluateClassic: makeEvaluate(
+            spawner,
+            { ...options, allowedOrigins },
+            hostRequestSemaphore,
+            "classic",
+          ),
           evaluate: makeEvaluate(
             spawner,
             { ...options, allowedOrigins },

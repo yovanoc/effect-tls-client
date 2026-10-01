@@ -314,6 +314,22 @@ append is a no-op, even to the other target: reparenting and removal are not
 modeled; no `parentNode` or `insertBefore` is supplied. Lookup itself performs
 no network request or execution and does not increase any quota.
 
+`document.getElementById(id)` performs a read-only scan of actual attached
+modeled script and iframe records, returning the same node object or `null`.
+IDs are exact and case-sensitive; an empty or missing ID matches no node. The
+argument uses DOMString coercion (omitting it or passing a Symbol rejects).
+Lookup follows head-before-body order and append order within each target,
+including mixed scripts/frames; duplicate appends neither duplicate nor move
+nodes. Attribute changes are read live: script `id`/`setAttribute`/`removeAttribute`
+and iframe `id`/`setAttribute` retain the existing cumulative UTF-8 attribute
+budget. Frame IDs can change after append, but frame navigation still rejects.
+The frozen head/body targets have no modeled ID attributes and cannot match.
+Created but unattached nodes and all nodes in other realms are excluded. No
+registry, page HTML seeds, fabricated missing elements, or renderer is provided;
+lookup adds no network, execution, cookie, or frame authority in either async
+or classic evaluation. A missing original-page element honestly returns `null`,
+not provider acquisition, Device Check compatibility, or clearance evidence.
+
 There is no HTML parsing or synthetic initial-page script node: the evaluated
 bootstrap and `document.loadScript` calls are VM programs, not DOM elements.
 Child realms get only their own targets and collections, never parent nodes;
@@ -462,10 +478,39 @@ Retries remain bounded by `maxChallengeRetries`. Cookie presence and freshness
 are retry evidence, not proof that the page is solved: inspect the follow-up
 page and its challenge/status yourself.
 
+### Caller-reviewed classic root source
+
+`context.evaluate(source)` remains async-body evaluation: top-level `return` and
+`await` work, and `var` declarations stay local. For original caller-reviewed
+classic scripts, explicitly use `context.evaluateClassic(source)`. BrowserMock
+compiles the original source as-is as a `vm.Script` in the root realm: top-level
+`var` and functions become window globals; `let`/`const` remain global lexical
+bindings, not window properties. Later dynamic classic scripts share that realm.
+
+The runtime capability `BrowserScriptRuntime.evaluateClassic` is optional.
+Existing custom runtimes remain valid for async evaluation; requesting classic
+execution without that capability fails with `BrowserScriptError`, reason
+`Runtime does not support classic script evaluation`, never an async fallback.
+Direct callers can use `runBoundedScript(runtime, source, context, host, "classic")`;
+the fifth argument is Schema-validated and defaults to `"async"`.
+
+The script completion value is awaited once under the same shared deadline,
+then authoritative host cookie writes are flushed. A final expression Promise
+can explicitly wait for acquisition work; undefined completion returns an empty
+string, not clearance or a retry. Unawaited acquisition is **not** implicitly
+awaited. This adds no HTML script discovery, source rewriting, automatic SDK
+configuration, vendor resolver, or claim of challenge clearance. All existing
+source/network/frame/crypto/timer/DOM quotas, origins, credentials, Node permission
+denials, VM code-generation denial, and hard process cutoff remain unchanged.
+Trusted snapshot/flush/error helpers are captured before guest source and are
+not in its lexical scope. Reserved delivery-name collisions fail before trusted
+callbacks are installed; delivery names are removed and checked inside the realm
+before callback execution.
+
 If reviewed source uses `document.loadScript`, await the actual acquisition
 operation too, not just asset loading. Assign shared entry points to `window`
-globals: evaluated source runs inside an async wrapper, so local declarations
-are not shared globals. Unawaited work ends when evaluation completes. The
+globals when using default async evaluation: that source runs inside an async
+wrapper, so local declarations are not shared globals. Unawaited work ends when evaluation completes. The
 runtime defaults to a 2-second hard deadline; navigation also caps the whole
 handler at 5 seconds. Origin review/allowlisting does not provide an exact-byte
 asset integrity pin. Existing source, input, body, origin, credential, and

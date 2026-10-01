@@ -122,7 +122,10 @@ export interface BrowserScriptHost {
   ) => Effect.Effect<string, BrowserScriptError>;
 }
 
+export const BrowserScriptMode = Schema.Literals(["async", "classic"]);
+
 export interface BrowserScriptRuntime {
+  readonly evaluateClassic?: BrowserScriptRuntime["evaluate"];
   readonly allowedOrigins?: ReadonlyArray<string>;
   readonly timeoutMs?: number;
   readonly evaluate: (
@@ -142,7 +145,26 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
     input: unknown,
     context?: BrowserScriptContext,
     host?: BrowserScriptHost,
+    mode: "async" | "classic" = "async",
   ) {
+    const executionMode = yield* Schema.decodeEffect(BrowserScriptMode)(
+      mode,
+    ).pipe(
+      Effect.mapError(
+        (cause) =>
+          new BrowserScriptError({
+            reason: "invalid script execution mode",
+            cause,
+          }),
+      ),
+    );
+    const evaluate =
+      executionMode === "classic" ? runtime.evaluateClassic : runtime.evaluate;
+    if (evaluate === undefined) {
+      return yield* new BrowserScriptError({
+        reason: "Runtime does not support classic script evaluation",
+      });
+    }
     const source = yield* Schema.decodeUnknownEffect(Schema.String)(input).pipe(
       Effect.mapError(
         (cause) =>
@@ -159,7 +181,7 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
     }
 
     const result = yield* Effect.try({
-      try: () => runtime.evaluate(source, context, host),
+      try: () => evaluate.call(runtime, source, context, host),
       catch: (cause) =>
         new BrowserScriptError({
           reason: "script runtime threw before evaluation",

@@ -202,6 +202,9 @@ export interface BrowserChallengeContext {
   readonly response: TlsResponse;
   readonly body: string;
   /** The runtime has a hard cutoff; host cookie reads/writes can still fail. */
+  readonly evaluateClassic: (
+    source: unknown,
+  ) => Effect.Effect<string, BrowserOperationError>;
   readonly evaluate: (
     source: unknown,
   ) => Effect.Effect<string, BrowserOperationError>;
@@ -1196,7 +1199,12 @@ const makeBrowserSession = (
     "browser identity",
     identity.headers,
   );
-  const evaluate = (response: TlsResponse, source: unknown, referrer = "") => {
+  const evaluate = (
+    response: TlsResponse,
+    source: unknown,
+    referrer = "",
+    mode: "async" | "classic" = "async",
+  ) => {
     const runtime = handlers.scriptRuntime;
     if (runtime === undefined) {
       return Effect.fail(
@@ -1245,6 +1253,7 @@ const makeBrowserSession = (
           referrer,
         },
         host,
+        mode,
       );
       if (result.setCookies.length > 0) {
         yield* transport.scriptCookies(response.url, result.setCookies);
@@ -1384,6 +1393,8 @@ const makeBrowserSession = (
               transport,
               response,
               body,
+              evaluateClassic: (source) =>
+                evaluate(response, source, documentReferrer, "classic"),
               evaluate: (source) =>
                 evaluate(response, source, documentReferrer),
             })

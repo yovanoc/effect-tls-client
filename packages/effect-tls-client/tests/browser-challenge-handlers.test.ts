@@ -48,6 +48,7 @@ const context: BrowserChallengeContext = {
     setProxy: () => Effect.die("unused"),
   },
   evaluate: () => Effect.die("unused"),
+  evaluateClassic: () => Effect.die("unused"),
 };
 
 describe("composeChallengeHandlers", () => {

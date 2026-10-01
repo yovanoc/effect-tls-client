@@ -4022,3 +4022,674 @@ describe("frame host", () => {
     ),
   );
 });
+
+describe("caller-reviewed classic execution", () => {
+  it.live("keeps classic globals and awaits the script completion", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runBoundedScript(
+        runtime,
+        `
+        var authoredGlobal = 7;
+        let authoredLexical = 9;
+        Promise.resolve().then(() => String(window.authoredGlobal) + ":" + String(window.authoredLexical));
+      `,
+        undefined,
+        undefined,
+        "classic",
+      );
+      expect(result.value).toBe("7:undefined");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+  it.effect("rejects missing classic capability without async fallback", () =>
+    Effect.gen(function* () {
+      const runtime: BrowserScriptRuntime = {
+        evaluate: () => Effect.die("async fallback must not run"),
+      };
+      const error = yield* runBoundedScript(
+        runtime,
+        "var x = 1",
+        undefined,
+        undefined,
+        "classic",
+      ).pipe(Effect.flip);
+      expect(error.reason).toBe(
+        "Runtime does not support classic script evaluation",
+      );
+    }),
+  );
+  it.live("does not expose trusted prelude helpers to async guest source", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runtime.evaluate(
+        'return [typeof snapshot, typeof flush, typeof describe].join(":")',
+      );
+      expect(result.value).toBe("undefined:undefined:undefined");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+  it.effect("validates mode and source before invoking a runtime", () =>
+    Effect.gen(function* () {
+      let called = false;
+      const evaluate = () =>
+        Effect.sync(() => {
+          called = true;
+          return { value: "", setCookies: [] };
+        });
+      const runtime: BrowserScriptRuntime = {
+        evaluate,
+        evaluateClassic: evaluate,
+      };
+      // Simulate an untyped JavaScript caller without a cast or unchecked Effect result.
+      const invalidMode = new Proxy<{ readonly mode: "classic" }>(
+        { mode: "classic" },
+        {
+          get: () => "invalid",
+        },
+      ).mode;
+      expect(
+        (yield* runBoundedScript(
+          runtime,
+          "1",
+          undefined,
+          undefined,
+          invalidMode,
+        ).pipe(Effect.flip)).reason,
+      ).toBe("invalid script execution mode");
+      expect(
+        (yield* runBoundedScript(
+          runtime,
+          "x".repeat(65537),
+          undefined,
+          undefined,
+          "classic",
+        ).pipe(Effect.flip)).reason,
+      ).toBe("script source exceeds the 64 KiB limit");
+      expect(called).toBe(false);
+    }),
+  );
+  it.live(
+    "shares classic globals with later dynamic classic source and flushes host cookies",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const writes: string[] = [];
+        const host: BrowserScriptHost = {
+          setCookie: (value) =>
+            Effect.sync(() => {
+              writes.push(value);
+              return "authored=ok";
+            }),
+          request: (input) =>
+            Effect.succeed({
+              status: 200,
+              url: input.url,
+              headers: [],
+              cookie: "",
+              body: 'document.cookie = "authored=ok"; window.dynamicValue = authoredGlobal + authoredLexical;',
+            }),
+        };
+        const result = yield* runBoundedScript(
+          runtime,
+          `
+        var authoredGlobal = 7; let authoredLexical = 9;
+        document.loadScript("/authored.js").then(() => String(window.dynamicValue));
+      `,
+          {
+            url: "https://allowed.test/page",
+            cookie: "",
+            userAgent: "authored",
+          },
+          host,
+          "classic",
+        );
+        expect(result.value).toBe("16");
+        expect(writes).toEqual(["authored=ok"]);
+        expect(result.setCookies).toEqual([]);
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+  it.live(
+    "keeps default async declarations private and accepts undefined classic completion",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        expect(
+          (yield* runBoundedScript(
+            runtime,
+            "var authoredGlobal = 7; return String(window.authoredGlobal);",
+          )).value,
+        ).toBe("undefined");
+        expect(
+          (yield* runBoundedScript(
+            runtime,
+            "var authoredGlobal = 7;",
+            undefined,
+            undefined,
+            "classic",
+          )).value,
+        ).toBe("");
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+        ),
+      ),
+  );
+
+  it.live(
+    "exposes classic challenge evaluation without retrying an undefined result",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const calls: Call[] = [];
+        const browser = fromSession(
+          session(calls, (url) =>
+            response(url, 202, "authored challenge", [
+              ["x-amzn-waf-action", "challenge"],
+            ]),
+          ),
+          Chrome152Identity,
+          {
+            scriptRuntime: runtime,
+            challengeHandler: (_challenge, context) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* context.evaluateClassic("var authoredGlobal = 7;"),
+                ).toBe("");
+                return Option.none();
+              }),
+          },
+        );
+        const page = yield* browser.navigate("https://allowed.test/page");
+        expect(page.status).toBe(202);
+        expect(calls).toHaveLength(1);
+        yield* page.close;
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+        ),
+      ),
+  );
+  for (const mode of ["async", "classic"] as const) {
+    it.live(
+      `hides private names and prelude helpers and disables code generation in ${mode}`,
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const body = `
+          const privateNames = ["__receive", "__post", "__childRealm", "__consumeBudget", "__urlOperation", "__pageUrl", "__pageLocation", "__referrer", "__cookie", "__userAgent", "__languages", "__authoritativeCookies", "__performanceNow", "__performanceTimeOrigin", "__randomBytes", "__cryptoOperation", "__encodeBlobText", "__decodeBlobText", "__cookieSnapshot", "__cookieFlush", "__safeMessage", "__dispatch", "__incoming"];
+          const hidden = privateNames.every((key) => !(key in window));
+          const helpers = [typeof snapshot, typeof flush, typeof describe].join(":");
+          let blocked = false;
+          try { document.loadScript.constructor("return process")(); } catch (error) { blocked = error instanceof EvalError; }
+          const outcome = Promise.resolve().then(() => String(hidden && helpers === "undefined:undefined:undefined" && blocked && privateNames.every((key) => !(key in window))));
+        `;
+          const source =
+            body + (mode === "async" ? "return outcome;" : "outcome;");
+          expect(
+            (yield* runBoundedScript(
+              runtime,
+              source,
+              undefined,
+              undefined,
+              mode,
+            )).value,
+          ).toBe("true");
+        }).pipe(
+          Effect.provide(
+            BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+          ),
+        ),
+    );
+    it.live(
+      `does not elevate network permission or modeled node quota in ${mode}`,
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const body = `const denied = fetch("https://blocked.test/authored").then(() => false, () => true);
+          for (let i = 0; i < 32; i++) document.createElement("script");
+          let capped = false; try { document.createElement("script"); } catch (error) { capped = error instanceof RangeError; }
+          const outcome = denied.then((blocked) => String(blocked && capped));`;
+          expect(
+            (yield* runBoundedScript(
+              runtime,
+              body + (mode === "async" ? "return outcome;" : "outcome;"),
+              undefined,
+              undefined,
+              mode,
+            )).value,
+          ).toBe("true");
+        }).pipe(
+          Effect.provide(
+            BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+          ),
+        ),
+    );
+    for (const collision of [
+      "var __dispatch;",
+      'Object.defineProperty(window, "__dispatch", { get() { throw new Error("getter invoked"); }, set(value) { throw new Error("receiver exposed"); }, configurable: false });',
+      'Object.defineProperty(window, "__incoming", { value: 1, configurable: false });',
+    ]) {
+      it.live(
+        `rejects delivery collisions before exposing trusted callbacks in ${mode}: ${collision}`,
+        () =>
+          Effect.gen(function* () {
+            const runtime = yield* BrowserMock;
+            // Async local var is intentionally private; explicitly create the global collision.
+            const declaration =
+              mode === "async" && collision === "var __dispatch;"
+                ? "window.__dispatch = undefined;"
+                : collision;
+            const source =
+              declaration + (mode === "async" ? ' return "ok";' : ' "ok";');
+            const error = yield* runBoundedScript(
+              runtime,
+              source,
+              undefined,
+              undefined,
+              mode,
+            ).pipe(Effect.flip);
+            expect(error.reason).toContain(
+              "private delivery binding collision",
+            );
+            expect(error.reason).not.toContain("receiver exposed");
+            expect(error.reason).not.toContain("getter invoked");
+          }).pipe(
+            Effect.provide(
+              BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+            ),
+          ),
+      );
+    }
+    it.live(`preserves early failure and timer deadlines in ${mode}`, () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const early = yield* runBoundedScript(
+          runtime,
+          'throw new Error("authored failure")',
+          undefined,
+          undefined,
+          mode,
+        ).pipe(Effect.flip);
+        expect(early.reason).toBe("authored failure");
+        const synchronous = yield* runBoundedScript(
+          runtime,
+          "while (true) {}",
+          undefined,
+          undefined,
+          mode,
+        ).pipe(Effect.flip);
+        expect(synchronous.reason).toMatch(/timed out|timeout/i);
+        const promise =
+          "new Promise(() => { setTimeout(() => { while (true) {} }, 1); })";
+        const error = yield* runBoundedScript(
+          runtime,
+          mode === "async" ? "return " + promise : promise,
+          undefined,
+          undefined,
+          mode,
+        ).pipe(Effect.flip);
+        expect(error.reason).toMatch(/timed out|timeout/i);
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ timeoutMs: 500 }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+  }
+
+  for (const mode of ["async", "classic"] as const) {
+    const frameContext = {
+      url: "https://allowed.test/page",
+      cookie: "root=private",
+      userAgent: "authored",
+    };
+    const frameHost = (scripts: readonly string[]): BrowserScriptHost => ({
+      request: () => Effect.die("frame must not gain network permission"),
+      setCookie: () => Effect.die("frame must not gain cookie writes"),
+      loadFrame: (url) =>
+        Effect.succeed({
+          parentUrl: frameContext.url,
+          url,
+          origin: "https://allowed.test",
+          status: 200,
+          headers: [],
+          cookie: null,
+          scripts,
+        }),
+    });
+    const frameSource =
+      `const frame = document.createElement("iframe"); frame.src = "/frame";
+      const done = new Promise((resolve, reject) => { frame.onload = () => resolve("loaded"); frame.onerror = reject; document.body.appendChild(frame); });` +
+      (mode === "async" ? "return await done;" : "done;");
+    it.live(
+      `hides private globals in child realms under ${mode} root execution`,
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const child = `const names = ["__receive", "__post", "__childRealm", "__consumeBudget", "__urlOperation", "__pageUrl", "__pageLocation", "__referrer", "__cookie", "__userAgent", "__languages", "__authoritativeCookies", "__performanceNow", "__performanceTimeOrigin", "__randomBytes", "__cryptoOperation", "__encodeBlobText", "__decodeBlobText", "__cookieSnapshot", "__cookieFlush", "__safeMessage"];
+          if (!names.every((key) => !(key in window)) || typeof snapshot !== "undefined" || typeof flush !== "undefined" || typeof describe !== "undefined") throw new Error("private child binding leaked");
+          let blocked = false; try { document.createElement.constructor("return process")(); } catch (error) { blocked = error instanceof EvalError; }
+          if (!blocked) throw new Error("child code generation enabled");`;
+          expect(
+            (yield* runBoundedScript(
+              runtime,
+              frameSource,
+              frameContext,
+              frameHost([child]),
+              mode,
+            )).value,
+          ).toBe("loaded");
+        }).pipe(
+          Effect.provide(
+            BrowserMock.layer({
+              allowedOrigins: ["https://allowed.test"],
+            }).pipe(Layer.provide(NodeServices.layer)),
+          ),
+        ),
+    );
+    it.live(
+      `clamps child scripts to the shared root deadline under ${mode}`,
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const error = yield* runBoundedScript(
+            runtime,
+            frameSource,
+            frameContext,
+            frameHost(["while (true) {}"]),
+            mode,
+          ).pipe(Effect.flip);
+          expect(error.reason).toMatch(/timed out|timeout/i);
+        }).pipe(
+          Effect.provide(
+            BrowserMock.layer({
+              allowedOrigins: ["https://allowed.test"],
+              timeoutMs: 500,
+            }).pipe(Layer.provide(NodeServices.layer)),
+          ),
+        ),
+    );
+  }
+});
+
+describe("modeled exact ID lookup", () => {
+  for (const mode of ["async", "classic"] as const) {
+    it.live(`finds actual attached nodes by live exact ID in ${mode}`, () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const context = {
+          url: "https://allowed.test/page",
+          cookie: "",
+          userAgent: "authored",
+        };
+        const host: BrowserScriptHost = {
+          request: (input) =>
+            Effect.succeed({
+              status: 200,
+              url: input.url,
+              headers: [],
+              cookie: "",
+              body: "",
+            }),
+          setCookie: () => Effect.die("lookup must not write cookies"),
+          loadFrame: (url) =>
+            Effect.succeed({
+              parentUrl: context.url,
+              url,
+              origin: "https://allowed.test",
+              status: 200,
+              headers: [],
+              cookie: null,
+              scripts: [],
+            }),
+        };
+        const body = `
+          const lookup = (id) => document.getElementById(id);
+          const checks = [lookup("") === null, lookup("missing") === null, lookup("cmsg") === null,
+            lookup("head") === null, lookup("body") === null];
+          const detached = document.createElement("script"); detached.id = "detached";
+          const frame = document.createElement("iframe"); frame.src = "/frame"; frame.id = "shared";
+          checks.push(lookup("detached") === null, lookup("shared") === null);
+          const loaded = [];
+          const attach = (node, parent) => {
+            loaded.push(new Promise((resolve, reject) => { node.onload = resolve; node.onerror = reject; }));
+            checks.push(parent.appendChild(node) === node);
+          };
+          attach(frame, document.body);
+          const bodyScript = document.createElement("script"); bodyScript.src = "/body.js"; bodyScript.id = "shared";
+          attach(bodyScript, document.body);
+          checks.push(lookup("shared") === frame);
+          const headScript = document.createElement("script"); headScript.src = "/head.js"; headScript.setAttribute("id", "shared");
+          attach(headScript, document.head);
+          const headFrame = document.createElement("iframe"); headFrame.src = "/frame2"; headFrame.id = "shared";
+          attach(headFrame, document.head);
+          checks.push(lookup("shared") === headScript);
+          document.body.appendChild(headScript); document.head.appendChild(frame);
+          checks.push(lookup("shared") === headScript, document.getElementsByTagName("script").length === 2);
+          headScript.id = "Changed";
+          checks.push(lookup("shared") === headFrame, lookup("Changed") === headScript, lookup("changed") === null);
+          headFrame.setAttribute("id", "frameChanged");
+          checks.push(lookup("shared") === frame, lookup("frameChanged") === headFrame);
+          frame.id = "";
+          checks.push(lookup("shared") === bodyScript, lookup("") === null);
+          bodyScript.removeAttribute("id");
+          checks.push(lookup("shared") === null);
+          headScript.setAttribute("id", 42);
+          checks.push(lookup(42) === headScript, lookup({ toString() { return "42"; } }) === headScript);
+          headScript.id = null; checks.push(lookup(null) === headScript);
+          headScript.id = undefined; checks.push(lookup(undefined) === headScript);
+          for (const operation of [() => document.getElementById(), () => lookup(Symbol("id"))]) {
+            try { operation(); checks.push(false); } catch (error) { checks.push(error instanceof TypeError); }
+          }
+          try { document.getElementById.constructor("return process")(); checks.push(false); }
+          catch (error) { checks.push(error instanceof EvalError); }
+          const outcome = Promise.all(loaded).then(() => String(checks.every(Boolean)));`;
+        expect(
+          (yield* runBoundedScript(
+            runtime,
+            body + (mode === "async" ? "return outcome;" : "outcome;"),
+            context,
+            host,
+            mode,
+          )).value,
+        ).toBe("true");
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+    it.live(`preserves ID attribute and node budgets in ${mode}`, () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const body = `
+          const script = document.createElement("script"); script.id = "kept";
+          const frame = document.createElement("iframe"); frame.id = "kept-frame";
+          const checks = [];
+          for (const node of [script, frame]) {
+            try { node.id = "x".repeat(8193); checks.push(false); }
+            catch (error) { checks.push(error instanceof Error && error.message.includes("8192")); }
+          }
+          checks.push(script.getAttribute("id") === "kept", frame.getAttribute("id") === "kept-frame");
+          script.id = "é".repeat(4000); frame.id = "é".repeat(4000);
+          for (const node of [script, frame]) {
+            try { node.id = "é".repeat(200); checks.push(false); }
+            catch (error) { checks.push(error instanceof RangeError && error.message.includes("16 KiB")); }
+            checks.push(node.getAttribute("id") === "é".repeat(4000));
+            try { Object.defineProperty(node, "id", { value: "bypass" }); checks.push(false); }
+            catch (error) { checks.push(error instanceof TypeError); }
+          }
+          for (let i = 0; i < 100; i++) checks.push(document.getElementById("kept") === null);
+          for (let i = 0; i < 3; i++) document.createElement("iframe");
+          try { document.createElement("iframe"); checks.push(false); }
+          catch (error) { checks.push(error instanceof RangeError && error.message.includes("4 frames")); }
+          for (let i = 0; i < 27; i++) document.createElement("script");
+          try { document.createElement("script"); checks.push(false); }
+          catch (error) { checks.push(error instanceof RangeError && error.message.includes("32 nodes")); }
+          const outcome = String(checks.every(Boolean));`;
+        expect(
+          (yield* runBoundedScript(
+            runtime,
+            body + (mode === "async" ? "return outcome;" : "outcome;"),
+            undefined,
+            undefined,
+            mode,
+          )).value,
+        ).toBe("true");
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+        ),
+      ),
+    );
+    it.live(
+      `keeps ID lookup realm-local and reviewed frame identity opaque in ${mode}`,
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const context = {
+            url: "https://allowed.test/page",
+            cookie: "root=private",
+            userAgent: "authored",
+          };
+          const child = `
+          if (document.getElementById("parent-frame") !== null || document.getElementById("cmsg") !== null) throw new Error("parent ID leaked");
+          const detached = document.createElement("script"); detached.id = "child-only";
+          if (document.getElementById("child-only") !== null) throw new Error("detached child fabricated");
+          try { document.head.appendChild(detached); throw new Error("child append allowed"); }
+          catch (error) { if (!(error instanceof TypeError)) throw error; }
+          if (document.cookie !== "" || typeof parent.document !== "undefined") throw new Error("parent authority leaked");`;
+          const host: BrowserScriptHost = {
+            request: () => Effect.die("lookup must not grant child network"),
+            setCookie: () => Effect.die("lookup must not grant cookie writes"),
+            loadFrame: (url) =>
+              Effect.succeed({
+                parentUrl: context.url,
+                url,
+                origin: new URL(url).origin,
+                status: 200,
+                headers: [],
+                cookie: null,
+                scripts: [child],
+              }),
+          };
+          const body = `
+          const frame = document.createElement("iframe"); frame.src = "https://cdn.test/frame"; frame.id = "parent-frame";
+          const outcome = new Promise((resolve, reject) => {
+            frame.onload = () => resolve(String(document.getElementById("parent-frame") === frame &&
+              document.getElementById("child-only") === null && document.getElementById("cmsg") === null &&
+              frame.contentDocument === null && typeof frame.contentWindow.document === "undefined"));
+            frame.onerror = reject; document.body.appendChild(frame);
+          });`;
+          expect(
+            (yield* runBoundedScript(
+              runtime,
+              body + (mode === "async" ? "return outcome;" : "outcome;"),
+              context,
+              host,
+              mode,
+            )).value,
+          ).toBe("true");
+        }).pipe(
+          Effect.provide(
+            BrowserMock.layer({
+              allowedOrigins: ["https://allowed.test", "https://cdn.test"],
+            }).pipe(Layer.provide(NodeServices.layer)),
+          ),
+        ),
+    );
+  }
+});
+
+describe("atomic bounded src writes", () => {
+  for (const mode of ["async", "classic"] as const) {
+    it.live(
+      `preserves accepted src and denies frame authority after rejected writes in ${mode}`,
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const context = {
+            url: "https://page.invalid/root",
+            cookie: "",
+            userAgent: "authored",
+          };
+          const host: BrowserScriptHost = {
+            request: () =>
+              Effect.die("rejected src must not gain network permission"),
+            setCookie: () => Effect.die("rejected src must not write cookies"),
+            loadFrame: () => Effect.die("denied frame must not reach the host"),
+          };
+          const body = `
+          const frame = document.createElement("iframe");
+          const script = document.createElement("script");
+          const old = "https://local.invalid/old";
+          frame.src = old; script.src = old;
+          let used = 2 * (3 + old.length);
+          frame.setAttribute("src", "/old"); used += 3 + 4;
+          if (frame.src !== "https://page.invalid/old" || frame.getAttribute("src") !== "/old") throw new Error("accepted attribute src is not reflected");
+          frame.src = old; used += 3 + old.length;
+          const reject = (node, value, attribute, message) => {
+            let rejected = false;
+            try { if (attribute) node.setAttribute("src", value); else node.src = value; }
+            catch (error) { rejected = error instanceof Error && error.message.includes(message); }
+            if (!rejected) throw new Error("src write was not rejected: " + message);
+            if (node.src !== old || node.getAttribute("src") !== old) throw new Error("rejected src changed accepted state: " + message);
+          };
+          for (const node of [frame, script]) {
+            for (const attribute of [false, true]) {
+              reject(node, "x".repeat(8193), attribute, "8192");
+            }
+          }
+          frame.name = "é".repeat(4096); used += 4 + 8192;
+          for (const node of [frame, script]) {
+            for (const attribute of [false, true]) reject(node, "/" + "é".repeat(4200), attribute, "16 KiB");
+          }
+          // Fill exactly the shared UTF-8 budget: failed writes must not spend it.
+          script.nonce = "x".repeat(16384 - used - 5);
+          for (const node of [frame, script]) {
+            for (const attribute of [false, true]) reject(node, "/rejected", attribute, "16 KiB");
+          }
+          const outcome = new Promise((resolve, reject) => {
+            frame.onload = () => reject(new Error("denied frame loaded"));
+            frame.onerror = () => {
+              if (frame.src !== old || frame.getAttribute("src") !== old || frame.contentWindow !== null || frame.contentDocument !== null) reject(new Error("denied frame gained authority"));
+              else resolve("denied:old");
+            };
+            document.body.appendChild(frame);
+          });`;
+          expect(
+            (yield* runBoundedScript(
+              runtime,
+              body + (mode === "async" ? "return outcome;" : "outcome;"),
+              context,
+              host,
+              mode,
+            )).value,
+          ).toBe("denied:old");
+        }).pipe(
+          Effect.provide(
+            BrowserMock.layer({
+              allowedOrigins: ["https://page.invalid"],
+            }).pipe(Layer.provide(NodeServices.layer)),
+          ),
+        ),
+    );
+  }
+});
