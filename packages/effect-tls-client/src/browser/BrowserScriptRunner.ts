@@ -1495,10 +1495,12 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const MAX_SCRIPT_NODES = 32;
   const MAX_SCRIPT_ATTRIBUTE_BYTES = 16 * 1024;
   const scriptNodes = new WeakMap();
+  const headScripts = [];
+  const bodyScripts = [];
   let scriptNodeCount = 0;
   let scriptAttributeBytes = 0;
   const scriptAttributeNames = ["src", "type", "integrity", "crossorigin", "async", "defer", "nomodule", "id", "nonce"];
-  const appendScript = (element) => {
+  const appendScript = (element, attached) => {
     const frameState = frameNodes.get(element);
     if (frameState !== undefined) return appendFrame(element, frameState);
     const state = scriptNodes.get(element);
@@ -1508,6 +1510,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     const src = state.attributes.get("src");
     if (!src) throw new NativeTypeError("BrowserMock requires an external script src; inline scripts are unsupported");
     state.started = true;
+    attached[attached.length] = element;
     apply(promiseThen, loadExternalScript(src), [
       () => element.dispatchEvent(new Event("load")),
       () => element.dispatchEvent(new Event("error")),
@@ -1640,8 +1643,42 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     frameNodes.set(element, state);
     return objectFreeze(element);
   };
-  document.head = objectFreeze({ appendChild: appendScript });
-  document.body = objectFreeze({ appendChild: appendScript });
+  objectDefineProperties(document, {
+    head: { value: objectFreeze({ appendChild: (element) => appendScript(element, headScripts) }), enumerable: true },
+    body: { value: objectFreeze({ appendChild: (element) => appendScript(element, bodyScripts) }), enumerable: true },
+  });
+  // Cached per realm; no HTML seeds, snapshots, cross-frame nodes, or extra node budget.
+  const tagCollections = objectCreate(null);
+  for (const tag of ["head", "body", "script"]) {
+    const length = () => tag === "script" ? headScripts.length + bodyScripts.length : 1;
+    const at = (index) => {
+      if (index >= length()) return undefined;
+      if (tag !== "script") return tag === "head" ? document.head : document.body;
+      return index < headScripts.length ? headScripts[index] : bodyScripts[index - headScripts.length];
+    };
+    const readonly = () => { throw new NativeTypeError("modeled element collection is read-only"); };
+    const collection = objectCreate(null);
+    objectDefineProperties(collection, {
+      length: { get: length },
+      item: { value: (index) => at(+index >>> 0) ?? null },
+      namedItem: { value: () => { throw new NativeTypeError("modeled element collection namedItem is unsupported"); } },
+      [Symbol.iterator]: { value: function* () { for (let index = 0; index < length(); index++) yield at(index); } },
+    });
+    objectFreeze(collection);
+    tagCollections[tag] = new Proxy(collection, {
+      get: (target, key) => typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key) ? at(NativeNumber(key)) : target[key],
+      has: (target, key) => typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key)
+        ? NativeNumber(key) < length()
+        : key in target,
+      set: readonly, defineProperty: readonly, deleteProperty: readonly, setPrototypeOf: readonly,
+      preventExtensions: readonly,
+    });
+  }
+  document.getElementsByTagName = (name) => {
+    const tag = NativeString(name).replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+    if (!Object.hasOwn(tagCollections, tag)) throw new NativeTypeError("unsupported modeled element lookup: " + tag);
+    return tagCollections[tag];
+  };
   const navigator = Object.freeze({ userAgent, language: languages[0] ?? "", languages, cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);

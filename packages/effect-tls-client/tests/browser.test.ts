@@ -2690,6 +2690,158 @@ describe("browser layer", () => {
     { excludeTestServices: true },
   )("dynamic external scripts", (it) => {
     it.effect(
+      "looks up only attached modeled nodes with live readonly collections",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+          const host: BrowserScriptHost = {
+            setCookie: () => Effect.succeed(""),
+            request: (input) =>
+              Effect.sync(() => {
+                requests.push(input);
+                return {
+                  status: 200,
+                  url: input.url,
+                  headers: [],
+                  cookie: "",
+                  body: "globalThis.lookupExecutions = (globalThis.lookupExecutions || 0) + 1;",
+                };
+              }),
+          };
+          const result = yield* runtime.evaluate(
+            `
+          const query = (name) => document.getElementsByTagName(name);
+          const scripts = query("SCRIPT");
+          const checks = [scripts.length === 0, scripts[0] === undefined, scripts.item(0) === null,
+            !(0 in scripts), 0 in query("head"), 0 in query("body"),
+            ["length", "item", "namedItem"].every((key) => key in scripts), Symbol.iterator in scripts,
+            query("head")[0] === document.head, query("BODY").item(0) === document.body,
+            [...query("head")][0] === document.head, query("head").length === 1,
+            query("script") === scripts, !Array.isArray(scripts), Object.isFrozen(scripts) === true,
+            Reflect.isExtensible(scripts) === false];
+          const localReject = (fn) => { try { fn(); return false; } catch (e) { return e instanceof TypeError && e.constructor === TypeError; } };
+          checks.push(["*", "div", "iframe", " script ", "ſcript"].every((tag) => localReject(() => query(tag))),
+            localReject(() => scripts.namedItem("id")), Object.getPrototypeOf(scripts) === null,
+            localReject(() => { scripts[0] = document.head; }), localReject(() => { scripts.length = 100; }),
+            localReject(() => Object.defineProperty(scripts, "0", { value: document.head })),
+            localReject(() => Object.preventExtensions(scripts)),
+            localReject(() => Object.setPrototypeOf(scripts, {})), localReject(() => { delete scripts.item; }),
+            !Reflect.set(document, "head", {}), !Reflect.set(document, "body", {}),
+            query("head") === query("HEAD"), query("body") === query("BODY"),
+            localReject(() => scripts.item(0n)));
+          for (const fn of [query, scripts.item, scripts[Symbol.iterator], document.head.appendChild]) {
+            try { fn.constructor("return process")(); checks.push(false); } catch (e) { checks.push(e instanceof EvalError); }
+          }
+          checks.push(typeof __receive === "undefined", typeof __consumeBudget === "undefined", typeof __post === "undefined");
+          const unattached = document.createElement("script");
+          checks.push(scripts.length === 0);
+          const loaded = [];
+          const attach = (parent, id) => {
+            const script = document.createElement("script"); script.src = "/" + id + ".js";
+            loaded.push(new Promise((resolve, reject) => { script.onload = resolve; script.onerror = reject; }));
+            checks.push(parent.appendChild(script) === script); return script;
+          };
+          const body = attach(document.body, "body");
+          const head = attach(document.head, "head");
+          checks.push(scripts.length === 2, scripts[0] === head, scripts.item(1) === body,
+            0 in scripts, 1 in scripts, !(2 in scripts),
+            scripts[2] === undefined, scripts.item(2) === null, scripts.item(-1) === null,
+            scripts.item("0") === head, [...scripts][0] === head);
+          document.head.appendChild(head); document.body.appendChild(head);
+          checks.push(scripts.length === 2, scripts[0] === head, 0 in scripts, 1 in scripts, !(2 in scripts));
+          const third = attach(query("head")[0], "third");
+          checks.push(scripts.length === 3, scripts[1] === third, scripts[2] === body, [...scripts].length === 3,
+            0 in scripts, 1 in scripts, 2 in scripts, !(3 in scripts), !("01" in scripts), !("1.0" in scripts));
+          for (let i = 0; i < 1000; i++) checks.push(query("script") === scripts);
+          for (let i = 0; i < 28; i++) document.createElement("script");
+          try { document.createElement("script"); checks.push(false); } catch (e) { checks.push(e instanceof RangeError && e.message.includes("32 nodes")); }
+          checks.push(scripts.length === 3, ![...scripts].includes(unattached));
+          await Promise.all(loaded);
+          checks.push(lookupExecutions === 3);
+          return String(checks.every(Boolean));
+        `,
+            {
+              url: "https://allowed.test/page",
+              cookie: "",
+              userAgent: "fixture",
+            },
+            host,
+          );
+          expect(result.value).toBe("true");
+          expect(requests.map(({ url }) => url)).toEqual([
+            "https://allowed.test/body.js",
+            "https://allowed.test/head.js",
+            "https://allowed.test/third.js",
+          ]);
+        }),
+    );
+
+    it.effect(
+      "keeps modeled lookup collections local to each child realm",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+          const host: BrowserScriptHost = {
+            ...recordingScriptHost(requests),
+            request: (input) =>
+              Effect.sync(() => {
+                requests.push(input);
+                return {
+                  status: 200,
+                  url: input.url,
+                  headers: [],
+                  cookie: "",
+                  body: "globalThis.parentLoaded = true;",
+                };
+              }),
+            loadFrame: (url) =>
+              Effect.succeed({
+                parentUrl: "https://allowed.test/page",
+                url,
+                origin: "https://allowed.test",
+                status: 200,
+                headers: [],
+                cookie: null,
+                scripts: [
+                  `
+              const scripts = document.getElementsByTagName("script");
+              if (scripts.length !== 0 || document.getElementsByTagName("head")[0] !== document.head ||
+                  document.getElementsByTagName("body").item(0) !== document.body ||
+                  typeof parentLoaded !== "undefined" || typeof __receive !== "undefined" || typeof __post !== "undefined") throw new Error("child lookup leaked");
+              const created = document.createElement("script"); created.src = "/child.js";
+              try { document.head.appendChild(created); throw new Error("child script accepted"); }
+              catch (e) { if (!(e instanceof TypeError)) throw e; }
+              if (scripts.length !== 0) throw new Error("unattached child script visible");
+              try { scripts.item.constructor("return process")(); throw new Error("constructor escaped"); }
+              catch (e) { if (!(e instanceof EvalError)) throw e; }
+            `,
+                ],
+              }),
+          };
+          const result = yield* runtime.evaluate(
+            `
+          const scripts = document.getElementsByTagName("script");
+          const script = document.createElement("script"); script.src = "/parent.js";
+          await new Promise((resolve, reject) => { script.onload = resolve; script.onerror = reject; document.head.appendChild(script); });
+          const frame = document.createElement("iframe"); frame.src = "/frame";
+          const outcome = await new Promise((resolve) => { frame.onload = () => resolve("load"); frame.onerror = () => resolve("error"); document.body.appendChild(frame); });
+          return [outcome, scripts.length, scripts[0] === script, frame.contentDocument === null, frame.contentWindow.document === undefined].join("|");
+        `,
+            {
+              url: "https://allowed.test/page",
+              cookie: "",
+              userAgent: "fixture",
+            },
+            host,
+          );
+          expect(result.value).toBe("load|1|true|true|true");
+          expect(requests).toHaveLength(1);
+        }),
+    );
+
+    it.effect(
       "executes before load, preserves URLs, and deduplicates append",
       () =>
         Effect.gen(function* () {

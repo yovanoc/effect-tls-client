@@ -293,6 +293,36 @@ and reject. `document.createElement` also accepts `"iframe"` as described
 below; other elements (including `div` and `canvas`) remain unsupported. This
 is not a general DOM or renderer and adds no `postMessage` API.
 
+### Experimental modeled element lookup
+
+`document.getElementsByTagName` supports only `"head"`, `"body"`, and `"script"`
+(ASCII case-insensitive, without trimming). Each realm caches three VM-local,
+read-only live collections: numeric access, `in` for currently present canonical
+numeric indices and actual collection properties, `length`, `item(index)`
+(unsigned 32-bit index coercion, `null` out of range), and iteration. Numeric
+access out of range is `undefined`; `in` is false for out-of-range and
+noncanonical indices. These are not arrays or complete `HTMLCollection`
+implementations: `namedItem` explicitly rejects; named-property lookup and
+numeric-property enumeration are not provided. Collection writes, deletion,
+property definition, preventing extensions, and prototype replacement reject.
+
+Head/body lookup returns the actual frozen append targets, which cannot be
+replaced. Script lookup includes only successfully appended modeled script
+nodes, including nodes whose subsequent load fails, not merely created nodes.
+Order is head before body, with append order within each target. Duplicate
+append is a no-op, even to the other target: reparenting and removal are not
+modeled; no `parentNode` or `insertBefore` is supplied. Lookup itself performs
+no network request or execution and does not increase any quota.
+
+There is no HTML parsing or synthetic initial-page script node: the evaluated
+bootstrap and `document.loadScript` calls are VM programs, not DOM elements.
+Child realms get only their own targets and collections, never parent nodes;
+child dynamic script append remains unsupported. `"iframe"`, `"*"`, and all
+other tag queries explicitly reject rather than pretending to query a full
+DOM. This subset adds no lifecycle/DOMReady, history, worker, rendering,
+messaging, navigation, or cookie authority, and is not a Cloudflare resolver
+or evidence of clearance.
+
 ### Experimental reviewed iframe loading
 
 The optional `BrowserHandlers.frameReviewer` lets `BrowserMock` load an
