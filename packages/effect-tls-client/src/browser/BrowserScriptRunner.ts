@@ -966,7 +966,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (!timer) return;
     if (timer.interval === undefined) { timers.delete(id); send({ type: "timer.clear", id }); }
     try { timer.callback(...timer.args); }
-    catch (cause) { send({ type: "script.error", reason: safeMessage(cause) }); }
+    catch (cause) { reportException(cause); }
     if (timer.interval !== undefined && timers.get(id) === timer) {
       send({ type: "timer.set", id, ms: timer.interval });
     }
@@ -1152,7 +1152,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (typeof this["on" + type] === "function") callbacks.push(this["on" + type]);
     for (const callback of callbacks) {
       try { callback.call(this, event); }
-      catch (cause) { send({ type: "script.error", reason: safeMessage(cause) }); }
+      catch (cause) { reportException(cause); }
     }
   };
   XMLHttpRequest.prototype.open = function(method, url, async = true) {
@@ -1308,7 +1308,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
             if (typeof entry.callback === "function") entry.callback.call(target, event);
             else entry.callback.handleEvent.call(entry.callback, event);
           } catch (cause) {
-            send({ type: "script.error", reason: safeMessage(cause) });
+            reportException(cause);
           } finally {
             event._inPassiveListener = false;
           }
@@ -1729,6 +1729,22 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     Object.defineProperties(window, { parent: { value: opaqueWindow() }, top: { value: opaqueWindow() }, postMessage: { value: unsupportedFrameOperation } });
   }
   bindEventHandlers(window, ["error"]);
+  const RealmErrorEvent = ErrorEvent;
+  const dispatchWindowEvent = window.dispatchEvent;
+  let inErrorReportingMode = false;
+  const dispatchErrorEvent = (event) => {
+    const wasInErrorReportingMode = inErrorReportingMode;
+    inErrorReportingMode = true;
+    try { apply(dispatchWindowEvent, window, [event]); }
+    finally { inErrorReportingMode = wasInErrorReportingMode; }
+  };
+  const reportException = (cause) => {
+    if (inErrorReportingMode) return;
+    dispatchErrorEvent(new RealmErrorEvent("error", {
+      cancelable: true, message: safeMessage(cause), filename: location.href,
+      lineno: 0, colno: 0, error: cause,
+    }));
+  };
   // Captured and removed before guest execution, just like the private receiver.
   Object.defineProperty(globalThis, "__scriptErrorReporter", {
     configurable: true,
@@ -1736,7 +1752,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
       const [filename, muted, syntaxMessage] = jsonParse(encoded);
       return (cause) => {
         const error = syntaxMessage === null ? cause : new NativeSyntaxError(syntaxMessage);
-        window.dispatchEvent(new ErrorEvent("error", {
+        dispatchErrorEvent(new RealmErrorEvent("error", {
           cancelable: true, message: muted ? "Script error." : safeMessage(error),
           filename: muted ? "" : filename, lineno: 0, colno: 0, error: muted ? null : error,
         }));

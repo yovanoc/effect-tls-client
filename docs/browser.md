@@ -293,7 +293,11 @@ and muted: `message: "Script error."`, `filename: ""`, `lineno: 0`, `colno: 0`,
 and `error: null`. Locations are also 0 for same-origin errors: host stacks are
 not parsed and source locations are not modeled. Legacy `window.onerror` receives
 `(message, source, lineno, colno, error)`; returning `true` cancels the event.
-Listener and `onload` exceptions still fail evaluation with `BrowserScriptError`.
+Uncaught timer, event-listener, XHR, FileReader, and script-element `load`/`error`
+callback exceptions are reported as cancelable realm-local `ErrorEvent`s on
+`window`; evaluation continues, and errors thrown by error handlers do not
+recurse. These async errors use the page URL as `filename`, with `lineno` and
+`colno` 0; cross-origin muting does not apply to them.
 The nonstandard direct `document.loadScript` convenience API remains separate:
 parsing/execution failures reject with the existing `loaded script failed: `
 prefix, rather than reporting a Window event and resolving.

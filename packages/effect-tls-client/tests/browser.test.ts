@@ -2474,20 +2474,182 @@ describe("browser layer", () => {
       expect(events.value).toBe(
         "document:synthetic:true:false|once|document:synthetic:true:false|window:true|capture|bubble",
       );
-      const listenerError = yield* Effect.flip(
-        runtime.evaluate(`
-          document.addEventListener("listener-error", () => {
-            throw new Error("event listener failed");
-          });
-          document.dispatchEvent(new Event("listener-error"));
-          return "unreachable";
-        `),
-      );
-      expect(listenerError).toBeInstanceOf(BrowserScriptError);
-      expect(listenerError.reason).toContain("event listener failed");
+      const listenerResult = yield* runtime.evaluate(`
+        const thrown = { document: {}, window: {} };
+        const reports = [];
+        const nextListeners = [];
+        window.addEventListener("error", (event) => {
+          reports.push(event.error === thrown.document || event.error === thrown.window);
+          reports.push(event.target === window && event.filename === document.location.href);
+        });
+        for (const [type, target] of [["document", document], ["window", window]]) {
+          target.addEventListener(type, () => { throw thrown[type]; });
+          target.addEventListener(type, () => nextListeners.push(type));
+          target.dispatchEvent(new Event(type));
+        }
+        return [reports.length, reports.every(Boolean), nextListeners.join(",")].join("|");
+      `);
+      expect(listenerResult.value).toBe("4|true|document,window");
     }).pipe(
       Effect.provide(
         BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.live("reports timer callback exceptions and runs later timers", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runtime.evaluate(
+        `
+          const thrown = new Error("timer callback failure");
+          const reports = [];
+          let laterTimerRan = false;
+          window.addEventListener("error", (event) => reports.push(
+            event.type === "error" && event.cancelable && event.error === thrown &&
+            event.filename === "https://allowed.test/page" && event.target === window &&
+            event instanceof ErrorEvent && Object.getPrototypeOf(event) === ErrorEvent.prototype &&
+            event.constructor.constructor("return typeof process")() === "undefined"
+          ));
+          await new Promise((resolve) => setTimeout(() => {
+            setTimeout(() => { laterTimerRan = true; resolve(); }, 0);
+            throw thrown;
+          }, 0));
+          return ["normal result", reports.length, reports[0], laterTimerRan].join("|");
+        `,
+        { url: "https://allowed.test/page", cookie: "", userAgent: "fixture" },
+      );
+      expect(result.value).toBe("normal result|1|true|true");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.live("does not recurse when a window error listener throws", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runtime.evaluate(`
+        let errorReports = 0;
+        let nextListenerCalls = 0;
+        window.addEventListener("error", () => {
+          errorReports += 1;
+          throw new Error("error listener failure");
+        });
+        window.addEventListener("error", () => nextListenerCalls += 1);
+        setTimeout(() => { throw new Error("timer failure"); }, 0);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return [errorReports, nextListenerCalls, "evaluation continued"].join("|");
+      `);
+      expect(result.value).toBe("1|1|evaluation continued");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.live("applies legacy window.onerror arguments to async exceptions", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runtime.evaluate(
+        `
+          const thrown = new Error("legacy timer failure");
+          let reportCount = 0;
+          let event;
+          let args;
+          let receiver;
+          window.addEventListener("error", (reported) => { reportCount += 1; event = reported; });
+          window.onerror = function(...values) { args = values; receiver = this; return true; };
+          setTimeout(() => { throw thrown; }, 0);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return [
+            reportCount === 1, args.length === 5, receiver === window,
+            args[0] === event.message, args[1] === "https://allowed.test/page",
+            args[2] === 0, args[3] === 0, args[4] === thrown, event.defaultPrevented,
+          ].join("|");
+        `,
+        { url: "https://allowed.test/page", cookie: "", userAgent: "fixture" },
+      );
+      expect(result.value).toBe("true|true|true|true|true|true|true|true|true");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.effect("reports throwing XHR and FileReader handlers", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const result = yield* runtime.evaluate(
+        `
+          const xhrThrown = new Error("XHR handler failure");
+          const readerThrown = new Error("FileReader handler failure");
+          const reports = [];
+          let xhrFinished = false;
+          let readerFinished = false;
+          window.addEventListener("error", (event) => reports.push(
+            event.filename === document.location.href && event.target === window &&
+            (event.error === xhrThrown || event.error === readerThrown)
+          ));
+          const xhr = new XMLHttpRequest();
+          const xhrDone = new Promise((resolve) => {
+            xhr.onload = () => { throw xhrThrown; };
+            xhr.onloadend = () => { xhrFinished = true; resolve(); };
+          });
+          xhr.open("GET", "/xhr");
+          xhr.send();
+          await xhrDone;
+          const reader = new FileReader();
+          const readerDone = new Promise((resolve) => {
+            reader.onload = () => { throw readerThrown; };
+            reader.onloadend = () => { readerFinished = true; resolve(); };
+          });
+          reader.readAsText(new Blob(["fixture"]));
+          await readerDone;
+          return [reports.length, reports.every(Boolean), xhrFinished, readerFinished, "continued"].join("|");
+        `,
+        { url: "https://allowed.test/page", cookie: "", userAgent: "fixture" },
+        {
+          request: (input) =>
+            Effect.succeed({
+              status: 200,
+              url: input.url,
+              headers: [],
+              cookie: "",
+              body: "fixture response",
+            }),
+          setCookie: () => Effect.succeed(""),
+        },
+      );
+      expect(result.value).toBe("2|true|true|true|continued");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.live("keeps host timer-fire quota failures fatal", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const error = yield* Effect.flip(
+        runtime.evaluate(`
+          setInterval(() => {}, 0);
+          await new Promise(() => {});
+        `),
+      );
+      expect(error).toBeInstanceOf(BrowserScriptError);
+      expect(error.reason).toBe("script timer budget exceeds 256 fires");
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ timeoutMs: 10_000 }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
       ),
     ),
   );
@@ -3445,28 +3607,40 @@ describe("browser layer", () => {
       }),
     );
 
-    it.effect("surfaces throwing external-script load callbacks", () =>
-      Effect.gen(function* () {
-        const runtime = yield* BrowserMock;
-        const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
-        const error = yield* Effect.flip(
-          runtime.evaluate(
+    it.effect(
+      "reports throwing external-script load callbacks and continues",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+          const result = yield* runtime.evaluate(
             `
-              let callbackCalls = 0;
-              const script = document.createElement("script");
-              script.src = "/callback.js";
-              const loaded = new Promise((resolve) => {
-                script.onload = () => {
-                  const sourceExecuted = globalThis.externalScriptExecuted === true;
-                  callbackCalls += 1;
-                  resolve("source-executed=" + sourceExecuted + ";calls=" + callbackCalls);
-                  throw new Error("synthetic onload callback failure:" + sourceExecuted + ":" + callbackCalls);
-                };
-              });
-              document.head.appendChild(script);
-              await loaded;
-              return "unexpected quiet success";
-            `,
+            let callbackCalls = 0;
+            let thrown;
+            const reports = [];
+            window.addEventListener("error", (event) => reports.push(event));
+            window.onerror = () => true;
+            const script = document.createElement("script");
+            script.src = "/callback.js";
+            const loaded = new Promise((resolve) => {
+              script.onload = () => {
+                const sourceExecuted = globalThis.externalScriptExecuted === true;
+                callbackCalls += 1;
+                thrown = new Error("synthetic onload callback failure:" + sourceExecuted + ":" + callbackCalls);
+                resolve();
+                throw thrown;
+              };
+            });
+            document.head.appendChild(script);
+            await loaded;
+            const reported = reports[0];
+            return [
+              "normal result", callbackCalls, globalThis.externalScriptExecuted === true,
+              reports.length, reported.error === thrown, reported.message === thrown.message,
+              reported.filename === document.location.href, reported.cancelable,
+              reported.defaultPrevented,
+            ].join("|");
+          `,
             {
               url: "https://allowed.test/page",
               cookie: "",
@@ -3486,16 +3660,14 @@ describe("browser layer", () => {
                 }),
               setCookie: () => Effect.succeed(""),
             },
-          ),
-        );
-        expect(error).toBeInstanceOf(BrowserScriptError);
-        expect(error.reason).toContain(
-          "synthetic onload callback failure:true:1",
-        );
-        expect(requests.map(({ url }) => url)).toEqual([
-          "https://allowed.test/callback.js",
-        ]);
-      }),
+          );
+          expect(result.value).toBe(
+            "normal result|1|true|1|true|true|true|true|true",
+          );
+          expect(requests.map(({ url }) => url)).toEqual([
+            "https://allowed.test/callback.js",
+          ]);
+        }),
     );
 
     it.effect(
