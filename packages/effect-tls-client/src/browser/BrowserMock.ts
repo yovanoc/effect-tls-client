@@ -20,6 +20,7 @@ import {
   type BrowserScriptRuntime,
 } from "./BrowserScript.js";
 import { makeBrowserScriptRunnerSource } from "./BrowserScriptRunner.js";
+import { parseHtmlSnapshot } from "./HtmlSnapshot.js";
 import {
   normalizeAllowedOrigins,
   resolveAllowedUrl,
@@ -56,6 +57,41 @@ const timeoutError = () =>
     reason: "script evaluation timed out and the process was terminated",
   });
 
+const DocumentSnapshot = Schema.Struct({
+  nodes: Schema.Array(
+    Schema.Struct({
+      tag: Schema.String,
+      parent: Schema.Int,
+      attributes: Schema.Array(
+        Schema.Tuple([
+          Schema.String,
+          Schema.String.check(Schema.isMaxLength(8192)),
+        ]),
+      ),
+      textContent: Schema.String,
+    }),
+  ).check(Schema.isMaxLength(32)),
+  textContent: Schema.String,
+}).check(
+  Schema.makeFilter(
+    (snapshot) =>
+      (snapshot.nodes.every(
+        (node, index) => node.parent >= -1 && node.parent < index,
+      ) &&
+        snapshot.nodes.reduce(
+          (bytes, node) =>
+            bytes +
+            node.attributes.reduce(
+              (total, [name, value]) =>
+                total + lineBytes(name) + lineBytes(value),
+              0,
+            ),
+          0,
+        ) <= 16384) ||
+      "invalid document snapshot budgets or parents",
+  ),
+);
+
 const RunnerStart = Schema.Struct({
   type: Schema.Literal("start"),
   timeoutMs: TimeoutMs,
@@ -67,6 +103,7 @@ const RunnerStart = Schema.Struct({
   languages: BrowserScriptContext.fields.languages,
   referrer: Schema.String,
   authoritativeCookies: Schema.Boolean,
+  documentSnapshot: Schema.optionalKey(DocumentSnapshot),
 });
 const RunnerOutput = Schema.Union([
   Schema.Struct({
@@ -216,6 +253,36 @@ const makeEvaluate = (
     },
     host?: BrowserScriptHost,
   ): Effect.fn.Return<BrowserScriptResult, BrowserScriptError> {
+    context = yield* Schema.decodeEffect(BrowserScriptContext)(context).pipe(
+      Effect.mapError(
+        (cause) =>
+          new BrowserScriptError({
+            reason: "invalid browser script context",
+            cause,
+          }),
+      ),
+    );
+    let documentSnapshot:
+      | Schema.Schema.Type<typeof DocumentSnapshot>
+      | undefined;
+    if (context.html !== undefined) {
+      const parsed = parseHtmlSnapshot(context.html);
+      if (parsed._tag !== "Success") {
+        return yield* new BrowserScriptError({
+          reason:
+            parsed._tag === "Unsupported"
+              ? "unsupported HTML body-fragment snapshot"
+              : "HTML snapshot exceeds " + parsed.limit + " limit",
+        });
+      }
+      documentSnapshot = yield* Schema.decodeEffect(DocumentSnapshot)(
+        parsed.snapshot,
+      ).pipe(
+        Effect.mapError(
+          () => new BrowserScriptError({ reason: "invalid document snapshot" }),
+        ),
+      );
+    }
     if (
       source.length > MAX_SOURCE_BYTES ||
       new TextEncoder().encode(source).byteLength > MAX_SOURCE_BYTES
@@ -254,6 +321,7 @@ const makeEvaluate = (
         : { languages: context.languages }),
       referrer: context.referrer ?? "",
       authoritativeCookies: host !== undefined,
+      ...(documentSnapshot === undefined ? {} : { documentSnapshot }),
     }).pipe(
       Effect.mapError(
         (cause) =>

@@ -28,6 +28,8 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const hostCryptoOperation = __cryptoOperation;
   delete globalThis.__cryptoOperation;
   const jsonParse = JSON.parse;
+  const documentSnapshot = jsonParse(__documentSnapshot);
+  delete globalThis.__documentSnapshot;
   const jsonStringify = JSON.stringify;
   const pageLocationData = jsonParse(__pageLocation);
   delete globalThis.__pageLocation;
@@ -1579,12 +1581,41 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const MAX_SCRIPT_NODES = 32;
   const MAX_SCRIPT_ATTRIBUTE_BYTES = 16 * 1024;
   const scriptNodes = new WeakMap();
+  const snapshotRecords = new WeakMap();
+  const readonlySnapshot = () => { throw new NativeTypeError("document snapshot is read-only"); };
+  const immutableSnapshotArray = (values) => new Proxy(objectFreeze(values), {
+    set: readonlySnapshot, defineProperty: readonlySnapshot, deleteProperty: readonlySnapshot,
+    setPrototypeOf: readonlySnapshot, preventExtensions: readonlySnapshot,
+  });
+  const snapshotNodes = (documentSnapshot?.nodes ?? []).map((record) => {
+    const attributes = new Map(record.attributes);
+    const node = objectCreate(null);
+    objectDefineProperties(node, {
+      tagName: { value: record.tag.toUpperCase(), enumerable: true },
+      nodeName: { value: record.tag.toUpperCase(), enumerable: true },
+      id: { value: attributes.get("id") ?? "", enumerable: true },
+      className: { value: attributes.get("class") ?? "", enumerable: true },
+      textContent: { value: record.textContent, enumerable: true },
+      attributes: { value: immutableSnapshotArray(record.attributes.map((pair) => immutableSnapshotArray(pair))), enumerable: true },
+      getAttribute: { value: (name) => attributes.get(NativeString(name).toLowerCase()) ?? null },
+      hasAttribute: { value: (name) => attributes.has(NativeString(name).toLowerCase()) },
+      setAttribute: { value: readonlySnapshot }, removeAttribute: { value: readonlySnapshot },
+      appendChild: { value: readonlySnapshot },
+    });
+    const immutable = new Proxy(objectFreeze(node), {
+      set: readonlySnapshot, defineProperty: readonlySnapshot, deleteProperty: readonlySnapshot,
+      setPrototypeOf: readonlySnapshot, preventExtensions: readonlySnapshot,
+    });
+    snapshotRecords.set(immutable, { attributes });
+    return immutable;
+  });
   const headNodes = [];
   const bodyNodes = [];
   let scriptNodeCount = 0;
   let scriptAttributeBytes = 0;
   const scriptAttributeNames = ["src", "type", "integrity", "crossorigin", "async", "defer", "nomodule", "id", "nonce"];
   const appendScript = (element, attached) => {
+    if (snapshotRecords.has(element)) return readonlySnapshot();
     const frameState = frameNodes.get(element);
     if (frameState !== undefined) return appendFrame(element, frameState, attached);
     const state = scriptNodes.get(element);
@@ -1734,17 +1765,19 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   };
   objectDefineProperties(document, {
     head: { value: objectFreeze({ appendChild: (element) => appendScript(element, headNodes) }), enumerable: true },
-    body: { value: objectFreeze({ appendChild: (element) => appendScript(element, bodyNodes) }), enumerable: true },
+    body: { value: objectFreeze({ appendChild: (element) => appendScript(element, bodyNodes), ...(documentSnapshot === null ? {} : { textContent: documentSnapshot.textContent }) }), enumerable: true },
   });
-  // Cached per realm; no HTML seeds, snapshots, cross-frame nodes, or extra node budget.
+  // Actual realm records only: head append order, fragment preorder, body append order.
+  const documentNodes = () => [...headNodes, ...snapshotNodes, ...bodyNodes];
   const tagCollections = objectCreate(null);
-  const attachedScripts = () => [...headNodes, ...bodyNodes].filter((node) => scriptNodes.has(node));
-  for (const tag of ["head", "body", "script"]) {
-    const length = () => tag === "script" ? attachedScripts().length : 1;
+  const tags = new Set(["head", "body", "script", ...(documentSnapshot?.nodes ?? []).map((record) => record.tag)]);
+  for (const tag of tags) {
+    const matching = () => documentNodes().filter((node) => node.tagName.toLowerCase() === tag);
+    const length = () => tag === "head" || tag === "body" ? 1 : matching().length;
     const at = (index) => {
       if (index >= length()) return undefined;
-      if (tag !== "script") return tag === "head" ? document.head : document.body;
-      return attachedScripts()[index];
+      if (tag === "head" || tag === "body") return tag === "head" ? document.head : document.body;
+      return matching()[index];
     };
     const readonly = () => { throw new NativeTypeError("modeled element collection is read-only"); };
     const collection = objectCreate(null);
@@ -1774,11 +1807,26 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     const text = NativeString(id);
     if (text === "") return null;
     // Bounded tree scan: actual records only, never guest-replaced getters or child globals.
-    for (const nodes of [headNodes, bodyNodes]) {
-      for (const node of nodes) {
-        const state = scriptNodes.get(node) ?? frameNodes.get(node);
-        if (state.attributes.get("id") === text) return node;
-      }
+    for (const node of documentNodes()) {
+      const state = snapshotRecords.get(node) ?? scriptNodes.get(node) ?? frameNodes.get(node);
+      if (state.attributes.get("id") === text) return node;
+    }
+    return null;
+  };
+  document.querySelector = (input) => {
+    if (typeof input === "symbol") throw new NativeTypeError("unsupported selector syntax");
+    const selector = NativeString(input);
+    // Deliberately no CSS escapes, combinators, attributes, pseudo-classes or lists.
+    if (!/^(?:[A-Za-z][A-Za-z0-9-]*)?(?:[#.][A-Za-z_][A-Za-z0-9_-]*)*$/.test(selector) || selector === "") throw new NativeTypeError("unsupported selector syntax");
+    const tag = /^[A-Za-z][A-Za-z0-9-]*/.exec(selector)?.[0].toLowerCase();
+    const parts = selector.match(/[#.][A-Za-z_][A-Za-z0-9_-]*/g) ?? [];
+    if (parts.filter((part) => part[0] === "#").length > 1) throw new NativeTypeError("unsupported selector syntax");
+    if ((tag === "head" || tag === "body") && parts.length === 0) return document[tag];
+    for (const node of documentNodes()) {
+      if (tag !== undefined && node.tagName.toLowerCase() !== tag) continue;
+      const state = snapshotRecords.get(node) ?? scriptNodes.get(node) ?? frameNodes.get(node);
+      const classes = (state.attributes.get("class") ?? "").split(/[\t\n\f\r ]+/);
+      if (parts.every((part) => part[0] === "#" ? state.attributes.get("id") === part.slice(1) : classes.includes(part.slice(1)))) return node;
     }
     return null;
   };
@@ -2080,7 +2128,7 @@ const post = (line, owner = context) => {
 const bootstrap = ${JSON.stringify(bootstrap)};
 // Node 25 can retain VM-created globals after deletion through the host sandbox.
 // These fixed kernel sources run before any guest code and verify realm-local removal.
-const cleanupPrivateBindings = "{ for (const key of ['__scriptErrorReporter', '__receive', '__post', '__childRealm', '__consumeBudget', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupPrivateBindings = "{ for (const key of ['__scriptErrorReporter', '__receive', '__post', '__childRealm', '__consumeBudget', '__documentSnapshot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const handleParentLine = (line) => {
   try {
@@ -2182,6 +2230,7 @@ const createRealm = (input, childRealm) => {
   const sandbox = Object.assign(Object.create(null), {
     __post: (line) => post(line, realm),
     __childRealm: childRealm,
+    __documentSnapshot: JSON.stringify(childRealm ? null : input.documentSnapshot ?? null),
     __consumeBudget: consumeBudget,
     __urlOperation: hostUrlOperation,
     __pageUrl: String(input.url),
@@ -2209,6 +2258,19 @@ const createRealm = (input, childRealm) => {
 };
 const start = (input) => {
   if (!Number.isInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > ${limits.maxTimeoutMs}) throw new Error("invalid script evaluation timeout");
+  const snapshot = input.documentSnapshot;
+  if (snapshot !== undefined) {
+    if (!snapshot || !Array.isArray(snapshot.nodes) || typeof snapshot.textContent !== "string" || snapshot.nodes.length > 32) throw new Error("invalid document snapshot");
+    let bytes = 0;
+    for (const [index, node] of snapshot.nodes.entries()) {
+      if (!node || typeof node.tag !== "string" || !/^[a-z]+$/.test(node.tag) || !Number.isInteger(node.parent) || node.parent < -1 || node.parent >= index || typeof node.textContent !== "string" || !Array.isArray(node.attributes)) throw new Error("invalid document snapshot record");
+      for (const pair of node.attributes) {
+        if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string" || typeof pair[1] !== "string" || pair[1].length > 8192) throw new Error("invalid document snapshot attribute");
+        bytes += Buffer.byteLength(pair[0]) + Buffer.byteLength(pair[1]);
+      }
+    }
+    if (!consumeBudget("node", snapshot.nodes.length) || !consumeBudget("attribute", bytes)) throw new Error("document snapshot budget exceeded");
+  }
   rootInput = input; deadline = hostMonotonicNow() + input.timeoutMs;
   setTimeout(() => writeFinal({ ok: false, reason: "script evaluation timed out" }), Math.max(1, Math.ceil(deadline - hostMonotonicNow())));
   context = createRealm(input, false);

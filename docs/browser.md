@@ -299,7 +299,7 @@ WebSocket, or general DOM APIs. Network operations
 are serialized to the host and made through the same scoped `TlsSession`; Go
 remains authoritative for cookies.
 
-The only DOM-like script support is VM-local external asynchronous classic
+The only executable DOM-like script support is VM-local external asynchronous classic
 `<script>` elements: `document.createElement("script")`, plus
 `document.head.appendChild` and `document.body.appendChild`. Appending returns
 the same element and starts that element at most once. Resource failures (including
@@ -330,10 +330,70 @@ and reject. `document.createElement` also accepts `"iframe"` as described
 below; other elements (including `div` and `canvas`) remain unsupported. This
 is not a general DOM or renderer and adds no `postMessage` API.
 
+### Explicit body-fragment snapshot (experimental)
+
+Low-level callers may explicitly pass `html?: string` in `BrowserScriptContext`:
+
+```ts
+const source = 'return document.querySelector("div#notice.note").textContent;';
+const context = {
+  url: "https://example.com/",
+  cookie: "",
+  userAgent: "fixture",
+  html: '<div id="notice" class="note">Local &amp; explicit</div>',
+};
+const evaluation = runtime.evaluate(source, context);
+```
+
+This is a **complete supplied body fragment**, not an actual full reviewed page,
+HTML excerpt selection, full-document parsing, renderer, or provider proof.
+There is no automatic navigation/challenge body plumbing or Browser option.
+The caller supplies it deliberately; use is explicit and nonautomated.
+
+The host parses the strict `HtmlSnapshot` subset before spawning. Supported ordinary
+tags are a, address, article, aside, b, blockquote, code, div, em, footer, header,
+i, main, p, section, small, span, strong, sub, sup, u; standard void tags except
+col are accepted. Script/style contain inert raw text. Simple comments, properly
+nested explicit closing tags, quoted/unquoted/boolean attributes, amp/apos/gt/lt/quot
+and valid numeric references are supported. Full documents, doctype, document repair,
+unsupported tags/references and script escape syntax reject the whole fragment.
+Unsupported syntax and limits become finite `BrowserScriptError` reasons, without
+embedding HTML. Raw HTML is not sent over IPC, fetched, or persisted by BrowserMock;
+only Schema-validated parsed records and complete textContent cross the boundary.
+
+Limits stay at 128 KiB UTF-8 input, 32 combined snapshot/script/frame elements,
+16 KiB cumulative UTF-8 attribute-name/value bytes, and 8,192 characters per value.
+The **actual serialized startup line including its newline** must fit 128 KiB.
+Repeated ancestor textContent and JSON escaping can exceed that limit even for a
+valid small fragment: fail before spawn, never trim text or raise quotas.
+Snapshot quotas are charged before guest execution and never refunded; all other
+source/network/timer/frame/deadline budgets remain unchanged.
+
+Each parsed element has one stable immutable realm-local object with actual
+uppercase `tagName`/`nodeName`, readonly attribute pairs, `id`, `className`, complete
+`textContent`, `getAttribute` and `hasAttribute` (ASCII-case-insensitive names).
+`document.body.textContent` is the complete supplied fragment text. Missing IDs
+are not fabricated. Mutations or appending snapshot elements reject, including
+parsed scripts: parsing never evaluates, fetches, writes cookies, triggers
+lifecycle events, or requests frames. Only the root gets these records; reviewed
+child frames see no parent snapshot or private data helpers.
+
+`document.querySelector` accepts **one compound selector**: optional ASCII tag
+plus at most one `#id` and zero or more `.classes`. Tag grammar is
+`[A-Za-z][A-Za-z0-9-]*`; ID/class tokens use `[A-Za-z_][A-Za-z0-9_-]*`.
+No whitespace, escapes, Unicode tokens, wildcards, combinators, attribute selectors,
+pseudo-classes or lists: unsupported syntax throws a realm-local TypeError, not
+`null`. Supported selectors return the first actual attached record in the modeled
+order or `null`; tag-only head/body selectors return the existing append targets.
+IDs/classes are case-sensitive under this fixed standards-style fragment model;
+no original-page quirks mode or full-page first-match guarantee is claimed.
+There is no `querySelectorAll`, generic element creation, layout, rendering,
+native-browser fingerprinting or provider-selector support.
+
 ### Experimental modeled element lookup
 
-`document.getElementsByTagName` supports only `"head"`, `"body"`, and `"script"`
-(ASCII case-insensitive, without trimming). Each realm caches three VM-local,
+Without a snapshot, `document.getElementsByTagName` supports only `"head"`, `"body"`, and `"script"`
+(ASCII case-insensitive, without trimming). A snapshot additionally enables its actual tag names. Each realm caches VM-local,
 read-only live collections: numeric access, `in` for currently present canonical
 numeric indices and actual collection properties, `length`, `item(index)`
 (unsigned 32-bit index coercion, `null` out of range), and iteration. Numeric
@@ -346,23 +406,23 @@ property definition, preventing extensions, and prototype replacement reject.
 Head/body lookup returns the actual frozen append targets, which cannot be
 replaced. Script lookup includes only successfully appended modeled script
 nodes, including nodes whose subsequent load fails, not merely created nodes.
-Order is head before body, with append order within each target. Duplicate
+Order is head append order, supplied fragment preorder, then body append order. Duplicate
 append is a no-op, even to the other target: reparenting and removal are not
 modeled; no `parentNode` or `insertBefore` is supplied. Lookup itself performs
 no network request or execution and does not increase any quota.
 
 `document.getElementById(id)` performs a read-only scan of actual attached
-modeled script and iframe records, returning the same node object or `null`.
+snapshot, modeled script and iframe records, returning the same node object or `null`.
 IDs are exact and case-sensitive; an empty or missing ID matches no node. The
 argument uses DOMString coercion (omitting it or passing a Symbol rejects).
-Lookup follows head-before-body order and append order within each target,
+Lookup follows head append order, fragment preorder, then body append order,
 including mixed scripts/frames; duplicate appends neither duplicate nor move
 nodes. Attribute changes are read live: script `id`/`setAttribute`/`removeAttribute`
 and iframe `id`/`setAttribute` retain the existing cumulative UTF-8 attribute
 budget. Frame IDs can change after append, but frame navigation still rejects.
 The frozen head/body targets have no modeled ID attributes and cannot match.
 Created but unattached nodes and all nodes in other realms are excluded. No
-registry, page HTML seeds, fabricated missing elements, or renderer is provided;
+registry, automatically acquired page HTML, fabricated missing elements, or renderer is provided;
 lookup adds no network, execution, cookie, or frame authority in either async
 or classic evaluation. A missing original-page element honestly returns `null`,
 not provider acquisition, Device Check compatibility, or clearance evidence.

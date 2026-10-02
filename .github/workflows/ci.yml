@@ -48,6 +48,7 @@ jobs:
           node node_modules/vitest/vitest.mjs run
           tests/browser.test.ts tests/browser.integration.test.ts
           tests/browser-frame-runtime.test.ts
+          tests/browser-document-snapshot.test.ts
 
       - name: Run Bun checks in parallel
         env:
@@ -70,6 +71,7 @@ jobs:
           --exclude tests/browser.test.ts
           --exclude tests/browser.integration.test.ts
           --exclude tests/browser-frame-runtime.test.ts
+          --exclude tests/browser-document-snapshot.test.ts
 
       - name: Run shared lint diagnostics
         run: |

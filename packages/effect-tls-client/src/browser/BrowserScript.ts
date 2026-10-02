@@ -21,6 +21,8 @@ export const BrowserScriptContext = Schema.Struct({
     Schema.Array(Schema.String).check(Schema.isMaxLength(16)),
   ),
   referrer: Schema.optionalKey(Schema.String),
+  /** Explicit complete strict body fragment; BrowserMock validates it before spawn. */
+  html: Schema.optionalKey(Schema.String),
 });
 export interface BrowserScriptContext extends Schema.Schema.Type<
   typeof BrowserScriptContext
