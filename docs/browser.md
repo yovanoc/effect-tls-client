@@ -201,9 +201,29 @@ invalid `Accept-Language` yields `language: ""` and `languages: []`; a
 standalone `BrowserMock` evaluation with omitted `languages` instead defaults
 to `en-US`. It does not synthesize platform or hardware properties. The VM also
 exposes a small `console` and a context-local
-`performance` with only
-monotonic `now()` and numeric `timeOrigin` backed by the runner's real monotonic
-clock. It exposes context-local `URL` and `URLSearchParams` backed by a private,
+`performance` with monotonic `now()` and numeric `timeOrigin` backed by the
+runner's real monotonic clock. `getEntries()`, `getEntriesByType(type)`, and
+`getEntriesByName(name, type?)` return fresh realm-local empty arrays: no
+navigation, resource, mark, measure, or other entries are recorded or fabricated.
+The required type/name arguments and DOMString conversions are validated.
+Context-local `PerformanceObserver` validates a callable constructor callback
+and converts the `observe()` dictionary before checking options. `entryTypes`
+accepts iterable objects (including empty sequences); unsupported types are
+ignored. It cannot be combined with `type` or `buffered`, even `buffered: false`.
+An observer cannot switch between `entryTypes` and `type`, even after
+`disconnect()` (a realm-local Error named `InvalidModificationError` is thrown;
+a full DOMException interface is not supplied). `supportedEntryTypes` is the
+same frozen empty realm-local array on each read; observers never call callbacks,
+and `takeRecords()` returns a fresh empty realm-local array. These APIs are an
+unrecorded timeline subset, not Resource Timing or acquisition evidence.
+`document.readyState` is read-only and statically `"complete"` as a model
+convention, not proof that the actual reviewed page's lifecycle completed.
+Challenge response HTML is not passed into the realm: head/body are synthetic
+append targets containing only explicitly created and appended modeled nodes.
+No HTML parsing, loading/interactive transitions, lifecycle simulation,
+`readystatechange`, `DOMContentLoaded`, or document/window lifecycle `load`
+events are generated. Modeled element load events remain separate.
+It exposes context-local `URL` and `URLSearchParams` backed by a private,
 string-only Node URL parser closure. URL parsing accepts bounded strings and an
 optional base, and provides `href`, `origin`, `protocol`, `host`, `hostname`,
 `port`, `pathname`, `search`, `hash`, and `toString()`. `URLSearchParams`

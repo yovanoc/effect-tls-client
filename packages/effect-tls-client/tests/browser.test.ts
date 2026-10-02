@@ -2654,10 +2654,12 @@ describe("browser layer", () => {
     ),
   );
 
-  it.live("exposes context-local monotonic performance timing", () =>
-    Effect.gen(function* () {
-      const runtime = yield* BrowserMock;
-      const timing = yield* runtime.evaluate(`
+  it.live(
+    "exposes performance timing, empty entry lists, PerformanceObserver, and readyState",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const timing = yield* runtime.evaluate(`
         const before = performance.now();
         await new Promise((resolve) => setTimeout(resolve, 5));
         const after = performance.now();
@@ -2670,20 +2672,161 @@ describe("browser layer", () => {
           performance.timeOrigin > 0,
           Object.getPrototypeOf(performance) === Object.prototype,
           Object.getPrototypeOf(performance.now) === Function.prototype,
+          Array.isArray(performance.getEntries()) && performance.getEntries().length === 0,
+          Array.isArray(performance.getEntriesByType("resource")) && performance.getEntriesByType("resource").length === 0,
+          Array.isArray(performance.getEntriesByName("x", "mark")) && performance.getEntriesByName("x").length === 0,
+          performance.getEntries() !== performance.getEntries(),
+          document.readyState === "complete",
+          typeof PerformanceObserver === "function" && PerformanceObserver === window.PerformanceObserver,
+          Array.isArray(PerformanceObserver.supportedEntryTypes) && PerformanceObserver.supportedEntryTypes.length === 0,
+          (() => { const o = new PerformanceObserver(() => {}); o.observe({ entryTypes: ["resource"] }); new PerformanceObserver(() => {}).observe({ type: "mark" }); o.disconnect(); return Array.isArray(o.takeRecords()) && o.takeRecords().length === 0; })(),
+          (() => { try { new PerformanceObserver(1); return false; } catch (e) { return e instanceof TypeError; } })(),
+          (() => { try { new PerformanceObserver(() => {}).observe({}); return false; } catch (e) { return e instanceof TypeError; } })(),
+          PerformanceObserver.constructor("return typeof process")() === "undefined",
         ].join("|");
       `);
-      expect(timing.value).toBe("number|true|true|number|true|true|true|true");
+        expect(timing.value).toBe(
+          "number|true|true|number|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true",
+        );
 
-      const hostEscape = yield* Effect.flip(
-        runtime.evaluate(
-          'return performance.now.constructor("return process")().version;',
+        const hostEscape = yield* Effect.flip(
+          runtime.evaluate(
+            'return performance.now.constructor("return process")().version;',
+          ),
+        );
+        expect(hostEscape.reason).toContain("process is not defined");
+        expect(hostEscape.reason).not.toContain(process.version);
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
         ),
+      ),
+  );
+
+  it.live.each([
+    {
+      name: "timeline arguments and realm-local lists",
+      source: `
+        const failures = [];
+        const check = (name, value) => { if (!value) failures.push(name); };
+        const throwsType = (run) => { try { run(); return false; } catch (e) { return e instanceof TypeError; } };
+        check("missing type", throwsType(() => performance.getEntriesByType()));
+        check("missing name", throwsType(() => performance.getEntriesByName()));
+        check("symbol type", throwsType(() => performance.getEntriesByType(Symbol())));
+        check("symbol name", throwsType(() => performance.getEntriesByName(Symbol())));
+        check("symbol optional type", throwsType(() => performance.getEntriesByName("x", Symbol())));
+        check("symbol primitive", throwsType(() => performance.getEntriesByName({ [Symbol.toPrimitive]() { return Symbol(); } })));
+        const order = [];
+        performance.getEntriesByName({ toString() { order.push("name"); return "x"; } }, { toString() { order.push("type"); return "mark"; } });
+        check("name before type", order.join() === "name,type");
+        check("stop on name failure", throwsType(() => performance.getEntriesByName(Symbol(), { toString() { order.push("unexpected"); return "mark"; } })) && order.join() === "name,type");
+        performance.getEntriesByType(undefined);
+        performance.getEntriesByName(undefined, undefined);
+        for (const entries of [() => performance.getEntries(), () => performance.getEntriesByType("resource"), () => performance.getEntriesByName("x")]) {
+          const first = entries(); first.push("local mutation");
+          const next = entries();
+          check("fresh local arrays", Object.getPrototypeOf(next) === Array.prototype && next.length === 0 && next !== first);
+        }
+        return JSON.stringify(failures);
+      `,
+    },
+    {
+      name: "observer dictionary conversion and invalid combinations",
+      source: `
+        const failures = [];
+        const check = (name, value) => { if (!value) failures.push(name); };
+        const throwsType = (options) => { try { new PerformanceObserver(() => {}).observe(options); return false; } catch (e) { return e instanceof TypeError; } };
+        for (const options of [undefined, null, {}, 1, "x", Symbol(), { entryTypes: null }, { entryTypes: "resource" }, { entryTypes: {} }, { entryTypes: [Symbol()] }, { type: Symbol() }, { entryTypes: [], type: "mark" }, { entryTypes: [], buffered: false }]) {
+          check("invalid options", throwsType(options));
+        }
+        const order = [];
+        new PerformanceObserver(() => {}).observe({
+          get type() { order.push("type"); return { toString() { order.push("type conversion"); return "unsupported"; } }; },
+          get entryTypes() { order.push("entryTypes"); return undefined; },
+          get buffered() { order.push("buffered"); return { valueOf() { throw new Error("boolean must not coerce object"); } }; },
+        });
+        check("dictionary order/read once", order.join() === "buffered,entryTypes,type,type conversion");
+        const sentinel = {};
+        try { new PerformanceObserver(() => {}).observe({ entryTypes: [], get type() { throw sentinel; } }); check("conversion before validation", false); } catch (e) { check("conversion before validation", e === sentinel); }
+        const sequenceOrder = [];
+        const iterable = { *[Symbol.iterator]() { sequenceOrder.push("iterate"); yield { toString() { sequenceOrder.push("element"); return "resource"; } }; sequenceOrder.push("done"); } };
+        new PerformanceObserver(() => {}).observe({ entryTypes: iterable, get type() { sequenceOrder.push("type"); return undefined; } });
+        check("sequence before next member", sequenceOrder.join() === "iterate,element,done,type");
+        let closed = false;
+        check("sequence symbol rejects", throwsType({ entryTypes: { *[Symbol.iterator]() { try { yield Symbol(); } finally { closed = true; } } } }));
+        check("sequence conversion does not close iterator", !closed);
+        return JSON.stringify(failures);
+      `,
+    },
+    {
+      name: "observer unsupported types, persistent mode, and private callback",
+      source: `
+        const failures = [];
+        const check = (name, value) => { if (!value) failures.push(name); };
+        let callbacks = 0;
+        for (const options of [{ entryTypes: [] }, { entryTypes: new Set(["resource"]) }, { entryTypes: (function* () { yield "unsupported"; })() }, { entryTypes: [], buffered: undefined, type: undefined, ignored: true }, { type: "unsupported", buffered: true }, Object.assign(() => {}, { type: "mark" })]) {
+          const observer = new PerformanceObserver(() => { callbacks++; });
+          observer.observe(options); observer.disconnect();
+          const first = observer.takeRecords(); first.push("mutation");
+          check("fresh local records", observer.takeRecords().length === 0 && Object.getPrototypeOf(first) === Array.prototype);
+          check("no callback exposure", Reflect.ownKeys(observer).length === 0 && observer._callback === undefined);
+        }
+        for (const [first, second] of [[{ entryTypes: [] }, { type: "resource" }], [{ type: "unsupported" }, { entryTypes: [] }]]) {
+          const observer = new PerformanceObserver(() => {});
+          observer.observe(first); observer.disconnect(); observer.observe(first);
+          try { observer.observe(second); check("mode change rejects", false); } catch (e) { check("mode change rejects", e instanceof Error && e.name === "InvalidModificationError"); }
+        }
+        const observer = new PerformanceObserver(() => {});
+        try { observer.observe({ entryTypes: [], type: "mark" }); } catch {}
+        observer.observe({ type: "unsupported" });
+        await Promise.resolve();
+        check("no callbacks", callbacks === 0);
+        check("supported types frozen same object", Object.isFrozen(PerformanceObserver.supportedEntryTypes) && Object.getPrototypeOf(PerformanceObserver.supportedEntryTypes) === Array.prototype && PerformanceObserver.supportedEntryTypes === PerformanceObserver.supportedEntryTypes);
+        check("static complete", document.readyState === "complete" && Reflect.set(document, "readyState", "loading") === false);
+        return JSON.stringify(failures);
+      `,
+    },
+  ])(
+    "validates Performance Timeline: $name",
+    ({ source }: { readonly source: string }) =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const result = yield* runtime.evaluate(source);
+        expect(result.value).toBe("[]");
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+        ),
+      ),
+  );
+
+  it.live("times out an infinite PerformanceObserver entryTypes iterator", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const error = yield* Effect.flip(
+        runtime.evaluate(`
+          globalThis.entryTypesTimeoutSentinel = true;
+          new PerformanceObserver(() => {}).observe({
+            entryTypes: {
+              [Symbol.iterator]() {
+                return { next() { return { done: false, value: "resource" }; } };
+              },
+            },
+          });
+        `),
       );
-      expect(hostEscape.reason).toContain("process is not defined");
-      expect(hostEscape.reason).not.toContain(process.version);
+      expect(error).toBeInstanceOf(BrowserScriptError);
+      expect(error.reason).toContain("timed out");
+
+      const next = yield* runtime.evaluate(
+        "return typeof entryTypesTimeoutSentinel;",
+      );
+      expect(next.value).toBe("undefined");
     }).pipe(
       Effect.provide(
-        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+        BrowserMock.layer({ timeoutMs: 100 }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
       ),
     ),
   );

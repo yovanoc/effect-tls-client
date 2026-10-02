@@ -177,9 +177,26 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   };
   // Keep the host clock closure private; only the local wrapper is script-visible.
   const monotonicNow = __performanceNow;
+  const domString = (value) => {
+    if (typeof value === "symbol") throw new NativeTypeError("Cannot convert a Symbol to a DOMString");
+    return NativeString(value);
+  };
+  // Performance Timeline: this runtime records no entries, so the lists are truthfully empty.
   const performance = Object.freeze({
     timeOrigin: Number(__performanceTimeOrigin),
     now: () => monotonicNow(),
+    getEntries: () => [],
+    getEntriesByType(type) {
+      if (arguments.length === 0) throw new NativeTypeError("getEntriesByType requires a type");
+      domString(type);
+      return [];
+    },
+    getEntriesByName(name, type) {
+      if (arguments.length === 0) throw new NativeTypeError("getEntriesByName requires a name");
+      domString(name);
+      if (type !== undefined) domString(type);
+      return [];
+    },
   });
   const initialUrl = String(__pageUrl);
   const initialReferrer = String(__referrer);
@@ -1252,6 +1269,53 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
       });
     }
   }
+  // No entries are recorded: validate options and mode, but never register or call a callback.
+  const supportedPerformanceEntryTypes = objectFreeze([]);
+  const iteratorSymbol = Symbol.iterator;
+  class PerformanceObserver {
+    #observerType;
+    static get supportedEntryTypes() { return supportedPerformanceEntryTypes; }
+    constructor(callback) {
+      if (typeof callback !== "function") throw new NativeTypeError("PerformanceObserver requires a callback function");
+    }
+    observe(options = {}) {
+      if (options != null && typeof options !== "object" && typeof options !== "function") throw new NativeTypeError("PerformanceObserver.observe requires an options dictionary");
+      options = options ?? {};
+      // WebIDL dictionaries read and convert members once, in lexicographic order.
+      // Boolean conversion has no guest hooks; only presence matters in this empty subset.
+      const buffered = options.buffered;
+      const entryTypes = options.entryTypes;
+      if (entryTypes !== undefined) {
+        if (entryTypes === null || (typeof entryTypes !== "object" && typeof entryTypes !== "function")) throw new NativeTypeError("entryTypes requires an iterable object");
+        const method = entryTypes[iteratorSymbol];
+        if (typeof method !== "function") throw new NativeTypeError("entryTypes requires an iterable object");
+        const iterator = apply(method, entryTypes, []);
+        if (iterator === null || (typeof iterator !== "object" && typeof iterator !== "function")) throw new NativeTypeError("Invalid entryTypes iterator");
+        const next = iterator.next;
+        // WebIDL sequence conversion does not IteratorClose on an element conversion failure.
+        while (true) {
+          const step = apply(next, iterator, []);
+          if (step === null || (typeof step !== "object" && typeof step !== "function")) throw new NativeTypeError("Invalid entryTypes iterator result");
+          if (step.done) break;
+          domString(step.value);
+        }
+      }
+      const type = options.type;
+      if (type !== undefined) domString(type);
+      if (entryTypes === undefined && type === undefined) throw new NativeTypeError("PerformanceObserver.observe requires entryTypes or type");
+      if (entryTypes !== undefined && (type !== undefined || buffered !== undefined)) throw new NativeTypeError("entryTypes cannot be combined with type or buffered");
+      const mode = entryTypes === undefined ? "single" : "multiple";
+      if (this.#observerType !== undefined && this.#observerType !== mode) {
+        const error = new NativeError("PerformanceObserver cannot change observation mode");
+        error.name = "InvalidModificationError";
+        throw error;
+      }
+      this.#observerType = mode;
+      // Filtering against the empty supported list always aborts registration.
+    }
+    disconnect() {}
+    takeRecords() { return []; }
+  }
   class ProgressEvent extends Event {
     constructor(type, options = {}) {
       const init = options == null ? {} : options;
@@ -1505,6 +1569,8 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     ? { get: () => location, set: () => { throw new NativeTypeError("frame navigation is unsupported"); }, enumerable: true }
     : { value: location, enumerable: true });
   Object.defineProperty(document, "referrer", { value: initialReferrer, enumerable: true });
+  // The modeled document has no parser; scripts always observe a completed document.
+  Object.defineProperty(document, "readyState", { value: "complete", enumerable: true });
   document.loadScript = (url) => request("script", String(url), "GET", new Headers([["accept", "text/javascript, application/javascript, */*"]]), null).then((value) => {
     if (value.status < 200 || value.status >= 300) throw new TypeError("script load failed with HTTP " + value.status);
     return undefined;
@@ -1719,7 +1785,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: languages[0] ?? "", languages, cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location, navigator, console, performance, crypto, TextEncoder, CryptoKey, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Request, Response, Event, ErrorEvent, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
+  Object.assign(window, { document, location, navigator, console, performance, PerformanceObserver, crypto, TextEncoder, CryptoKey, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Request, Response, Event, ErrorEvent, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
   Object.defineProperty(window, "location", childRealm
     ? { get: () => location, set: unsupportedFrameOperation, enumerable: true, configurable: false }
     : { value: location, enumerable: true, writable: false, configurable: false });
