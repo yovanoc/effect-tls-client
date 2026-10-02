@@ -77,8 +77,7 @@ const cryptoRandomValuesSource = `
       probe();
       return false;
     } catch (error) {
-      return error instanceof EvalError && error.constructor === EvalError &&
-        error.message.includes("Code generation");
+      return error instanceof ReferenceError && error.message === "process is not defined";
     }
   };
   const changed = (array, fill) => {
@@ -1100,6 +1099,119 @@ describe("browser layer", () => {
     });
   });
 
+  it.live(
+    "supports direct eval and Function in classic root and external scripts",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const source = `
+        var rootValue = 3;
+        eval("var evalGlobal = 4; rootValue += evalGlobal;");
+        const generated = Function("return rootValue + evalGlobal")();
+        const script = document.createElement("script"); script.src = "/authored.js";
+        const loaded = new Promise((resolve, reject) => { script.onload = resolve; script.onerror = reject; });
+        document.head.appendChild(script);
+        loaded.then(() => [window.rootValue, window.evalGlobal, generated,
+          window.externalGlobal, window.externalEval, window.externalResult,
+          Function("var functionLocal = 1; return typeof functionLocal")(),
+          typeof window.functionLocal].join("|"));
+      `;
+        const host: BrowserScriptHost = {
+          setCookie: () => Effect.succeed(""),
+          request: (input) =>
+            Effect.succeed({
+              status: 200,
+              url: input.url,
+              headers: [],
+              cookie: "",
+              body: 'var externalGlobal = rootValue; eval("var externalEval = 5"); window.externalResult = Function("return externalGlobal + externalEval")();',
+            }),
+        };
+        const result = yield* runBoundedScript(
+          runtime,
+          source,
+          {
+            url: "https://allowed.test/page",
+            cookie: "",
+            userAgent: "fixture",
+          },
+          host,
+          "classic",
+        );
+        expect(result.value).toBe("7|4|11|7|5|12|number|undefined");
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ allowedOrigins: ["https://allowed.test"] }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.live(
+    "keeps Node globals unavailable through guest-reachable constructors",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const result = yield* runtime.evaluate(`
+        const key = await crypto.subtle.importKey("raw", new Uint8Array(16), { name: "AES-GCM" }, false, ["encrypt"]);
+        const output = await crypto.subtle.encrypt({ name: "AES-GCM", iv: new Uint8Array(12) }, key, new Uint8Array(0));
+        const script = document.createElement("script");
+        const frame = document.createElement("iframe");
+        const reader = new FileReader();
+        const event = new Event("authored");
+        const objects = [globalThis, window, document, crypto, key, key.algorithm, output,
+          new Uint8Array(output), Promise.resolve(key), new URL("https://allowed.test"),
+          new URLSearchParams("a=b"), new TextEncoder(), new XMLHttpRequest(),
+          new Headers(), new Request("/authored"), new Response("authored"),
+          new Blob(["authored"]), new FormData(), reader, event, script, frame,
+          document.getElementsByTagName("head"), document.getElementsByTagName("script")];
+        const failures = [];
+        const seen = new Set();
+        const visit = (value) => {
+          if (value === null || (typeof value !== "object" && typeof value !== "function") || seen.has(value)) return;
+          seen.add(value);
+          if (typeof value === "function") {
+            try {
+              if (value.constructor.constructor("return typeof process === 'undefined' && typeof require === 'undefined' && typeof Buffer === 'undefined'")() !== true) failures.push("host constructor");
+            } catch (error) { failures.push(error.name); }
+          }
+          visit(Object.getPrototypeOf(value));
+          for (const property of Reflect.ownKeys(value)) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, property);
+            visit(descriptor.value); visit(descriptor.get); visit(descriptor.set);
+          }
+        };
+        for (const value of objects) visit(value);
+        window.addEventListener("authored", (callbackEvent) => { visit(callbackEvent); visit(callbackEvent.target); });
+        window.dispatchEvent(event);
+        await new Promise((resolve) => setTimeout(() => { visit(resolve); resolve(); }, 0));
+        return JSON.stringify(failures);
+      `);
+        expect(result.value).toBe("[]");
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+        ),
+      ),
+  );
+
+  it.live("bounds generated code by the VM deadline", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const error = yield* runtime
+        .evaluate("return Function('while (true) {}')();")
+        .pipe(Effect.flip);
+      expect(error.reason).toMatch(/terminated|timed out|timeout/i);
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ timeoutMs: 100 }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect("runs the process-backed BrowserMock with only small globals", () =>
     Effect.gen(function* () {
       const runtime = yield* BrowserMock;
@@ -1133,22 +1245,22 @@ describe("browser layer", () => {
           'return this.constructor.constructor("return process")().pid;',
         ),
       );
-      expect(blocked.reason).toContain("Code generation");
+      expect(blocked.reason).toContain("process is not defined");
       const urlEscape = yield* Effect.flip(
         runtime.evaluate(
           `try { new URL("invalid"); } catch (error) { return error.constructor.constructor("return process")().version; }`,
         ),
       );
-      expect(urlEscape.reason).toContain("Code generation");
+      expect(urlEscape.reason).toContain("process is not defined");
       expect(urlEscape.reason).not.toContain(process.version);
       const typedArrayMutation = yield* runtime.evaluate(
         `Uint8Array.from = (value) => value; return Array.from(new TextEncoder().encode("x")).join(",");`,
       );
       expect(typedArrayMutation.value).toBe("120");
-      const functionError = yield* Effect.flip(
-        runtime.evaluate("return Function('return 1')();"),
+      const dynamicCode = yield* runtime.evaluate(
+        'return `${eval("1 + 1")}|${Function("return 1")()}`;',
       );
-      expect(functionError.reason).toContain("Code generation");
+      expect(dynamicCode.value).toBe("2|1");
       const hidden = yield* runtime.evaluate(
         "return `${typeof __URL}|${typeof __cookieRead}|${typeof __randomBytes}|${typeof URL}|${typeof TextEncoder}|${typeof setTimeout}`;",
       );
@@ -1392,7 +1504,7 @@ describe("browser layer", () => {
             Object.getPrototypeOf(error) === TypeError.prototype;
           const blocked = (value) => {
             try { value.constructor.constructor("return process")(); return false; }
-            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+            catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
           };
           let urlWriteRejected = false;
           try { url.pathname = "/changed"; } catch (error) { urlWriteRejected = localTypeError(error); }
@@ -1468,7 +1580,7 @@ describe("browser layer", () => {
         try { clone.clone(); } catch (error) { usedCloneRejected = localTypeError(error); }
         let hostEscapeBlocked = false;
         try { request.constructor.constructor("return process")(); }
-        catch (error) { hostEscapeBlocked = error instanceof EvalError && error.message.includes("Code generation"); }
+        catch (error) { hostEscapeBlocked = error instanceof ReferenceError && error.message === "process is not defined"; }
         return [
           Request === window.Request && request instanceof Request && Object.getPrototypeOf(request) === Request.prototype,
           request.url, request.method, request.credentials, request.redirect, request.mode,
@@ -1583,7 +1695,7 @@ describe("browser layer", () => {
         })();
         const blocked = (value) => {
           try { value.constructor.constructor("return process")(); return false; }
-          catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+          catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
         };
         return JSON.stringify({
           sameConstructor: Blob === window.Blob,
@@ -1684,7 +1796,7 @@ describe("browser layer", () => {
           catch (error) { filenameRejected = localTypeError(error); }
           const blocked = (value) => {
             try { value.constructor.constructor("return process")(); return false; }
-            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+            catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
           };
           return [
             FormData === window.FormData && data instanceof FormData && Object.getPrototypeOf(data) === FormData.prototype,
@@ -2070,7 +2182,7 @@ describe("browser layer", () => {
         await reentrantDone;
         const blocked = (value) => {
           try { value.constructor.constructor("return process")(); return false; }
-          catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+          catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
         };
         return JSON.stringify({
           exposed: FileReader === window.FileReader,
@@ -2224,7 +2336,7 @@ describe("browser layer", () => {
           events: events.join("|"),
           escapeBlocked: (() => {
             try { reader.error.constructor.constructor("return process")(); return false; }
-            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+            catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
           })(),
         });
       `);
@@ -2405,7 +2517,7 @@ describe("browser layer", () => {
           'return performance.now.constructor("return process")().version;',
         ),
       );
-      expect(hostEscape.reason).toContain("Code generation");
+      expect(hostEscape.reason).toContain("process is not defined");
       expect(hostEscape.reason).not.toContain(process.version);
     }).pipe(
       Effect.provide(
@@ -2450,7 +2562,7 @@ describe("browser layer", () => {
           const full = encoder.encodeInto(input, fullBytes);
           const blocked = (value) => {
             try { value.constructor.constructor("return process")(); return false; }
-            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+            catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
           };
           let invalidDestinationIsLocal = false;
           try { encoder.encodeInto("x", new DataView(new ArrayBuffer(1))); }
@@ -2535,7 +2647,7 @@ describe("browser layer", () => {
           const uuid = crypto.randomUUID();
           const blocked = (value) => {
             try { value.constructor.constructor("return process")(); return false; }
-            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+            catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
           };
           return JSON.stringify({
             ciphertext: Array.from(outputBytes),
@@ -2574,7 +2686,7 @@ describe("browser layer", () => {
             Object.getPrototypeOf(error) === TypeError.prototype;
           const blocked = (value) => {
             try { value.constructor.constructor("return process")(); return false; }
-            catch (error) { return error instanceof EvalError && error.message.includes("Code generation"); }
+            catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
           };
           const rejectsLocally = async (operation) => {
             try { await operation; return false; }
@@ -2730,9 +2842,12 @@ describe("browser layer", () => {
             !Reflect.set(document, "head", {}), !Reflect.set(document, "body", {}),
             query("head") === query("HEAD"), query("body") === query("BODY"),
             localReject(() => scripts.item(0n)));
-          for (const fn of [query, scripts.item, scripts[Symbol.iterator], document.head.appendChild]) {
-            try { fn.constructor("return process")(); checks.push(false); } catch (e) { checks.push(e instanceof EvalError); }
-          }
+          const constructorChecks = [["query", query], ["item", scripts.item],
+            ["iterator", scripts[Symbol.iterator]], ["appendChild", document.head.appendChild]].map(([name, fn]) => {
+              try { return [name, fn.constructor.constructor("return typeof process")() === "undefined"]; }
+              catch (error) { return [name, error instanceof ReferenceError && error.message === "process is not defined"]; }
+            });
+          checks.push(...constructorChecks.map(([, safe]) => safe));
           checks.push(typeof __receive === "undefined", typeof __consumeBudget === "undefined", typeof __post === "undefined");
           const unattached = document.createElement("script");
           checks.push(scripts.length === 0);
@@ -2759,7 +2874,7 @@ describe("browser layer", () => {
           checks.push(scripts.length === 3, ![...scripts].includes(unattached));
           await Promise.all(loaded);
           checks.push(lookupExecutions === 3);
-          return String(checks.every(Boolean));
+          return String(checks.every(Boolean)) + "|" + constructorChecks.filter(([, safe]) => !safe).map(([name]) => name).join(",");
         `,
             {
               url: "https://allowed.test/page",
@@ -2768,7 +2883,7 @@ describe("browser layer", () => {
             },
             host,
           );
-          expect(result.value).toBe("true");
+          expect(result.value).toBe("true|");
           expect(requests.map(({ url }) => url)).toEqual([
             "https://allowed.test/body.js",
             "https://allowed.test/head.js",
@@ -2815,7 +2930,7 @@ describe("browser layer", () => {
               catch (e) { if (!(e instanceof TypeError)) throw e; }
               if (scripts.length !== 0) throw new Error("unattached child script visible");
               try { scripts.item.constructor("return process")(); throw new Error("constructor escaped"); }
-              catch (e) { if (!(e instanceof EvalError)) throw e; }
+              catch (e) { if (!(e instanceof ReferenceError && e.message === "process is not defined")) throw e; }
             `,
                 ],
               }),
@@ -2885,7 +3000,7 @@ describe("browser layer", () => {
             const same = document.${parent}.appendChild(script) === script;
             document.body.appendChild(script);
             let escaped = false;
-            try { script.setAttribute.constructor("return process")(); } catch (error) { escaped = error instanceof EvalError; }
+            try { script.setAttribute.constructor("return process")(); } catch (error) { escaped = error instanceof ReferenceError && error.message === "process is not defined"; }
             return [same, script.async, script.src, script.getAttribute("src"), escaped, await loaded].join("~");
           `,
                 {
@@ -3042,7 +3157,7 @@ describe("browser layer", () => {
       }),
     );
 
-    it.effect("reports HTTP, network, and evaluation errors without load", () =>
+    it.effect("separates script resource and execution errors", () =>
       Effect.gen(function* () {
         const runtime = yield* BrowserMock;
         yield* Effect.forEach(
@@ -3071,8 +3186,10 @@ describe("browser layer", () => {
             const result = yield* runtime.evaluate(
               `
             return await new Promise((resolve) => {
+              let windowErrors = 0;
+              window.addEventListener("error", () => windowErrors++);
               const script = document.createElement("script"); script.src = "/failure.js";
-              script.onload = () => resolve("unexpected load");
+              script.onload = () => resolve("load|" + windowErrors);
               script.onerror = (event) => resolve([event.type, !event.isTrusted, event.target === script, event instanceof Event].join("|"));
               document.head.appendChild(script);
             });
@@ -3084,8 +3201,246 @@ describe("browser layer", () => {
               },
               host,
             );
-            expect(result.value).toBe("error|true|true|true");
+            expect(result.value).toBe(
+              failure === "throw" ? "load|1" : "error|true|true|true",
+            );
           }),
+        );
+      }),
+    );
+
+    for (const kind of ["runtime", "syntax", "muted"]) {
+      it.effect(
+        "reports classic script exceptions with realm-owned ErrorEvents: " +
+          kind,
+        () =>
+          Effect.gen(function* () {
+            const runtime = yield* BrowserMock;
+            const result = yield* runtime.evaluate(
+              `
+                const kind = "${kind}";
+                const order = [];
+                let reported, legacyArgs, legacyThis;
+                window.addEventListener("error", (event) => { reported = event; order.push("window"); });
+                window.onerror = function(...args) { legacyArgs = args; legacyThis = this; return true; };
+                const blocked = (value) => {
+                  try { value.constructor.constructor("return process")(); return false; }
+                  catch (error) { return error instanceof ReferenceError && error.message === "process is not defined"; }
+                };
+                const script = document.createElement("script"); script.src = "/authored.js";
+                const outcome = await new Promise((resolve) => {
+                  script.onload = () => { order.push("load"); resolve("load"); };
+                  script.onerror = () => resolve("element-error");
+                  document.head.appendChild(script);
+                });
+                if (!reported) return outcome;
+                const muted = kind === "muted";
+                const ExpectedError = kind === "syntax" ? SyntaxError : TypeError;
+                const localError = muted ? reported.error === null :
+                  reported.error instanceof ExpectedError &&
+                  Object.getPrototypeOf(reported.error) === ExpectedError.prototype &&
+                  Object.getPrototypeOf(ExpectedError.prototype) === Error.prototype && blocked(reported.error);
+                return JSON.stringify({
+                  outcome, order, type: reported.type, cancelable: reported.cancelable,
+                  trusted: reported.isTrusted, canceled: reported.defaultPrevented,
+                  localEvent: reported instanceof ErrorEvent && reported instanceof Event &&
+                    Object.getPrototypeOf(reported) === ErrorEvent.prototype &&
+                    Object.getPrototypeOf(ErrorEvent.prototype) === Event.prototype && blocked(reported),
+                  message: muted ? reported.message === "Script error." :
+                    kind === "syntax" ? reported.message.length > 0 : reported.message.includes("authored TypeError"),
+                  filename: reported.filename, lineno: reported.lineno, colno: reported.colno, localError,
+                  legacy: legacyArgs.length === 5 && legacyThis === window &&
+                    legacyArgs[0] === reported.message && legacyArgs[1] === reported.filename &&
+                    legacyArgs[2] === 0 && legacyArgs[3] === 0 && legacyArgs[4] === reported.error,
+                  privateAbsent: typeof __scriptErrorReporter === "undefined" &&
+                    !("__scriptErrorReporter" in window),
+                });
+              `,
+              {
+                url: "https://allowed.test/page",
+                cookie: "",
+                userAgent: "fixture",
+              },
+              {
+                request: () =>
+                  Effect.succeed({
+                    status: 200,
+                    url:
+                      kind === "muted"
+                        ? "https://cdn.test/final.js"
+                        : "https://allowed.test/final.js",
+                    headers: [],
+                    cookie: "",
+                    body:
+                      kind === "syntax"
+                        ? "const authored = ;"
+                        : 'throw new TypeError("authored TypeError");',
+                  }),
+                setCookie: () => Effect.succeed(""),
+              },
+            );
+            expect(result.value).not.toBe("element-error");
+            const report = yield* Schema.decodeEffect(
+              Schema.fromJsonString(
+                Schema.Struct({
+                  outcome: Schema.String,
+                  order: Schema.Array(Schema.String),
+                  type: Schema.String,
+                  cancelable: Schema.Boolean,
+                  trusted: Schema.Boolean,
+                  canceled: Schema.Boolean,
+                  localEvent: Schema.Boolean,
+                  message: Schema.Boolean,
+                  filename: Schema.String,
+                  lineno: Schema.Finite,
+                  colno: Schema.Finite,
+                  localError: Schema.Boolean,
+                  legacy: Schema.Boolean,
+                  privateAbsent: Schema.Boolean,
+                }),
+              ),
+            )(result.value);
+            expect(report).toEqual({
+              outcome: "load",
+              order: ["window", "load"],
+              type: "error",
+              cancelable: true,
+              trusted: false,
+              canceled: true,
+              localEvent: true,
+              message: true,
+              filename: kind === "muted" ? "" : "https://allowed.test/final.js",
+              lineno: 0,
+              colno: 0,
+              localError: true,
+              legacy: true,
+              privateAbsent: true,
+            });
+          }),
+      );
+    }
+
+    for (const kind of ["proxy", "prototype"]) {
+      it.effect(
+        "reports script exceptions without host prototype traps: " + kind,
+        () =>
+          Effect.gen(function* () {
+            const runtime = yield* BrowserMock;
+            const result = yield* runtime.evaluate(
+              `
+                globalThis.prototypeTrapCalls = 0;
+                const order = [];
+                window.addEventListener("error", (event) => {
+                  order.push(event instanceof ErrorEvent && event.error === globalThis.thrownValue ? "window" : "wrong-error");
+                });
+                const script = document.createElement("script"); script.src = "/proxy.js";
+                await new Promise((resolve) => {
+                  script.onload = () => { order.push("load"); resolve(); };
+                  script.onerror = () => { order.push("element-error"); resolve(); };
+                  document.head.appendChild(script);
+                });
+                return order.join("|") + "|" + prototypeTrapCalls;
+              `,
+              {
+                url: "https://allowed.test/page",
+                cookie: "",
+                userAgent: "fixture",
+              },
+              {
+                request: (input) =>
+                  Effect.succeed({
+                    status: 200,
+                    url: input.url,
+                    headers: [],
+                    cookie: "",
+                    body: `
+                      const proxy = new Proxy(new TypeError("authored proxy failure"), {
+                        getPrototypeOf() {
+                          globalThis.prototypeTrapCalls++;
+                          throw new Error("prototype trap must not run on the host");
+                        },
+                      });
+                      globalThis.thrownValue = ${kind === "proxy" ? "proxy" : 'Object.setPrototypeOf(new TypeError("authored prototype failure"), proxy)'};
+                      throw globalThis.thrownValue;
+                    `,
+                  }),
+                setCookie: () => Effect.succeed(""),
+              },
+            );
+            expect(result.value).toBe("window|load|0");
+          }),
+      );
+    }
+
+    it.effect("preserves script-element VM timeout failure", () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const error = yield* Effect.flip(
+          runtime.evaluate(
+            `
+              const script = document.createElement("script"); script.src = "/loop.js";
+              return await new Promise((resolve) => {
+                window.onerror = () => resolve("unexpected window error");
+                script.onload = () => resolve("unexpected load");
+                document.head.appendChild(script);
+              });
+            `,
+            {
+              url: "https://allowed.test/page",
+              cookie: "",
+              userAgent: "fixture",
+            },
+            {
+              request: (input) =>
+                Effect.succeed({
+                  status: 200,
+                  url: input.url,
+                  headers: [],
+                  cookie: "",
+                  body: "while (true) {}",
+                }),
+              setCookie: () => Effect.succeed(""),
+            },
+          ),
+        );
+        expect(error).toBeInstanceOf(BrowserScriptError);
+        expect(error.reason).toMatch(/timed out|timeout/i);
+      }).pipe(
+        Effect.provide(
+          BrowserMock.layer({ timeoutMs: 500 }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+
+    it.effect("preserves direct script-loader typed execution rejection", () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const error = yield* Effect.flip(
+          runtime.evaluate(
+            'await document.loadScript("/direct.js");',
+            {
+              url: "https://allowed.test/page",
+              cookie: "",
+              userAgent: "fixture",
+            },
+            {
+              request: (input) =>
+                Effect.succeed({
+                  status: 200,
+                  url: input.url,
+                  headers: [],
+                  cookie: "",
+                  body: 'throw new TypeError("authored direct failure");',
+                }),
+              setCookie: () => Effect.succeed(""),
+            },
+          ),
+        );
+        expect(error).toBeInstanceOf(BrowserScriptError);
+        expect(error.reason).toBe(
+          "loaded script failed: authored direct failure",
         );
       }),
     );
@@ -4224,16 +4579,16 @@ describe("caller-reviewed classic execution", () => {
   );
   for (const mode of ["async", "classic"] as const) {
     it.live(
-      `hides private names and prelude helpers and disables code generation in ${mode}`,
+      `hides private names and prelude helpers under dynamic code generation in ${mode}`,
       () =>
         Effect.gen(function* () {
           const runtime = yield* BrowserMock;
           const body = `
-          const privateNames = ["__receive", "__post", "__childRealm", "__consumeBudget", "__urlOperation", "__pageUrl", "__pageLocation", "__referrer", "__cookie", "__userAgent", "__languages", "__authoritativeCookies", "__performanceNow", "__performanceTimeOrigin", "__randomBytes", "__cryptoOperation", "__encodeBlobText", "__decodeBlobText", "__cookieSnapshot", "__cookieFlush", "__safeMessage", "__dispatch", "__incoming"];
+          const privateNames = ["__scriptErrorReporter", "__receive", "__post", "__childRealm", "__consumeBudget", "__urlOperation", "__pageUrl", "__pageLocation", "__referrer", "__cookie", "__userAgent", "__languages", "__authoritativeCookies", "__performanceNow", "__performanceTimeOrigin", "__randomBytes", "__cryptoOperation", "__encodeBlobText", "__decodeBlobText", "__cookieSnapshot", "__cookieFlush", "__safeMessage", "__dispatch", "__incoming"];
           const hidden = privateNames.every((key) => !(key in window));
           const helpers = [typeof snapshot, typeof flush, typeof describe].join(":");
           let blocked = false;
-          try { document.loadScript.constructor("return process")(); } catch (error) { blocked = error instanceof EvalError; }
+          try { document.loadScript.constructor("return process")(); } catch (error) { blocked = error instanceof ReferenceError && error.message === "process is not defined"; }
           const outcome = Promise.resolve().then(() => String(hidden && helpers === "undefined:undefined:undefined" && blocked && privateNames.every((key) => !(key in window))));
         `;
           const source =
@@ -4381,10 +4736,10 @@ describe("caller-reviewed classic execution", () => {
       () =>
         Effect.gen(function* () {
           const runtime = yield* BrowserMock;
-          const child = `const names = ["__receive", "__post", "__childRealm", "__consumeBudget", "__urlOperation", "__pageUrl", "__pageLocation", "__referrer", "__cookie", "__userAgent", "__languages", "__authoritativeCookies", "__performanceNow", "__performanceTimeOrigin", "__randomBytes", "__cryptoOperation", "__encodeBlobText", "__decodeBlobText", "__cookieSnapshot", "__cookieFlush", "__safeMessage"];
+          const child = `const names = ["__scriptErrorReporter", "__receive", "__post", "__childRealm", "__consumeBudget", "__urlOperation", "__pageUrl", "__pageLocation", "__referrer", "__cookie", "__userAgent", "__languages", "__authoritativeCookies", "__performanceNow", "__performanceTimeOrigin", "__randomBytes", "__cryptoOperation", "__encodeBlobText", "__decodeBlobText", "__cookieSnapshot", "__cookieFlush", "__safeMessage"];
           if (!names.every((key) => !(key in window)) || typeof snapshot !== "undefined" || typeof flush !== "undefined" || typeof describe !== "undefined") throw new Error("private child binding leaked");
-          let blocked = false; try { document.createElement.constructor("return process")(); } catch (error) { blocked = error instanceof EvalError; }
-          if (!blocked) throw new Error("child code generation enabled");`;
+          let blocked = false; try { document.createElement.constructor("return process")(); } catch (error) { blocked = error instanceof ReferenceError && error.message === "process is not defined"; }
+          if (!blocked) throw new Error("Node globals escaped through child code generation");`;
           expect(
             (yield* runBoundedScript(
               runtime,
@@ -4497,7 +4852,7 @@ describe("modeled exact ID lookup", () => {
             try { operation(); checks.push(false); } catch (error) { checks.push(error instanceof TypeError); }
           }
           try { document.getElementById.constructor("return process")(); checks.push(false); }
-          catch (error) { checks.push(error instanceof EvalError); }
+          catch (error) { checks.push(error instanceof ReferenceError && error.message === "process is not defined"); }
           const outcome = Promise.all(loaded).then(() => String(checks.every(Boolean)));`;
         expect(
           (yield* runBoundedScript(

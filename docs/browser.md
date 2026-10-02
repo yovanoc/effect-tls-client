@@ -282,8 +282,21 @@ remains authoritative for cookies.
 The only DOM-like script support is VM-local external asynchronous classic
 `<script>` elements: `document.createElement("script")`, plus
 `document.head.appendChild` and `document.body.appendChild`. Appending returns
-the same element and starts that element at most once. Synthetic `load` and
-`error` events fire after the existing loader has completed execution or failed.
+the same element and starts that element at most once. Resource failures (including
+HTTP, network, policy, and byte-budget failures) fire synthetic element `error`
+without `load`. A successfully fetched classic script that fails parsing or
+execution instead reports a cancelable, realm-local `ErrorEvent` on `window`
+before element `load`. Events remain synthetic (`isTrusted === false`). Same-origin
+errors expose the thrown guest value (a guest `SyntaxError` for parsing failures),
+message, and final script URL as `filename`. Cross-origin final URLs are no-CORS
+and muted: `message: "Script error."`, `filename: ""`, `lineno: 0`, `colno: 0`,
+and `error: null`. Locations are also 0 for same-origin errors: host stacks are
+not parsed and source locations are not modeled. Legacy `window.onerror` receives
+`(message, source, lineno, colno, error)`; returning `true` cancels the event.
+Listener and `onload` exceptions still fail evaluation with `BrowserScriptError`.
+The nonstandard direct `document.loadScript` convenience API remains separate:
+parsing/execution failures reject with the existing `loaded script failed: `
+prefix, rather than reporting a Window event and resolving.
 This is not acquisition or clearance evidence. At most 32 script elements may
 be created per evaluation; cumulative script-attribute data is capped at 16 KiB,
 and each attribute value at 8,192 characters. Inline content, module or other
@@ -501,7 +514,9 @@ string, not clearance or a retry. Unawaited acquisition is **not** implicitly
 awaited. This adds no HTML script discovery, source rewriting, automatic SDK
 configuration, vendor resolver, or claim of challenge clearance. All existing
 source/network/frame/crypto/timer/DOM quotas, origins, credentials, Node permission
-denials, VM code-generation denial, and hard process cutoff remain unchanged.
+denials and the hard process cutoff remain unchanged. String-based `eval` and
+`Function` work in the VM for caller-reviewed code; WebAssembly code generation
+remains disabled. This VM is not a hostile-code sandbox (see below).
 Trusted snapshot/flush/error helpers are captured before guest source and are
 not in its lexical scope. Reserved delivery-name collisions fail before trusted
 callbacks are installed; delivery names are removed and checked inside the realm

@@ -39,6 +39,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const NativePromise = Promise;
   const NativeError = Error;
   const NativeTypeError = TypeError;
+  const NativeSyntaxError = SyntaxError;
   const NativeRangeError = RangeError;
   const NativeString = String;
   const NativeNumber = Number;
@@ -1238,6 +1239,19 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     stopImmediatePropagation() { this._immediateStopped = true; }
   }
+  class ErrorEvent extends Event {
+    constructor(type, options = {}) {
+      const init = options == null ? {} : options;
+      super(type, init);
+      objectDefineProperties(this, {
+        message: { value: NativeString(init.message ?? ""), enumerable: true },
+        filename: { value: NativeString(init.filename ?? ""), enumerable: true },
+        lineno: { value: NativeNumber(init.lineno ?? 0) >>> 0, enumerable: true },
+        colno: { value: NativeNumber(init.colno ?? 0) >>> 0, enumerable: true },
+        error: { value: init.error ?? null, enumerable: true },
+      });
+    }
+  }
   class ProgressEvent extends Event {
     constructor(type, options = {}) {
       const init = options == null ? {} : options;
@@ -1321,7 +1335,11 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
         set: (value) => {
           if (listener !== null) target.removeEventListener(type, listener);
           callback = typeof value === "function" ? value : null;
-          listener = callback === null ? null : (event) => callback.call(target, event);
+          listener = callback === null ? null : (event) => {
+            if (target === globalThis && type === "error" && event instanceof ErrorEvent) {
+              if (apply(callback, target, [event.message, event.filename, event.lineno, event.colno, event.error]) === true) event.preventDefault();
+            } else apply(callback, target, [event]);
+          };
           if (listener !== null) target.addEventListener(type, listener);
         },
       });
@@ -1517,8 +1535,10 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     ]);
     return element;
   };
-  // Capture the existing loader: replies execute in this VM before its promise resolves.
-  const loadExternalScript = document.loadScript;
+  // Distinct internal pending kind; the host still sees the ordinary script request.
+  const loadExternalScript = (url) => request("script.element", NativeString(url), "GET", new Headers([["accept", "text/javascript, application/javascript, */*"]]), null).then((value) => {
+    if (value.status < 200 || value.status >= 300) throw new NativeTypeError("script load failed with HTTP " + value.status);
+  });
   document.createElement = (name, ...options) => {
     if (NativeString(name).toLowerCase() === "iframe" && options.length === 0) return createFrame();
     if (NativeString(name).toLowerCase() !== "script" || options.length !== 0) {
@@ -1699,7 +1719,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const navigator = Object.freeze({ userAgent, language: languages[0] ?? "", languages, cookieEnabled: true, webdriver: false });
   const console = Object.freeze({ log() {}, warn() {}, error() {}, info() {} });
   const window = makeEventTarget(globalThis);
-  Object.assign(window, { document, location, navigator, console, performance, crypto, TextEncoder, CryptoKey, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Request, Response, Event, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
+  Object.assign(window, { document, location, navigator, console, performance, crypto, TextEncoder, CryptoKey, fetch, XMLHttpRequest, setTimeout, clearTimeout, setInterval, clearInterval, Headers, Request, Response, Event, ErrorEvent, ProgressEvent, Blob, FileReader, FormData, URL, URLSearchParams });
   Object.defineProperty(window, "location", childRealm
     ? { get: () => location, set: unsupportedFrameOperation, enumerable: true, configurable: false }
     : { value: location, enumerable: true, writable: false, configurable: false });
@@ -1708,6 +1728,21 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   if (childRealm) {
     Object.defineProperties(window, { parent: { value: opaqueWindow() }, top: { value: opaqueWindow() }, postMessage: { value: unsupportedFrameOperation } });
   }
+  bindEventHandlers(window, ["error"]);
+  // Captured and removed before guest execution, just like the private receiver.
+  Object.defineProperty(globalThis, "__scriptErrorReporter", {
+    configurable: true,
+    value: (encoded) => {
+      const [filename, muted, syntaxMessage] = jsonParse(encoded);
+      return (cause) => {
+        const error = syntaxMessage === null ? cause : new NativeSyntaxError(syntaxMessage);
+        window.dispatchEvent(new ErrorEvent("error", {
+          cancelable: true, message: muted ? "Script error." : safeMessage(error),
+          filename: muted ? "" : filename, lineno: 0, colno: 0, error: muted ? null : error,
+        }));
+      };
+    },
+  });
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
     configurable: true,
@@ -1739,6 +1774,8 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
 
   return String.raw`
 const vm = require("node:vm");
+const { types } = require("node:util");
+const hostErrorPrototypes = new Set([Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError, URIError].map((constructor) => constructor.prototype));
 const readline = require("node:readline");
 const hostPerformance = require("node:perf_hooks").performance;
 const hostMonotonicNow = () => hostPerformance.now();
@@ -1877,6 +1914,7 @@ let outputBytes = 0;
 const pendingKinds = new Map();
 const frames = new Map();
 const receivers = new WeakMap();
+const scriptErrorReporters = new WeakMap();
 const realmGlobals = new WeakMap();
 const timerOwners = new Map();
 let nextOuterTimerId = 0;
@@ -1947,6 +1985,7 @@ const post = (line, owner = context) => {
     if (message.type === "network") {
       if (owner !== context) return false;
       pendingKinds.set(message.id, message.kind);
+      if (message.kind === "script.element") { message.kind = "script"; line = JSON.stringify(message); }
     }
     if (message.type === "cookie.write" && owner !== context) return false;
     bytes = Buffer.byteLength(line) + 1;
@@ -1959,7 +1998,7 @@ const post = (line, owner = context) => {
 const bootstrap = ${JSON.stringify(bootstrap)};
 // Node 25 can retain VM-created globals after deletion through the host sandbox.
 // These fixed kernel sources run before any guest code and verify realm-local removal.
-const cleanupPrivateBindings = "{ for (const key of ['__receive', '__post', '__childRealm', '__consumeBudget', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupPrivateBindings = "{ for (const key of ['__scriptErrorReporter', '__receive', '__post', '__childRealm', '__consumeBudget', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const handleParentLine = (line) => {
   try {
@@ -1998,11 +2037,34 @@ const handleParentLine = (line) => {
     if (message.type === "reply") {
       const kind = pendingKinds.get(message.id);
       pendingKinds.delete(message.id);
-      if (message.ok && kind === "script") {
+      if (message.ok && (kind === "script" || kind === "script.element")) {
         if (!message.response.error && message.response.status >= 200 && message.response.status < 300) {
-          try { run(message.response.body, context); }
-          catch (cause) {
-            message = { type: "reply", id: message.id, ok: false, error: "loaded script failed: " + safeMessage(cause) };
+          if (kind === "script.element") {
+            const response = message.response;
+            const muted = new URL(response.url).origin !== new URL(rootInput.url).origin;
+            const report = (cause, syntaxMessage = null) => {
+              const callback = invokeInRealm(context, scriptErrorReporters.get(context), JSON.stringify([response.url, muted, syntaxMessage]));
+              invokeInRealm(context, callback, cause);
+            };
+            let compiled;
+            try { compiled = new vm.Script(response.body, { filename: response.url }); }
+            catch (cause) {
+              if (!(cause instanceof SyntaxError)) throw cause;
+              report(undefined, safeMessage(cause));
+            }
+            if (compiled) {
+              try { compiled.runInContext(context, { timeout: Math.max(1, Math.ceil(deadline - hostMonotonicNow())) }); }
+              catch (cause) {
+                // VM timeout/host failures are not guest exceptions and must never enter the realm.
+                if (!types.isProxy(cause) && types.isNativeError(cause) && hostErrorPrototypes.has(Object.getPrototypeOf(cause))) throw cause;
+                report(cause);
+              }
+            }
+          } else {
+            try { run(message.response.body, context); }
+            catch (cause) {
+              message = { type: "reply", id: message.id, ok: false, error: "loaded script failed: " + safeMessage(cause) };
+            }
           }
         }
         if (message.ok) message.response.body = "";
@@ -2054,10 +2116,11 @@ const createRealm = (input, childRealm) => {
     __encodeBlobText: hostEncodeBlobText,
     __decodeBlobText: hostDecodeBlobText,
   });
-  const realm = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
+  const realm = vm.createContext(sandbox, { codeGeneration: { strings: true, wasm: false } });
   realmGlobals.set(realm, run("this", realm));
   run(bootstrap, realm);
   receivers.set(realm, run("__receive", realm));
+  scriptErrorReporters.set(realm, run("__scriptErrorReporter", realm));
   run(cleanupPrivateBindings, realm);
   if (childRealm) run(cleanupCookieBindings, realm);
   return realm;
