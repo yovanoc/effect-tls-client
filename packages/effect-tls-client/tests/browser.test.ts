@@ -2824,9 +2824,7 @@ describe("browser layer", () => {
       expect(next.value).toBe("undefined");
     }).pipe(
       Effect.provide(
-        BrowserMock.layer({ timeoutMs: 100 }).pipe(
-          Layer.provide(NodeServices.layer),
-        ),
+        BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
       ),
     ),
   );
