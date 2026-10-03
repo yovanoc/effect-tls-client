@@ -58,11 +58,12 @@ type cookieJarState struct {
 type sessionCookieJar struct {
 	state *cookieJarState
 
-	// fhttp asks the Jar for cookies before each redirect hop. This flag is
-	// scoped to one client, so an explicit Cookie header can suppress automatic
-	// Jar injection without disabling response Set-Cookie processing.
-	skipMu        sync.Mutex
-	skipAutomatic bool
+	// fhttp asks the Jar for cookies before each redirect hop. These flags are
+	// scoped to one client request; explicit Cookie headers still accept response
+	// Set-Cookie values, while omitCredentials suppresses both directions.
+	skipMu          sync.Mutex
+	skipAutomatic   bool
+	omitCredentials bool
 }
 
 func newSessionCookieJar(strict bool) (*sessionCookieJar, error) {
@@ -95,10 +96,28 @@ func (j *sessionCookieJar) clearAutomaticCookieSkip() {
 	j.skipMu.Unlock()
 }
 
+func (j *sessionCookieJar) beginCredentialOmission() {
+	j.skipMu.Lock()
+	j.omitCredentials = true
+	j.skipMu.Unlock()
+}
+
+func (j *sessionCookieJar) endCredentialOmission() {
+	j.skipMu.Lock()
+	j.omitCredentials = false
+	j.skipMu.Unlock()
+}
+
 func (j *sessionCookieJar) skipsAutomaticCookies() bool {
 	j.skipMu.Lock()
 	defer j.skipMu.Unlock()
-	return j.skipAutomatic
+	return j.skipAutomatic || j.omitCredentials
+}
+
+func (j *sessionCookieJar) skipsResponseCookies() bool {
+	j.skipMu.Lock()
+	defer j.skipMu.Unlock()
+	return j.omitCredentials
 }
 
 func cloneCookie(cookie *http.Cookie) *http.Cookie {
@@ -124,15 +143,22 @@ func cookiePath(u *url.URL, cookie *http.Cookie) string {
 	return cookie.Path
 }
 
-func cookieDomain(u *url.URL, cookie *http.Cookie) string {
-	if cookie.Domain == "" {
-		return strings.ToLower(u.Hostname())
-	}
-	return strings.TrimPrefix(strings.ToLower(cookie.Domain), ".")
-}
-
 func cookieKey(cookie *http.Cookie) string {
 	return strings.ToLower(cookie.Domain) + "\x00" + cookie.Path + "\x00" + cookie.Name
+}
+
+func cookiePathMatches(requestPath, cookiePath string) bool {
+	if requestPath == cookiePath {
+		return true
+	}
+	if strings.HasPrefix(requestPath, cookiePath) {
+		return strings.HasSuffix(cookiePath, "/") || requestPath[len(cookiePath)] == '/'
+	}
+	return false
+}
+
+func cookieDomainMatches(host, domain string) bool {
+	return host == domain || (net.ParseIP(host) == nil && strings.HasSuffix(host, "."+domain))
 }
 
 func cookieQueryURL(scheme, host, path string) *url.URL {
@@ -183,18 +209,19 @@ func (j *sessionCookieJar) reconcileLocked() {
 }
 
 func (j *sessionCookieJar) acceptedCookieLocked(u *url.URL, candidate *http.Cookie) (*http.Cookie, bool) {
+	key := scriptCookieKey(u, candidate)
+	if key == "" {
+		return nil, false
+	}
 	path := cookiePath(u, candidate)
 	scheme := u.Scheme
 	if candidate.Secure {
 		scheme = "https"
 	}
 	selected := j.state.jar.Cookies(cookieQueryURL(scheme, u.Host, path))
-	domain := cookieDomain(u, candidate)
 	for _, cookie := range selected {
-		if cookie.Name == candidate.Name &&
+		if cookieKey(cookie) == key &&
 			cookie.Value == candidate.Value &&
-			cookie.Domain == domain &&
-			cookie.Path == path &&
 			cookie.Secure == candidate.Secure &&
 			cookie.HttpOnly == candidate.HttpOnly {
 			return cookie, true
@@ -222,6 +249,119 @@ func (j *sessionCookieJar) cookiesFor(u *url.URL) []*http.Cookie {
 	return result
 }
 
+// scriptCookieKey asks fhttp to canonicalize a probe cookie so protection and
+// tracking use the same host, IDNA, domain, and path rules as the real Jar.
+func scriptCookieKey(u *url.URL, cookie *http.Cookie) string {
+	if u == nil || cookie == nil {
+		return ""
+	}
+	canonicalJar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		return ""
+	}
+	probe := cloneCookie(cookie)
+	probe.Value = "__effect_tls_client_cookie_probe__"
+	probe.MaxAge = 0
+	probe.Expires = time.Time{}
+	canonicalJar.SetCookies(u, []*http.Cookie{probe})
+	for _, actual := range canonicalJar.Cookies(cookieQueryURL("https", u.Host, cookiePath(u, cookie))) {
+		if actual.Name == probe.Name && actual.Value == probe.Value {
+			return cookieKey(actual)
+		}
+	}
+	return ""
+}
+
+func cookieHeader(cookies []*http.Cookie) string {
+	values := make([]string, 0, len(cookies))
+	for _, cookie := range cookies {
+		value := (&http.Cookie{Name: cookie.Name, Value: cookie.Value}).String()
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	return strings.Join(values, "; ")
+}
+
+// scriptCookieHeader performs the browser document.cookie read and writes as
+// one Jar-locked operation. Raw writes are parsed by fhttp so URL/domain/path
+// rules stay identical to response Set-Cookie handling.
+func (j *sessionCookieJar) scriptCookieHeader(u *url.URL, setCookies []string) string {
+	if u == nil {
+		return ""
+	}
+	j.state.mu.Lock()
+	defer j.state.mu.Unlock()
+
+	j.reconcileLocked()
+	protected := make(map[string]struct{})
+	for key, record := range j.state.cookies {
+		if record.cookie.HttpOnly {
+			protected[key] = struct{}{}
+		}
+	}
+	parsed := (&http.Response{Header: http.Header{"Set-Cookie": setCookies}}).Cookies()
+	accepted := make([]*http.Cookie, 0, len(parsed))
+	for _, candidate := range parsed {
+		if candidate.HttpOnly || (j.state.strict && candidate.Value == "") ||
+			(candidate.Secure && !strings.EqualFold(u.Scheme, "https")) {
+			continue
+		}
+		key := scriptCookieKey(u, candidate)
+		if key == "" {
+			continue
+		}
+		if _, blocked := protected[key]; blocked {
+			continue
+		}
+		if !candidate.Secure && !strings.EqualFold(u.Scheme, "https") {
+			candidateDomain, _, _ := strings.Cut(key, "\x00")
+			candidatePath := cookiePath(u, candidate)
+			overlaysSecure := false
+			for _, record := range j.state.cookies {
+				existing := record.cookie
+				// RFC 6265bis step 16 treats the candidate path as the request path.
+				if existing.Secure && existing.Name == candidate.Name &&
+					(cookieDomainMatches(candidateDomain, existing.Domain) || cookieDomainMatches(existing.Domain, candidateDomain)) &&
+					cookiePathMatches(candidatePath, existing.Path) {
+					overlaysSecure = true
+					break
+				}
+			}
+			if overlaysSecure {
+				continue
+			}
+		}
+		accepted = append(accepted, candidate)
+	}
+	if len(accepted) > 0 {
+		j.state.jar.SetCookies(u, accepted)
+		j.reconcileLocked()
+		for _, candidate := range accepted {
+			actual, ok := j.acceptedCookieLocked(u, candidate)
+			if !ok {
+				continue
+			}
+			key := cookieKey(actual)
+			j.state.cookies[key] = trackedCookie{
+				cookie:     actual,
+				origin:     strings.ToLower(u.Hostname()),
+				hostOnly:   candidate.Domain == "",
+				persistent: candidate.MaxAge > 0 || !candidate.Expires.IsZero(),
+				sameSite:   candidate.SameSite,
+			}
+		}
+	}
+
+	visible := make([]*http.Cookie, 0)
+	for _, cookie := range j.state.jar.Cookies(u) {
+		if !cookie.HttpOnly {
+			visible = append(visible, cookie)
+		}
+	}
+	return cookieHeader(visible)
+}
+
 func (j *sessionCookieJar) Cookies(u *url.URL) []*http.Cookie {
 	if u == nil {
 		return nil
@@ -233,6 +373,13 @@ func (j *sessionCookieJar) Cookies(u *url.URL) []*http.Cookie {
 }
 
 func (j *sessionCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	if j.skipsResponseCookies() {
+		return
+	}
+	j.storeCookies(u, cookies)
+}
+
+func (j *sessionCookieJar) storeCookies(u *url.URL, cookies []*http.Cookie) {
 	if u == nil || len(cookies) == 0 {
 		return
 	}
@@ -264,6 +411,14 @@ func (j *sessionCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 			sameSite:   candidate.SameSite,
 		}
 	}
+}
+
+func setClientCookies(client tlsClient.HttpClient, u *url.URL, cookies []*http.Cookie) {
+	if jar, ok := client.GetCookieJar().(*sessionCookieJar); ok {
+		jar.storeCookies(u, cookies)
+		return
+	}
+	client.SetCookies(u, cookies)
 }
 
 func (j *sessionCookieJar) GetAllCookies() map[string][]*http.Cookie {
@@ -1072,7 +1227,7 @@ func (d *dispatcher) runCookiesSet(ctx context.Context, op *operation, meta prot
 		_ = d.finishCancelled(op)
 		return
 	}
-	session.client.SetCookies(parsed, converted)
+	setClientCookies(session.client, parsed, converted)
 	releaseProxy()
 	_ = d.finishOK(op)
 }
@@ -1133,10 +1288,38 @@ func (d *dispatcher) runCookiesImport(ctx context.Context, op *operation, meta p
 		return
 	}
 	for _, item := range converted {
-		session.client.SetCookies(item.url, []*http.Cookie{item.cookie})
+		setClientCookies(session.client, item.url, []*http.Cookie{item.cookie})
 	}
 	releaseProxy()
 	_ = d.finishOK(op)
+}
+
+func (d *dispatcher) runCookiesScript(ctx context.Context, op *operation, meta protocol.CookiesScriptMeta) {
+	if err := ctx.Err(); err != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	session, ok := d.sessions.get(meta.SessionID)
+	if !ok {
+		sessionNotFound(d, op, meta.SessionID)
+		return
+	}
+	parsed, err := parseCookieURL(meta.URL)
+	if err != nil {
+		_ = d.finishError(op, protocol.ErrorKindInvalidUrl, err.Error())
+		return
+	}
+	releaseProxy, acquireErr := session.proxyGate.acquireRead(ctx)
+	if acquireErr != nil {
+		_ = d.finishCancelled(op)
+		return
+	}
+	cookie := ""
+	if jar, ok := session.client.GetCookieJar().(*sessionCookieJar); ok {
+		cookie = jar.scriptCookieHeader(parsed, meta.SetCookies)
+	}
+	releaseProxy()
+	_ = d.finishResult(op, protocol.CookiesScriptResultMeta{Cookie: cookie})
 }
 
 func (d *dispatcher) runBandwidthGet(ctx context.Context, op *operation, meta protocol.BandwidthMeta) {
@@ -1574,9 +1757,27 @@ func mergeHeaderPairs(identity, request []protocol.HeaderPair) ([]protocol.Heade
 	return append(merged, request...), nil
 }
 
+func withoutCredentials(headers []protocol.HeaderPair) []protocol.HeaderPair {
+	result := make([]protocol.HeaderPair, 0, len(headers))
+	for _, pair := range headers {
+		switch strings.ToLower(pair[0]) {
+		case "authorization", "proxy-authorization", "cookie":
+			continue
+		default:
+			result = append(result, pair)
+		}
+	}
+	return result
+}
+
 func requestHeaders(identity protocol.IdentityMeta, request protocol.RequestMeta) (http.Header, error) {
 	identityHeaders := identity.Headers
-	merged, err := mergeHeaderPairs(identityHeaders, request.Headers)
+	requestHeaders := request.Headers
+	if request.OmitCredentials {
+		identityHeaders = withoutCredentials(identityHeaders)
+		requestHeaders = withoutCredentials(requestHeaders)
+	}
+	merged, err := mergeHeaderPairs(identityHeaders, requestHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -1926,6 +2127,9 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		fail(protocol.ErrorKindInvalidUrl, message)
 		return
 	}
+	if meta.OmitCredentials {
+		parsedURL.User = nil
+	}
 	method := meta.Method
 	if method == "" {
 		method = http.MethodGet
@@ -1976,12 +2180,17 @@ func (d *dispatcher) runRequest(ctx context.Context, op *operation, meta protoco
 		return
 	}
 	defer releaseBandwidth()
-	if err := setRequestCookies(client, parsedURL, meta.Cookies); err != nil {
-		fail(protocol.ErrorKindInvalidConfig, err.Error())
-		return
+	if !meta.OmitCredentials {
+		if err := setRequestCookies(client, parsedURL, meta.Cookies); err != nil {
+			fail(protocol.ErrorKindInvalidConfig, err.Error())
+			return
+		}
 	}
-	if hasHeader(req.Header, "Cookie") {
-		if jar, ok := client.GetCookieJar().(*sessionCookieJar); ok {
+	if jar, ok := client.GetCookieJar().(*sessionCookieJar); ok {
+		if meta.OmitCredentials {
+			jar.beginCredentialOmission()
+			defer jar.endCredentialOmission()
+		} else if hasHeader(req.Header, "Cookie") {
 			jar.skipAutomaticCookies()
 			defer jar.clearAutomaticCookieSkip()
 		}

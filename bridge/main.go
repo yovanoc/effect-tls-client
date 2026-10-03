@@ -755,6 +755,30 @@ func (d *dispatcher) dispatch(frame protocol.Frame) (bool, error) {
 		}
 		return false, nil
 
+	case protocol.KindCookiesScript:
+		if frame.ID == 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.script id 0 is reserved")
+		}
+		if err := d.ensureAvailable(frame.ID); err != nil {
+			return false, err
+		}
+		if len(frame.Body) != 0 {
+			return false, writeProtocolError(d.writer, frame.ID, "cookies.script does not accept a body")
+		}
+		var meta protocol.CookiesScriptMeta
+		if err := protocol.DecodeObject(frame.Meta, &meta); err != nil {
+			return false, writeProtocolError(d.writer, frame.ID, err.Error())
+		}
+		if meta.SessionID == "" || meta.URL == "" {
+			return false, writeProtocolError(d.writer, frame.ID, "sessionId and url are required")
+		}
+		if err := d.start(frame.ID, false, meta.SessionID, func(ctx context.Context, op *operation) {
+			d.runCookiesScript(ctx, op, meta)
+		}); err != nil {
+			return false, err
+		}
+		return false, nil
+
 	case protocol.KindBandwidthGet, protocol.KindBandwidthReset:
 		if frame.ID == 0 {
 			return false, writeProtocolError(d.writer, frame.ID, "bandwidth operation id 0 is reserved")

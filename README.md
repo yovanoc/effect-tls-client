@@ -5,9 +5,9 @@ Effect-native HTTP, HTTP/2/3, and WebSocket access to
 versioned Go Bridge process. It is for applications that need a pinned TLS
 identity without loading native code into Node or Bun.
 
-The package supports **Node 22+** and **Bun 1.4+**. The browser/challenge layer
-is intentionally not part of this release; use the transport primitives below
-for survey, anti-bot, API, and game-client workloads.
+The package supports **Node 22+** and **Bun 1.4+**. The optional browser layer
+adds browser-shaped headers, bounded navigation, and an application-owned
+challenge seam on top of the same scoped transport session.
 
 ## Install
 
@@ -53,7 +53,9 @@ const program = Effect.scoped(
 );
 
 await Effect.runPromise(
-  program.pipe(Effect.provide(TlsClient.layer.pipe(Layer.provide(NodeServices.layer)))),
+  program.pipe(
+    Effect.provide(TlsClient.layer.pipe(Layer.provide(NodeServices.layer))),
+  ),
 );
 ```
 
@@ -87,7 +89,9 @@ const app = Effect.scoped(
 await Effect.runPromise(
   app.pipe(
     Effect.provide(
-      TlsHttpClient.layer({ profile: "chrome_146" }).pipe(Layer.provide(NodeServices.layer)),
+      TlsHttpClient.layer({ profile: "chrome_146" }).pipe(
+        Layer.provide(NodeServices.layer),
+      ),
     ),
   ),
 );
@@ -120,18 +124,75 @@ The Go Jar is the source of truth, including redirects and WebSocket
 handshakes:
 
 ```ts
-const cookies = yield * session.cookies(url);
-yield * session.setCookies(url, cookies);
-const snapshot = yield * session.exportCookies;
-yield * session.importCookies(snapshot);
-yield * session.setProxy("socks5://127.0.0.1:1080");
-yield * session.setProxy(null); // direct routing
+const program = Effect.gen(function* () {
+  const cookies = yield* session.cookies(url);
+  yield* session.setCookies(url, cookies);
+  const snapshot = yield* session.exportCookies;
+  yield* session.importCookies(snapshot);
+  yield* session.setProxy("socks5://127.0.0.1:1080");
+  yield* session.setProxy(null); // direct routing
+});
 ```
 
 Use `setCookies` rather than manually adding a `Cookie` header so domain, path,
 expiry, security, and redirect rules remain correct. `cookieJar: "strict"`
 rejects invalid/empty values; `cookieJar: "none"` disables the Jar. Proxy
 failures are typed `TlsRequestError` values with `kind: "Proxy"`.
+
+## Browser layer
+
+Import the optional facade from `effect-tls-client/browser`. It wraps one
+`TlsSession`, stamps navigation or XHR-style headers from a fixed identity, and
+follows bounded `Location` and actual HTML meta-refresh redirects. It does not
+infer redirects from scripts or form fields, or execute page JavaScript
+automatically. The Go-side cookie jar remains authoritative; browser requests
+reject manually supplied `Cookie` headers.
+
+For `chrome_146`, `chrome_146_PSK`, `chrome_152`, and `chrome_152_PSK`,
+`Browser.open` derives the matching identity when `identity` is omitted. An
+explicit identity remains available for customization, but for known Chrome
+profiles only its User-Agent's Chrome major is checked; this does not guarantee
+full fingerprint or platform consistency. A major mismatch fails with
+`BrowserSessionError` kind `Config`. Other and custom profiles require an
+explicit identity. `Browser.fromSession` always takes one because an existing
+`TlsSession`'s fixed identity is opaque and must be kept caller-aligned.
+
+```ts
+import { Effect, Layer } from "effect";
+import { NodeServices } from "@effect/platform-node";
+import { TlsClient } from "effect-tls-client";
+import * as Browser from "effect-tls-client/browser";
+
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const browser = yield* Browser.open({
+      transport: { profile: "chrome_152_PSK" },
+    });
+    const page = yield* browser.navigate("https://example.com/");
+    console.log(page.status, page.url, page.body.slice(0, 240));
+  }),
+);
+
+await Effect.runPromise(
+  program.pipe(
+    Effect.provide(TlsClient.layer.pipe(Layer.provide(NodeServices.layer))),
+  ),
+);
+```
+
+See [docs/browser.md](docs/browser.md) for the runnable Node/Bun example,
+cookie ownership, and challenge limitations. Navigation recognizes explicit
+provider headers only: AWS WAF's `x-amzn-waf-action: challenge` takes priority
+over Cloudflare's `cf-mitigated: challenge`; this is not a generic 403/page
+guess or an automatic Cloudflare resolver. The optional AWS WAF adapter remains
+a separate experimental import from `effect-tls-client/challenges/aws-waf` and
+does not change default behavior or enter the core barrel. `BrowserMock`'s
+process-backed script runtime requires Node 25+ (also when hosted from Bun); the
+transport remains supported on Node 22+ and Bun 1.4+. An optional
+`frameReviewer` adds experimental, load-only iframe support: it runs only
+caller-selected source in a separate VM realm, not a rendered browser, provider
+SDK integration, or clearance. The browser guide has explicit-origin,
+reviewed-bootstrap and iframe examples, with their limitations.
 
 ### WebSockets
 
@@ -140,14 +201,19 @@ frames remain distinct, and the socket participates in scope cleanup and credit
 flow control:
 
 ```ts
+import { Effect } from "effect";
 import * as Socket from "effect/unstable/socket/Socket";
 
-const socket = yield * session.webSocket("wss://example.test/echo");
-const reader = yield * socket.reader;
-const writer = yield * socket.writer;
-yield * writer.write("hello");
-const [reply] = yield * reader.pull;
-yield * writer.write(new Socket.CloseEvent(1000, "done"));
+const program = Effect.scoped(
+  Effect.gen(function* () {
+    const socket = yield* session.webSocket("wss://example.test/echo");
+    const reader = yield* socket.reader;
+    const writer = yield* socket.writer;
+    yield* writer.write("hello");
+    const [reply] = yield* reader.pull;
+    yield* writer.write(new Socket.CloseEvent(1000, "done"));
+  }),
+);
 ```
 
 Use `Effect.retry` around a complete handshake/session operation when a
@@ -201,14 +267,18 @@ No operation is retried implicitly. The exported
 import { Effect, Schedule } from "effect";
 import { isTransientRequestKind, TlsRequestError } from "effect-tls-client";
 
-const response =
-  yield *
-  session.request(url).pipe(
+const program = Effect.gen(function* () {
+  const response = yield* session.request(url).pipe(
     Effect.retry({
-      schedule: Schedule.exponential("100 millis").pipe(Schedule.upTo({ times: 3 })),
-      while: (error) => error instanceof TlsRequestError && isTransientRequestKind(error.kind),
+      schedule: Schedule.exponential("100 millis").pipe(
+        Schedule.upTo({ times: 3 }),
+      ),
+      while: (error) =>
+        error instanceof TlsRequestError && isTransientRequestKind(error.kind),
     }),
   );
+  return response;
+});
 ```
 
 Choose idempotency, backoff, and reconnect scope in the application. Do not
@@ -220,11 +290,13 @@ application-level HTTP response by default.
 Bandwidth is measured as TLS-level byte deltas without extra wire requests:
 
 ```ts
-const before = yield * session.bandwidth;
-const response = yield * session.request(url);
-console.log(yield * response.bytesRead, yield * response.bytesWritten);
-const total = yield * session.bandwidth;
-yield * session.resetBandwidth;
+const program = Effect.gen(function* () {
+  const before = yield* session.bandwidth;
+  const response = yield* session.request(url);
+  console.log(yield* response.bytesRead, yield* response.bytesWritten);
+  const total = yield* session.bandwidth;
+  yield* session.resetBandwidth;
+});
 ```
 
 The package exports `TlsClientMetrics.bytesRead`, `bytesWritten`, `requests`,
@@ -268,6 +340,8 @@ bun run build
 
 node examples/basic-request.mjs
 bun examples/basic-request.mjs
+node examples/browser.mjs
+bun examples/browser.mjs
 node examples/http-client.mjs
 bun examples/http-client.mjs
 node examples/websocket.mjs

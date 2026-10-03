@@ -48,6 +48,7 @@ import {
   CookiesExportMeta,
   CookiesGetMeta,
   CookiesImportMeta,
+  CookiesScriptMeta,
   CookiesSetMeta,
   EmptyMeta,
   HelloMeta,
@@ -90,6 +91,7 @@ type CallKind =
   | typeof FrameKind.cookiesSet
   | typeof FrameKind.cookiesExport
   | typeof FrameKind.cookiesImport
+  | typeof FrameKind.cookiesScript
   | typeof FrameKind.bandwidthGet
   | typeof FrameKind.bandwidthReset;
 
@@ -893,6 +895,12 @@ const makeBridge = Effect.gen(function* () {
       return encodeMeta(
         CookiesImportMeta,
         Schema.decodeUnknownSync(CookiesImportMeta)(meta ?? {}),
+      );
+    }
+    if (kind === FrameKind.cookiesScript) {
+      return encodeMeta(
+        CookiesScriptMeta,
+        Schema.decodeUnknownSync(CookiesScriptMeta)(meta ?? {}),
       );
     }
     return encodeMeta(

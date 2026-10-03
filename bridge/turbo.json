@@ -1,29 +1,20 @@
 {
   "$schema": "https://turborepo.dev/schema.json",
-  "extends": [
-    "//"
-  ],
+  "extends": ["//"],
   "tasks": {
     "build": {
-      "command": [
-        "bun",
-        "../scripts/build-bridge.ts",
-        "--host"
-      ],
-      "outputs": [
-        "bridge"
-      ],
+      "command": ["bun", "../scripts/build-bridge.ts", "--host"],
+      "outputs": ["bridge"],
       "inputs": [
-        "$TURBO_ROOT$/scripts/build-bridge.ts"
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/scripts/build-bridge.ts",
+        "$TURBO_ROOT$/packages/effect-tls-client/package.json",
+        "$TURBO_ROOT$/go.work",
+        "$TURBO_ROOT$/go.work.sum"
       ]
     },
     "test": {
-      "command": [
-        "go",
-        "test",
-        "-race",
-        "./..."
-      ]
+      "command": ["go", "test", "-race", "./..."]
     }
   }
 }

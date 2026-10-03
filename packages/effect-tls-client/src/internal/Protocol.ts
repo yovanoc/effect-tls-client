@@ -173,6 +173,22 @@ export interface CookiesImportMeta extends Schema.Schema.Type<
   typeof CookiesImportMeta
 > {}
 
+export const CookiesScriptMeta = Schema.Struct({
+  sessionId: Schema.String,
+  url: Schema.String,
+  setCookies: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+export interface CookiesScriptMeta extends Schema.Schema.Type<
+  typeof CookiesScriptMeta
+> {}
+
+export const CookiesScriptResultMeta = Schema.Struct({
+  cookie: Schema.String,
+});
+export interface CookiesScriptResultMeta extends Schema.Schema.Type<
+  typeof CookiesScriptResultMeta
+> {}
+
 export const CookiesResultMeta = Schema.Struct({
   cookies: Schema.Array(Cookie),
 });
@@ -206,6 +222,7 @@ export const RequestMeta = Schema.Struct({
   contentLength: Schema.optionalKey(NonNegativeInt),
   timeoutMs: Schema.optionalKey(NonNegativeInt),
   followRedirects: Schema.optionalKey(Schema.Boolean),
+  omitCredentials: Schema.optionalKey(Schema.Boolean),
   hostOverride: Schema.optionalKey(Schema.String),
   cookies: Schema.optionalKey(Schema.Array(Cookie)),
 }).check(
