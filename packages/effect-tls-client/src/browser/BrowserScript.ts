@@ -23,6 +23,8 @@ export const BrowserScriptContext = Schema.Struct({
   referrer: Schema.optionalKey(Schema.String),
   /** Explicit complete strict body fragment; BrowserMock validates it before spawn. */
   html: Schema.optionalKey(Schema.String),
+  /** Explicit whole strict document; mutually exclusive with html. */
+  document: Schema.optionalKey(Schema.String),
 });
 export interface BrowserScriptContext extends Schema.Schema.Type<
   typeof BrowserScriptContext

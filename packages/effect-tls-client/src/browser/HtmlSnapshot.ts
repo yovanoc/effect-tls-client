@@ -1,14 +1,15 @@
 /**
- * Parses a strict body-context HTML fragment subset, not a complete HTML document.
- * Ordinary tags are a, address, article, aside, b, blockquote, code, div, em,
- * footer, header, i, main, p, section, small, span, strong, sub, sup, and u;
- * standard void tags except col are accepted too. Non-void tags must be explicitly and
- * properly nested (anchors cannot nest, and p cannot contain a p-closing start
- * tag). Simple comments, quoted/unquoted/boolean attributes, and only the five
- * named references below plus valid decimal/hex numeric references are supported.
+ * Parses either a strict body-context HTML fragment or a complete document with
+ * explicit doctype/html/head/body roots. Ordinary tags are a, address, article,
+ * aside, b, blockquote, code, div, em, footer, header, i, main, p, section,
+ * small, span, strong, sub, sup, and u; standard void tags except col are
+ * accepted in body content. Non-void tags must be explicitly and properly
+ * nested (anchors cannot nest, and p cannot contain a p-closing start tag).
+ * Simple comments, quoted/unquoted/boolean attributes, and only the five named
+ * references below plus valid decimal/hex numeric references are supported.
  * Script and style are raw text only; script escape syntax is unsupported.
- * No document repair, execution, or loading occurs. Any syntax outside this
- * subset rejects the entire snapshot.
+ * No document repair, execution, or loading occurs. Any syntax outside the
+ * selected subset rejects the entire snapshot.
  */
 
 interface HtmlSnapshotNode {
@@ -22,7 +23,7 @@ interface HtmlSnapshotNode {
 
 interface HtmlSnapshot {
   readonly nodes: ReadonlyArray<HtmlSnapshotNode>;
-  /** TextContent of all fragment children in tree order. */
+  /** Fragment text in tree order, or textContent of the document element. */
   readonly textContent: string;
 }
 
@@ -53,6 +54,17 @@ interface MutableNode {
   readonly attributes: Array<[string, string]>;
   readonly textParts: string[];
 }
+
+type DocumentPhase =
+  | "fragment"
+  | "beforeDoctype"
+  | "beforeHtml"
+  | "beforeHead"
+  | "inHead"
+  | "afterHead"
+  | "inBody"
+  | "afterBody"
+  | "afterHtml";
 
 const MAX_ELEMENTS = 32;
 const MAX_ATTRIBUTE_BYTES = 16 * 1024;
@@ -242,7 +254,10 @@ const unsupportedTagReason = (tag: string): string => {
   return `element <${tag}> is outside the supported fragment subset`;
 };
 
-export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
+const parseHtml = (
+  input: string,
+  mode: "fragment" | "document",
+): HtmlSnapshotParseResult => {
   if (
     input.length > MAX_INPUT_BYTES ||
     new TextEncoder().encode(input).byteLength > MAX_INPUT_BYTES
@@ -259,6 +274,9 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
   const allText: string[] = [];
   let cursor = 0;
   let attributeBytes = 0;
+  let documentPhase: DocumentPhase =
+    mode === "document" ? "beforeDoctype" : "fragment";
+  const currentPhase = (): DocumentPhase => documentPhase;
 
   const abort = (result: ParseFailure): never => {
     throw new ParseAbort(result);
@@ -271,9 +289,86 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
       { readonly _tag: "LimitExceeded" }
     >["limit"],
   ): never => abort({ _tag: "LimitExceeded", limit });
+  const asciiEqualsAt = (position: number, value: string): boolean => {
+    for (let offset = 0; offset < value.length; offset += 1) {
+      let code = source.charCodeAt(position + offset);
+      if (code >= 0x41 && code <= 0x5a) code += 0x20;
+      if (code !== value.charCodeAt(offset)) return false;
+    }
+    return true;
+  };
+  const onlyHtmlWhitespace = (value: string): boolean => {
+    for (const character of value) {
+      if (!isHtmlWhitespace(character)) return false;
+    }
+    return true;
+  };
+  const parseDoctype = (): void => {
+    if (
+      !source.startsWith("<!", cursor) ||
+      !asciiEqualsAt(cursor + 2, "doctype")
+    ) {
+      reject("only the standard <!doctype html> is supported");
+    }
+    cursor += 9;
+    if (!isHtmlWhitespace(source[cursor])) {
+      reject("doctype keyword and name must be separated by whitespace");
+    }
+    while (isHtmlWhitespace(source[cursor])) cursor += 1;
+    if (!asciiEqualsAt(cursor, "html")) {
+      reject("only the standard <!doctype html> is supported");
+    }
+    cursor += 4;
+    if (!isHtmlWhitespace(source[cursor]) && source[cursor] !== ">") {
+      reject("legacy doctype identifiers are unsupported");
+    }
+    while (isHtmlWhitespace(source[cursor])) cursor += 1;
+    if (source[cursor] !== ">") {
+      reject("legacy doctype identifiers are unsupported");
+    }
+    cursor += 1;
+    documentPhase = "beforeHtml";
+  };
+  const isSupportedStartTag = (tag: string): boolean => {
+    if (mode === "fragment") return VOID_TAGS.has(tag) || NORMAL_TAGS.has(tag);
+    switch (currentPhase()) {
+      case "beforeHtml":
+        return tag === "html";
+      case "beforeHead":
+        return tag === "head";
+      case "inHead":
+        return (
+          tag === "meta" ||
+          tag === "link" ||
+          tag === "script" ||
+          tag === "style" ||
+          tag === "title"
+        );
+      case "afterHead":
+        return tag === "body";
+      case "inBody":
+        return VOID_TAGS.has(tag) || NORMAL_TAGS.has(tag);
+      default:
+        return false;
+    }
+  };
   const appendText = (text: string): void => {
     if (text === "") return;
     allText.push(text);
+    if (
+      mode === "document" &&
+      (currentPhase() === "afterBody" || currentPhase() === "afterHtml")
+    ) {
+      const html = nodes.find(
+        (node) => node.tag === "html" && node.parent === -1,
+      );
+      const body = nodes.find(
+        (node) => node.tag === "body" && node.parent === 0,
+      );
+      if (html !== undefined) html.textParts.push(text);
+      if (body !== undefined) body.textParts.push(text);
+      return;
+    }
     for (const parent of stack) {
       const node = nodes[parent];
       if (node !== undefined) node.textParts.push(text);
@@ -355,7 +450,7 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
     return decoded;
   };
 
-  const parseEndTag = (): void => {
+  const parseEndTag = (pop = true): string => {
     cursor += 2;
     if (!isAsciiLetter(source[cursor])) reject("invalid end tag");
     const nameStart = cursor;
@@ -379,7 +474,8 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
     if (parent === undefined || nodes[parent]?.tag !== tag) {
       reject(`unexpected or mismatched closing tag </${tag}>`);
     }
-    stack.pop();
+    if (pop) stack.pop();
+    return tag;
   };
 
   const rawTextCloseAt = (position: number, tag: string): boolean => {
@@ -428,12 +524,60 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
       if (source[cursor] !== "<") {
         const start = cursor;
         while (cursor < source.length && source[cursor] !== "<") cursor += 1;
-        appendText(decodeReferences(source.slice(start, cursor)));
+        const text = decodeReferences(source.slice(start, cursor));
+        if (mode === "document") {
+          if (!onlyHtmlWhitespace(text)) {
+            if (
+              currentPhase() === "beforeDoctype" ||
+              currentPhase() === "beforeHtml" ||
+              currentPhase() === "beforeHead" ||
+              currentPhase() === "inHead"
+            ) {
+              reject("non-whitespace text would trigger document repair");
+            }
+            if (
+              currentPhase() === "afterHead" ||
+              currentPhase() === "afterBody" ||
+              currentPhase() === "afterHtml"
+            ) {
+              reject("non-whitespace text outside the body is unsupported");
+            }
+          }
+          if (
+            currentPhase() === "beforeDoctype" ||
+            currentPhase() === "beforeHtml" ||
+            currentPhase() === "beforeHead"
+          ) {
+            continue;
+          }
+        }
+        appendText(text);
         continue;
       }
 
       if (source.startsWith("</", cursor)) {
-        parseEndTag();
+        if (mode === "document") {
+          if (currentPhase() === "inHead") {
+            const tag = parseEndTag();
+            if (tag === "head") documentPhase = "afterHead";
+          } else if (currentPhase() === "inBody") {
+            const tag = parseEndTag();
+            if (tag === "body") documentPhase = "afterBody";
+          } else if (currentPhase() === "afterBody") {
+            if (parseEndTag(false) !== "html") {
+              reject("only </html> may follow the body");
+            }
+            documentPhase = "afterHtml";
+          } else {
+            reject("unexpected end tag in document structure");
+          }
+        } else {
+          parseEndTag();
+        }
+        continue;
+      }
+      if (mode === "document" && currentPhase() === "beforeDoctype") {
+        parseDoctype();
         continue;
       }
       if (source.startsWith("<!", cursor) || source.startsWith("<?", cursor)) {
@@ -460,8 +604,11 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
       }
       const tag = source.slice(nameStart, cursor).toLowerCase();
       const isVoid = VOID_TAGS.has(tag);
-      if (!isVoid && !NORMAL_TAGS.has(tag)) {
-        reject(unsupportedTagReason(tag));
+      if (!isSupportedStartTag(tag)) {
+        if (mode === "fragment" || currentPhase() === "inBody") {
+          reject(unsupportedTagReason(tag));
+        }
+        reject(`unexpected <${tag}> in document structure`);
       }
       if (
         stack.some((index) => nodes[index]?.tag === "p") &&
@@ -574,6 +721,12 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
       nodes.push({ tag, parent, attributes, textParts: [] });
       if (!isVoid) stack.push(nodeIndex);
 
+      if (mode === "document") {
+        if (tag === "html") documentPhase = "beforeHead";
+        else if (tag === "head") documentPhase = "inHead";
+        else if (tag === "body") documentPhase = "inBody";
+      }
+
       if (tag === "script" || tag === "style") {
         let closing = cursor;
         while (closing < source.length && !rawTextCloseAt(closing, tag)) {
@@ -587,13 +740,44 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
         appendText(source.slice(cursor, closing));
         cursor = closing;
         parseEndTag();
+      } else if (mode === "document" && tag === "title") {
+        let closing = cursor;
+        while (closing < source.length && !rawTextCloseAt(closing, "title")) {
+          if (source[closing] === "<") {
+            reject("literal markup inside title RCDATA is unsupported");
+          }
+          closing += 1;
+        }
+        if (closing === source.length) reject("unterminated title element");
+        appendText(decodeReferences(source.slice(cursor, closing)));
+        cursor = closing;
+        parseEndTag();
       }
     }
 
-    if (stack.length > 0) {
-      reject(
-        `unclosed element <${nodes[stack[stack.length - 1] ?? 0]?.tag ?? "?"}>`,
-      );
+    if (mode === "fragment") {
+      if (stack.length > 0) {
+        reject(
+          `unclosed element <${nodes[stack[stack.length - 1] ?? 0]?.tag ?? "?"}>`,
+        );
+      }
+    } else if (
+      currentPhase() !== "afterHtml" ||
+      stack.length !== 1 ||
+      nodes[0]?.tag !== "html"
+    ) {
+      reject("incomplete or repaired HTML document");
+    }
+
+    if (mode === "document") {
+      const htmlChildren = nodes.filter((node) => node.parent === 0);
+      if (
+        htmlChildren.length !== 2 ||
+        htmlChildren[0]?.tag !== "head" ||
+        htmlChildren[1]?.tag !== "body"
+      ) {
+        reject("document must have exactly one head followed by one body");
+      }
     }
 
     return {
@@ -615,3 +799,11 @@ export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult => {
     throw error;
   }
 };
+
+/** Parses a strict body-context HTML fragment, rejecting all implicit repair. */
+export const parseHtmlSnapshot = (input: string): HtmlSnapshotParseResult =>
+  parseHtml(input, "fragment");
+
+/** Parses a complete document with explicit standard doctype, html, head, and body. */
+export const parseHtmlDocument = (input: string): HtmlSnapshotParseResult =>
+  parseHtml(input, "document");

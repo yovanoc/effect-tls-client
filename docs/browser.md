@@ -382,7 +382,7 @@ const evaluation = runtime.evaluate(source, context);
 
 This is a **complete supplied body fragment**, not an actual full reviewed page,
 HTML excerpt selection, full-document parsing, renderer, or provider proof.
-There is no automatic navigation/challenge body plumbing or Browser option.
+There is no automatic navigation/challenge body plumbing or Browser fragment option.
 The caller supplies it deliberately; use is explicit and nonautomated.
 
 The host parses the strict `HtmlSnapshot` subset before spawning. Supported ordinary
@@ -425,6 +425,69 @@ IDs/classes are case-sensitive under this fixed standards-style fragment model;
 no original-page quirks mode or full-page first-match guarantee is claimed.
 There is no `querySelectorAll`, unbounded element creation, layout, rendering,
 native-browser fingerprinting or provider-selector support.
+
+### Explicit complete-document snapshot (experimental)
+
+Low-level callers may instead pass `document?: string` in `BrowserScriptContext`,
+mutually exclusive with `html`. Supply a complete `<!doctype html>` document with
+explicit `html`, `head`, and `body` opening and closing tags:
+
+```ts
+const context = {
+  url: "http://localhost:43127/page",
+  cookie: "",
+  userAgent: "fixture",
+  document:
+    '<!doctype html><html lang="en" id="root"><head id="top"><meta name="fixture" content="yes"><title>Fixture</title></head><body id="page"><div id="seed">one<span>two</span></div></body></html>',
+};
+const evaluation = runtime.evaluate(
+  'return document.getElementById("seed").textContent;',
+  context,
+); // value: "onetwo"
+```
+
+All supported root attributes, head metadata, and ordinary body records are
+retained, or the entire input fails with `Unsupported` or `LimitExceeded`;
+there is no fragment extraction, HTML repair, rendering, or automatic execution.
+Head accepts only meta/link/title/script/style; title supports conservative
+character references but no `<`, and script/style text remains inert.
+Body uses the existing strict fragment grammar. Table, noscript, foreign content,
+form, base, omitted structural parts, legacy doctypes, and BOMs reject.
+Whitespace after `</body>` or `</html>` is appended to html/body `textContent`, following the native insertion-mode rules.
+
+Original parsed html/head/body attributes and record identity are readonly;
+`document.documentElement` is the actual root, also reachable by the supported
+query, tag, and ID lookups. Head/body bounded append delegates only to existing
+explicit caller-created script, frame, and ordinary-element authorization.
+Parsed LINK/META/SCRIPT/STYLE never load resources, run code, or fire events.
+
+The limits are 32 elements including these three roots, 16 KiB cumulative attribute-name/value
+bytes (shared with later mutable ordinary text), and 8,192 characters per attribute value or
+ordinary text assignment. Parsed snapshot text is bounded by the 128 KiB input and actual
+serialized IPC-line limits. Repeated ancestor `textContent` or JSON escaping can cause rejection.
+Child frames do not share the parent document. This is a source VM snapshot,
+not a full browser: no layout, styles, or `classList` support is claimed.
+Default challenge evaluation does not automatically supply response HTML or JS.
+The existing `html` fragment contract is unchanged; without `document`,
+`document.documentElement` remains absent.
+
+Challenge handlers can forward the **entire unmodified** `context.body` to the
+same strict document parser, keeping original reviewed program source separate:
+
+```ts
+const evaluation = Effect.gen(function* () {
+  return yield* context.evaluateClassic(originalSource, {
+    document: "response",
+  });
+});
+```
+
+Use `yield*`, not `await`: these methods return Effects. Async-body
+`context.evaluate(originalSource, { document: "response" })` takes the same strict
+option; omission supplies no document. No `context.html`, excerpts, repair,
+automatic HTML-script execution or lifecycle is added. Parsed records stay inert;
+resource/cookie grants and caps stay unchanged. No renderer, `classList`, native
+HTML-parser fidelity, provider fit, selector acquisition or clearance is promised.
 
 ### Experimental modeled element lookup
 

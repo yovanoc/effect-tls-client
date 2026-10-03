@@ -196,6 +196,15 @@ export interface BrowserChallengeResolution {
   readonly headers?: ReadonlyArray<Pair>;
 }
 
+const BrowserEvaluationOptionsSchema = Schema.Struct({
+  document: Schema.Literal("response"),
+});
+
+/** Explicitly project the entire original response body as an inert document. */
+export interface BrowserEvaluationOptions extends Schema.Schema.Type<
+  typeof BrowserEvaluationOptionsSchema
+> {}
+
 /** Context made available to an optional challenge handler. */
 export interface BrowserChallengeContext {
   readonly transport: TlsSession;
@@ -204,9 +213,11 @@ export interface BrowserChallengeContext {
   /** The runtime has a hard cutoff; host cookie reads/writes can still fail. */
   readonly evaluateClassic: (
     source: unknown,
+    options?: BrowserEvaluationOptions,
   ) => Effect.Effect<string, BrowserOperationError>;
   readonly evaluate: (
     source: unknown,
+    options?: BrowserEvaluationOptions,
   ) => Effect.Effect<string, BrowserOperationError>;
 }
 
@@ -1202,8 +1213,10 @@ const makeBrowserSession = (
   const evaluate = (
     response: TlsResponse,
     source: unknown,
-    referrer = "",
-    mode: "async" | "classic" = "async",
+    referrer: string,
+    mode: "async" | "classic",
+    body: string,
+    options?: BrowserEvaluationOptions,
   ) => {
     const runtime = handlers.scriptRuntime;
     if (runtime === undefined) {
@@ -1212,6 +1225,16 @@ const makeBrowserSession = (
       );
     }
     return Effect.gen(function* () {
+      const inputOptions = yield* Schema.decodeEffect(
+        Schema.UndefinedOr(BrowserEvaluationOptionsSchema),
+        { onExcessProperty: "error" },
+      )(options).pipe(
+        Effect.mapError(() =>
+          BrowserScriptError.make({
+            reason: "invalid browser evaluation options",
+          }),
+        ),
+      );
       yield* identityValidation;
       const allowedOrigins = yield* Effect.try({
         try: () => normalizeAllowedOrigins(runtime.allowedOrigins ?? []),
@@ -1251,6 +1274,7 @@ const makeBrowserSession = (
           userAgent: headerValue(identity.headers, "user-agent") ?? "",
           languages: identityLanguages(identity),
           referrer,
+          ...(inputOptions === undefined ? {} : { document: body }),
         },
         host,
         mode,
@@ -1393,10 +1417,24 @@ const makeBrowserSession = (
               transport,
               response,
               body,
-              evaluateClassic: (source) =>
-                evaluate(response, source, documentReferrer, "classic"),
-              evaluate: (source) =>
-                evaluate(response, source, documentReferrer),
+              evaluateClassic: (source, options) =>
+                evaluate(
+                  response,
+                  source,
+                  documentReferrer,
+                  "classic",
+                  body,
+                  options,
+                ),
+              evaluate: (source, options) =>
+                evaluate(
+                  response,
+                  source,
+                  documentReferrer,
+                  "async",
+                  body,
+                  options,
+                ),
             })
             .pipe(
               Effect.timeoutOrElse({

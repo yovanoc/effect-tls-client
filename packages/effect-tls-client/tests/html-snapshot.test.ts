@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { parseHtmlSnapshot } from "../src/browser/HtmlSnapshot.js";
+import {
+  parseHtmlDocument,
+  parseHtmlSnapshot,
+} from "../src/browser/HtmlSnapshot.js";
 
 describe("parseHtmlSnapshot", () => {
   it("preserves element identity, parentage, order, and complete textContent", () => {
@@ -226,6 +229,261 @@ describe("parseHtmlSnapshot", () => {
   it("checks the complete input against the UTF-8 byte limit before parsing", () => {
     expect(parseHtmlSnapshot("é".repeat(65_536))._tag).toBe("Success");
     expect(parseHtmlSnapshot("<".repeat(131_073))).toEqual({
+      _tag: "LimitExceeded",
+      limit: "inputBytes",
+    });
+  });
+});
+
+describe("parseHtmlDocument", () => {
+  it("preserves document roots, attributes, parentage, preorder, and textContent", () => {
+    expect(
+      parseHtmlDocument(
+        '<!DoCtYpE hTmL><HTML LANG="en"><HEAD data-head=x><meta charset=utf-8><link rel=icon><title>Hi &amp; &#x1F642;</title><script>if (a < b) "&amp;";</script><style>h1 { color: red }</style></HEAD><BODY class=main>Hi <strong>there</strong>!</BODY></HTML>',
+      ),
+    ).toEqual({
+      _tag: "Success",
+      snapshot: {
+        textContent: 'Hi & 🙂if (a < b) "&amp;";h1 { color: red }Hi there!',
+        nodes: [
+          {
+            tag: "html",
+            parent: -1,
+            attributes: [["lang", "en"]],
+            textContent: 'Hi & 🙂if (a < b) "&amp;";h1 { color: red }Hi there!',
+          },
+          {
+            tag: "head",
+            parent: 0,
+            attributes: [["data-head", "x"]],
+            textContent: 'Hi & 🙂if (a < b) "&amp;";h1 { color: red }',
+          },
+          {
+            tag: "meta",
+            parent: 1,
+            attributes: [["charset", "utf-8"]],
+            textContent: "",
+          },
+          {
+            tag: "link",
+            parent: 1,
+            attributes: [["rel", "icon"]],
+            textContent: "",
+          },
+          {
+            tag: "title",
+            parent: 1,
+            attributes: [],
+            textContent: "Hi & 🙂",
+          },
+          {
+            tag: "script",
+            parent: 1,
+            attributes: [],
+            textContent: 'if (a < b) "&amp;";',
+          },
+          {
+            tag: "style",
+            parent: 1,
+            attributes: [],
+            textContent: "h1 { color: red }",
+          },
+          {
+            tag: "body",
+            parent: 0,
+            attributes: [["class", "main"]],
+            textContent: "Hi there!",
+          },
+          {
+            tag: "strong",
+            parent: 7,
+            attributes: [],
+            textContent: "there",
+          },
+        ],
+      },
+    });
+  });
+
+  it("places whitespace according to document insertion mode and ignores comments", () => {
+    const result = parseHtmlDocument(
+      " \n<!--before doctype--> <!doctype html>\n<!--before html--> \n<html> \n<!--before head--><head>\n<title>x</title>\n</head> \n<!--between head and body--><body>y</body> \t</html>\r\n",
+    );
+
+    expect(result).toMatchObject({
+      _tag: "Success",
+      snapshot: {
+        textContent: "\nx\n \ny \t\n",
+        nodes: [
+          { tag: "html", parent: -1, textContent: "\nx\n \ny \t\n" },
+          { tag: "head", parent: 0, textContent: "\nx\n" },
+          { tag: "title", parent: 1, textContent: "x" },
+          { tag: "body", parent: 0, textContent: "y \t\n" },
+        ],
+      },
+    });
+  });
+
+  it("reprocesses post-body and post-html whitespace in body", () => {
+    expect(
+      parseHtmlDocument(
+        "<!doctype html><html><head></head><body>y</body>\n</html>\n",
+      ),
+    ).toEqual({
+      _tag: "Success",
+      snapshot: {
+        textContent: "y\n\n",
+        nodes: [
+          {
+            tag: "html",
+            parent: -1,
+            attributes: [],
+            textContent: "y\n\n",
+          },
+          { tag: "head", parent: 0, attributes: [], textContent: "" },
+          { tag: "body", parent: 0, attributes: [], textContent: "y\n\n" },
+        ],
+      },
+    });
+  });
+
+  it("reprocesses CRLF whitespace and ignores comments after body and html", () => {
+    expect(
+      parseHtmlDocument(
+        "<!doctype html><html><head></head><body>y</body>\r\n<!-- body -->\t</html>\r\n<!-- html -->\r\n",
+      ),
+    ).toEqual({
+      _tag: "Success",
+      snapshot: {
+        textContent: "y\n\t\n\n",
+        nodes: [
+          {
+            tag: "html",
+            parent: -1,
+            attributes: [],
+            textContent: "y\n\t\n\n",
+          },
+          { tag: "head", parent: 0, attributes: [], textContent: "" },
+          {
+            tag: "body",
+            parent: 0,
+            attributes: [],
+            textContent: "y\n\t\n\n",
+          },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    ["missing doctype", "<html><head></head><body></body></html>"],
+    [
+      "legacy doctype",
+      '<!doctype html PUBLIC "legacy"><html><head></head><body></body></html>',
+    ],
+    [
+      "leading BOM",
+      "\uFEFF<!doctype html><html><head></head><body></body></html>",
+    ],
+    ["missing html root", "<!doctype html><head></head><body></body>"],
+    ["missing head root", "<!doctype html><html><body></body></html>"],
+    ["missing body root", "<!doctype html><html><head></head></html>"],
+    [
+      "duplicate body",
+      "<!doctype html><html><head></head><body></body><body></body></html>",
+    ],
+    [
+      "duplicate head",
+      "<!doctype html><html><head></head><head></head><body></body></html>",
+    ],
+    [
+      "base in head",
+      "<!doctype html><html><head><base href=/></head><body></body></html>",
+    ],
+    [
+      "unsupported head element",
+      "<!doctype html><html><head><div></div></head><body></body></html>",
+    ],
+    [
+      "head text implying repair",
+      "<!doctype html><html><head>metadata</head><body></body></html>",
+    ],
+    [
+      "body before head close",
+      "<!doctype html><html><head><body></body></head></html>",
+    ],
+    [
+      "after-body content",
+      "<!doctype html><html><head></head><body></body><p>tail</p></html>",
+    ],
+    [
+      "after-html content",
+      "<!doctype html><html><head></head><body></body></html>tail",
+    ],
+    [
+      "literal title markup",
+      "<!doctype html><html><head><title>a <b>x</b></title></head><body></body></html>",
+    ],
+    [
+      "body table repair",
+      "<!doctype html><html><head></head><body><table><tr><td>x</td></tr></table></body></html>",
+    ],
+    [
+      "body noscript semantics",
+      "<!doctype html><html><head></head><body><noscript>x</noscript></body></html>",
+    ],
+    [
+      "body foreign content",
+      "<!doctype html><html><head></head><body><svg></svg></body></html>",
+    ],
+    [
+      "body form semantics",
+      "<!doctype html><html><head></head><body><form></form></body></html>",
+    ],
+    [
+      "script escape syntax",
+      "<!doctype html><html><head><script><!--x--></script></head><body></body></html>",
+    ],
+  ])(
+    "rejects %s without repairing or returning a partial document",
+    (_case, html) => {
+      const result = parseHtmlDocument(html);
+      expect(result._tag).toBe("Unsupported");
+      if (result._tag === "Unsupported") expect(result.reason).toBeTruthy();
+    },
+  );
+
+  it("counts structural roots toward the element limit", () => {
+    const prefix = "<!doctype html><html><head></head><body>";
+    const suffix = "</body></html>";
+    expect(
+      parseHtmlDocument(`${prefix}${"<br>".repeat(29)}${suffix}`)._tag,
+    ).toBe("Success");
+    expect(parseHtmlDocument(`${prefix}${"<br>".repeat(30)}${suffix}`)).toEqual(
+      {
+        _tag: "LimitExceeded",
+        limit: "elements",
+      },
+    );
+  });
+
+  it("shares per-value, aggregate-attribute, and complete-input limits", () => {
+    expect(
+      parseHtmlDocument(
+        `<!doctype html><html a="${"x".repeat(8193)}"><head></head><body></body></html>`,
+      ),
+    ).toEqual({ _tag: "LimitExceeded", limit: "attributeValueCharacters" });
+    expect(
+      parseHtmlDocument(
+        `<!doctype html><html a="${"é".repeat(4096)}"><head b="${"é".repeat(4096)}"></head><body></body></html>`,
+      ),
+    ).toEqual({ _tag: "LimitExceeded", limit: "attributesUtf8Bytes" });
+
+    const prefix = "<!doctype html><html><head></head><body>";
+    const suffix = "</body></html>";
+    const text = "x".repeat(131_072 - prefix.length - suffix.length);
+    expect(parseHtmlDocument(`${prefix}${text}${suffix}`)._tag).toBe("Success");
+    expect(parseHtmlDocument(`${prefix}${text}x${suffix}`)).toEqual({
       _tag: "LimitExceeded",
       limit: "inputBytes",
     });

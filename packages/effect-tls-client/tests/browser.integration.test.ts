@@ -11,9 +11,11 @@ import {
   Effect,
   Layer,
   Option,
+  Result,
   Schema,
   type Scope,
 } from "effect";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import * as Browser from "../src/browser/index.js";
 import { awsWafChallengeHandler } from "../src/challenges/AwsWaf.js";
 import { TlsClient } from "../src/index.js";
@@ -58,7 +60,10 @@ const ExportedCookies = Schema.fromJsonString(
   ),
 );
 
-const startFixture = async (): Promise<{
+const startFixture = async (
+  _signal?: AbortSignal,
+  body = "challenge",
+): Promise<{
   readonly url: string;
   readonly cookies: Array<string>;
   readonly close: () => Promise<void>;
@@ -74,7 +79,7 @@ const startFixture = async (): Promise<{
         "server-secret=hidden; Path=/private; HttpOnly",
         "read-secret=hidden; Path=/; HttpOnly",
       ]);
-      response.end("challenge");
+      response.end(body);
       return;
     }
     if (path === "/private/success") {
@@ -522,6 +527,271 @@ const awsWafHandler = (
   });
 
 describeRealIntegration("real BrowserMock integration", () => {
+  it.live(
+    "opts into the entire original response document without activating markup",
+    () =>
+      Effect.gen(function* () {
+        const body =
+          '<!doctype html><html lang="en" id="root"><head id="top" class="metadata"><title>Local &amp; exact</title><meta name="fixture" content="yes"><link href="/never.css" rel="stylesheet"><style id="css">body{}</style><script id="inert" src="/never.js">window.markupRuns = 1; document.cookie = "markup=bad";</script></head><body id="page" class="main"><div id="seed" class="a b">one&amp;<span>two</span></div><a href="/never-link">link</a></body></html>';
+        const fixture = yield* Effect.promise(() =>
+          startFixture(undefined, body),
+        );
+        const inspect = `
+        const root = document.documentElement, head = document.head, body = document.body;
+        if (root !== document.querySelector('html#root') || root.getAttribute('lang') !== 'en') throw new Error('root');
+        if (head !== document.querySelector('head.metadata') || head !== document.getElementById('top')) throw new Error('head');
+        if (body !== document.querySelector('body.main') || body !== document.getElementById('page')) throw new Error('body');
+        if (document.querySelector('title').textContent !== 'Local & exact' || document.querySelector('meta').getAttribute('content') !== 'yes') throw new Error('head data');
+        if (document.querySelector('div.a.b') !== document.getElementById('seed') || document.getElementById('seed').textContent !== 'one&two') throw new Error('body data');
+        if (document.querySelector('script#inert').getAttribute('src') !== '/never.js' || document.querySelector('link').getAttribute('href') !== '/never.css') throw new Error('inert data');
+        if (window.markupRuns !== undefined || document.cookie.includes('markup=bad')) throw new Error('markup activated');
+        let rejected = false; try { document.querySelector('*'); } catch(e) { rejected = e instanceof TypeError; } if (!rejected) throw new Error('selector');
+        rejected = false; try { root.id = 'changed'; } catch { rejected = true; } if (!rejected) throw new Error('mutable root');
+      `;
+        yield* withChallengeBrowser(
+          fixture,
+          (_, context) =>
+            Effect.gen(function* () {
+              expect(context.body).toBe(body);
+              const defaults = `JSON.stringify([document.documentElement === undefined, document.getElementById('root') === null, document.getElementById('seed') === null, window.markupRuns === undefined])`;
+              expect(yield* context.evaluateClassic(defaults)).toBe(
+                "[true,true,true,true]",
+              );
+              expect(yield* context.evaluate(`return ${defaults};`)).toBe(
+                "[true,true,true,true]",
+              );
+              // Separate authored classic programs must retain their own lexical source.
+              expect(
+                yield* context.evaluateClassic(inspect + '\n"classic-one";', {
+                  document: "response",
+                }),
+              ).toBe("classic-one");
+              expect(
+                yield* context.evaluateClassic(
+                  'const authored = document.querySelector("title").textContent; authored;',
+                  { document: "response" },
+                ),
+              ).toBe("Local & exact");
+              expect(
+                yield* context.evaluate(
+                  inspect + '\nawait Promise.resolve(); return "async";',
+                  { document: "response" },
+                ),
+              ).toBe("async");
+              expect(
+                yield* context.transport.scriptCookies(context.response.url),
+              ).toBe("");
+              return Option.none();
+            }),
+          (browser) => browser.navigate(`${fixture.url}/challenge`),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+        expect(fixture.cookies).toEqual([""]);
+      }),
+  );
+
+  it.live(
+    "carries the exact body and unchanged sources only on explicit opt-in",
+    () =>
+      Effect.gen(function* () {
+        const body =
+          '<!doctype html>\n<html id="root"><head id="head"><title>exact &amp; original</title></head><body><div id="body">fixture</div></body></html>\n';
+        const fixture = yield* Effect.promise(() =>
+          startFixture(undefined, body),
+        );
+        const calls: Array<{
+          readonly source: string;
+          readonly context: Browser.BrowserScriptContext | undefined;
+        }> = [];
+        const evaluate: Browser.BrowserScriptRuntime["evaluate"] = (
+          source,
+          context,
+        ) => {
+          calls.push({ source, context });
+          return Effect.succeed({ value: "authored", setCookies: [] });
+        };
+        const runtime: Browser.BrowserScriptRuntime = {
+          evaluate,
+          evaluateClassic: evaluate,
+        };
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const browser = yield* Browser.open(
+              { transport: { profile: "chrome_146", forceHttp1: true } },
+              {
+                scriptRuntime: runtime,
+                challengeHandler: (_, context) =>
+                  Effect.gen(function* () {
+                    for (const runEvaluation of [
+                      context.evaluate,
+                      context.evaluateClassic,
+                    ]) {
+                      const source =
+                        '/* authored whitespace */\nconst lexical = "local";\nlexical;';
+                      yield* runEvaluation(source);
+                      yield* runEvaluation(source, { document: "response" });
+                      for (const options of [
+                        null,
+                        1,
+                        false,
+                        "response",
+                        [],
+                        {},
+                        { html: "response" },
+                        { document: "response", unknown: "private" },
+                      ]) {
+                        const result = yield* Effect.result(
+                          // @ts-expect-error exercise invalid JavaScript caller options at the public boundary
+                          runEvaluation(source, options),
+                        );
+                        expect(Result.isFailure(result)).toBe(true);
+                        if (!Result.isFailure(result))
+                          return yield* Effect.die(
+                            "unexpected evaluation success",
+                          );
+                        const failure = result.failure;
+                        expect(failure).toMatchObject({
+                          _tag: "BrowserScriptError",
+                          reason: "invalid browser evaluation options",
+                        });
+                        expect(failure).not.toHaveProperty("cause");
+                      }
+                    }
+                    expect(calls).toHaveLength(4);
+                    for (const offset of [0, 2]) {
+                      const original = calls[offset];
+                      const opted = calls[offset + 1];
+                      expect(original?.source).toBe(
+                        '/* authored whitespace */\nconst lexical = "local";\nlexical;',
+                      );
+                      expect(opted?.source).toBe(original?.source);
+                      expect(original?.context).not.toHaveProperty("document");
+                      expect(original?.context).not.toHaveProperty("html");
+                      expect(opted?.context).toEqual({
+                        ...original?.context,
+                        document: body,
+                      });
+                    }
+                    return Option.none();
+                  }),
+              },
+            );
+            yield* browser.navigate(`${fixture.url}/challenge`);
+          }).pipe(Effect.provide(browserServices(fixture.url))),
+        ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+        expect(fixture.cookies).toEqual([""]);
+      }),
+  );
+
+  it.live(
+    "rejects response-document options and invalid whole bodies before guest spawn",
+    () =>
+      Effect.gen(function* () {
+        let spawns = 0;
+        const platform = Layer.mergeAll(
+          NodeServices.layer,
+          ConfigProvider.layer(
+            ConfigProvider.fromUnknown({ TLS_CLIENT_BRIDGE_PATH: bridgePath }),
+          ),
+        );
+        const services = Layer.mergeAll(
+          TlsClient.layer.pipe(Layer.provide(platform)),
+          Browser.BrowserMock.layer().pipe(
+            Layer.provide(
+              Layer.mock(ChildProcessSpawner.ChildProcessSpawner, {
+                spawn: () => {
+                  spawns += 1;
+                  return Effect.die("unexpected guest spawn");
+                },
+              }),
+            ),
+          ),
+        );
+        const valid = "<!doctype html><html><head></head><body></body></html>";
+        for (const body of [
+          valid,
+          valid.replace("<body>", "<body><noscript>x</noscript>"),
+          valid + "x",
+          valid.replace(
+            "<body>",
+            '<body><div title="' + "x".repeat(8193) + '"></div>',
+          ),
+          valid.replace(
+            "<body>",
+            '<body><div a="' +
+              "x".repeat(8192) +
+              '" b="' +
+              "x".repeat(8192) +
+              '" c="x"></div>',
+          ),
+          valid.replace("<body>", "<body>" + "<div></div>".repeat(30)),
+          valid.replace("<body>", "<body>" + "x".repeat(128 * 1024)),
+        ]) {
+          const fixture = yield* Effect.promise(() =>
+            startFixture(undefined, body),
+          );
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const runtime = yield* Browser.BrowserMock;
+              const browser = yield* Browser.open(
+                { transport: { profile: "chrome_146", forceHttp1: true } },
+                {
+                  scriptRuntime: runtime,
+                  challengeHandler: (_, context) =>
+                    Effect.gen(function* () {
+                      for (const runEvaluation of [
+                        context.evaluate,
+                        context.evaluateClassic,
+                      ]) {
+                        const options =
+                          body === valid
+                            ? [
+                                null,
+                                "response",
+                                [],
+                                { document: "html" },
+                                { html: "response" },
+                                {
+                                  document: "response",
+                                  extra: "private-option",
+                                },
+                                {},
+                              ]
+                            : [{ document: "response" }];
+                        for (const option of options) {
+                          const result = yield* Effect.result(
+                            runEvaluation(
+                              'fetch("/must-not-run"); document.cookie = "guest=bad";',
+                              // @ts-expect-error exercise invalid JavaScript caller options
+                              option,
+                            ),
+                          );
+                          expect(Result.isFailure(result)).toBe(true);
+                          if (!Result.isFailure(result))
+                            return yield* Effect.die(
+                              "unexpected evaluation success",
+                            );
+                          const failure = result.failure;
+                          expect(failure).toMatchObject({
+                            _tag: "BrowserScriptError",
+                          });
+                          expect(failure).not.toHaveProperty("cause");
+                          expect(failure).not.toHaveProperty("options");
+                          expect(failure).not.toHaveProperty("document");
+                        }
+                      }
+                      return Option.none();
+                    }),
+                },
+              );
+              yield* browser.navigate(`${fixture.url}/challenge`);
+            }).pipe(Effect.provide(services)),
+          ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
+          expect(fixture.cookies).toEqual([""]);
+        }
+        expect(spawns).toBe(0);
+      }),
+  );
+
   it.live(
     "sends session credentials only to the page origin, including redirects",
     () =>

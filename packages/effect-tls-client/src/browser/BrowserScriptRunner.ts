@@ -30,6 +30,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const jsonParse = JSON.parse;
   const documentSnapshot = jsonParse(__documentSnapshot);
   delete globalThis.__documentSnapshot;
+  const documentRoot = jsonParse(__documentRoot);
+  delete globalThis.__documentRoot;
+  const parsedDocument = documentRoot ?? documentSnapshot;
   const jsonStringify = JSON.stringify;
   const pageLocationData = jsonParse(__pageLocation);
   delete globalThis.__pageLocation;
@@ -1597,7 +1600,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     set: readonlySnapshot, defineProperty: readonlySnapshot, deleteProperty: readonlySnapshot,
     setPrototypeOf: readonlySnapshot, preventExtensions: readonlySnapshot,
   });
-  const snapshotNodes = (documentSnapshot?.nodes ?? []).map((record) => {
+  const headNodes = [];
+  const bodyNodes = [];
+  const snapshotNodes = (parsedDocument?.nodes ?? []).map((record, index) => {
     const attributes = new Map(record.attributes);
     const node = objectCreate(null);
     objectDefineProperties(node, {
@@ -1610,7 +1615,10 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
       getAttribute: { value: (name) => attributes.get(NativeString(name).toLowerCase()) ?? null },
       hasAttribute: { value: (name) => attributes.has(NativeString(name).toLowerCase()) },
       setAttribute: { value: readonlySnapshot }, removeAttribute: { value: readonlySnapshot },
-      appendChild: { value: readonlySnapshot },
+      appendChild: { value: documentRoot !== null && (record.tag === "head" || record.tag === "body")
+        ? (element) => appendScript(element, record.tag === "head" ? headNodes : bodyNodes, snapshotNodes[index])
+        : readonlySnapshot },
+      ...(documentRoot === null ? {} : { parentNode: { get: () => record.parent === -1 ? null : snapshotNodes[record.parent], enumerable: true } }),
     });
     const immutable = new Proxy(objectFreeze(node), {
       set: readonlySnapshot, defineProperty: readonlySnapshot, deleteProperty: readonlySnapshot,
@@ -1619,8 +1627,6 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     snapshotRecords.set(immutable, { attributes });
     return immutable;
   });
-  const headNodes = [];
-  const bodyNodes = [];
   let scriptNodeCount = 0;
   let scriptAttributeBytes = 0;
   const scriptAttributeNames = ["src", "type", "integrity", "crossorigin", "async", "defer", "nomodule", "id", "nonce"];
@@ -1886,9 +1892,11 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     frameNodes.set(element, state);
     return objectFreeze(element);
   };
+  const bodyIndex = documentRoot === null ? -1 : documentRoot.nodes.findIndex((record) => record.tag === "body");
   objectDefineProperties(document, {
-    head: { value: objectFreeze({ appendChild: (element) => appendScript(element, headNodes, document.head) }), enumerable: true },
-    body: { value: objectFreeze({ appendChild: (element) => appendScript(element, bodyNodes, document.body), ...(documentSnapshot === null ? {} : { textContent: documentSnapshot.textContent }) }), enumerable: true },
+    ...(documentRoot === null ? {} : { documentElement: { value: snapshotNodes[0], enumerable: true } }),
+    head: { value: documentRoot === null ? objectFreeze({ appendChild: (element) => appendScript(element, headNodes, document.head) }) : snapshotNodes[1], enumerable: true },
+    body: { value: documentRoot === null ? objectFreeze({ appendChild: (element) => appendScript(element, bodyNodes, document.body), ...(documentSnapshot === null ? {} : { textContent: documentSnapshot.textContent }) }) : snapshotNodes[bodyIndex], enumerable: true },
   });
   // Actual realm records only: head subtree preorder, fragment preorder, body subtree preorder.
   const ordinaryPreorder = (nodes, result = []) => {
@@ -1899,15 +1907,17 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     }
     return result;
   };
-  const documentNodes = () => [...ordinaryPreorder(headNodes), ...snapshotNodes, ...ordinaryPreorder(bodyNodes)];
+  const documentNodes = () => documentRoot === null
+    ? [...ordinaryPreorder(headNodes), ...snapshotNodes, ...ordinaryPreorder(bodyNodes)]
+    : [...snapshotNodes.slice(0, bodyIndex), ...ordinaryPreorder(headNodes), ...snapshotNodes.slice(bodyIndex), ...ordinaryPreorder(bodyNodes)];
   const tagCollections = objectCreate(null);
-  const tags = new Set(["head", "body", "script", ...ordinaryTags, ...(documentSnapshot?.nodes ?? []).map((record) => record.tag)]);
+  const tags = new Set(["head", "body", "script", ...ordinaryTags, ...(parsedDocument?.nodes ?? []).map((record) => record.tag)]);
   for (const tag of tags) {
     const matching = () => documentNodes().filter((node) => node.tagName.toLowerCase() === tag);
-    const length = () => tag === "head" || tag === "body" ? 1 : matching().length;
+    const length = () => documentRoot === null && (tag === "head" || tag === "body") ? 1 : matching().length;
     const at = (index) => {
       if (index >= length()) return undefined;
-      if (tag === "head" || tag === "body") return tag === "head" ? document.head : document.body;
+      if (documentRoot === null && (tag === "head" || tag === "body")) return tag === "head" ? document.head : document.body;
       return matching()[index];
     };
     const readonly = () => { throw new NativeTypeError("modeled element collection is read-only"); };
@@ -1953,7 +1963,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     const tag = /^[A-Za-z][A-Za-z0-9-]*/.exec(selector)?.[0].toLowerCase();
     const parts = selector.match(/[#.][A-Za-z_][A-Za-z0-9_-]*/g) ?? [];
     if (parts.filter((part) => part[0] === "#").length > 1) throw new NativeTypeError("unsupported selector syntax");
-    if ((tag === "head" || tag === "body") && parts.length === 0) return document[tag];
+    if (documentRoot === null && (tag === "head" || tag === "body") && parts.length === 0) return document[tag];
     for (const node of documentNodes()) {
       if (tag !== undefined && node.tagName.toLowerCase() !== tag) continue;
       const state = snapshotRecords.get(node) ?? ordinaryState(node) ?? scriptNodes.get(node) ?? frameNodes.get(node);
@@ -2260,7 +2270,7 @@ const post = (line, owner = context) => {
 const bootstrap = ${JSON.stringify(bootstrap)};
 // Node 25 can retain VM-created globals after deletion through the host sandbox.
 // These fixed kernel sources run before any guest code and verify realm-local removal.
-const cleanupPrivateBindings = "{ for (const key of ['__scriptErrorReporter', '__receive', '__post', '__childRealm', '__consumeBudget', '__documentSnapshot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupPrivateBindings = "{ for (const key of ['__scriptErrorReporter', '__receive', '__post', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const handleParentLine = (line) => {
   try {
@@ -2363,6 +2373,7 @@ const createRealm = (input, childRealm) => {
     __post: (line) => post(line, realm),
     __childRealm: childRealm,
     __documentSnapshot: JSON.stringify(childRealm ? null : input.documentSnapshot ?? null),
+    __documentRoot: JSON.stringify(childRealm ? null : input.documentRoot ?? null),
     __consumeBudget: consumeBudget,
     __urlOperation: hostUrlOperation,
     __pageUrl: String(input.url),
@@ -2390,7 +2401,8 @@ const createRealm = (input, childRealm) => {
 };
 const start = (input) => {
   if (!Number.isInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > ${limits.maxTimeoutMs}) throw new Error("invalid script evaluation timeout");
-  const snapshot = input.documentSnapshot;
+  if (input.documentRoot !== undefined && input.documentSnapshot !== undefined) throw new Error("conflicting document snapshots");
+  const snapshot = input.documentRoot === undefined ? input.documentSnapshot : input.documentRoot;
   if (snapshot !== undefined) {
     if (!snapshot || !Array.isArray(snapshot.nodes) || typeof snapshot.textContent !== "string" || snapshot.nodes.length > 32) throw new Error("invalid document snapshot");
     let bytes = 0;
@@ -2399,6 +2411,20 @@ const start = (input) => {
       for (const pair of node.attributes) {
         if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string" || typeof pair[1] !== "string" || pair[1].length > 8192) throw new Error("invalid document snapshot attribute");
         bytes += Buffer.byteLength(pair[0]) + Buffer.byteLength(pair[1]);
+      }
+    }
+    if (input.documentRoot !== undefined) {
+      const nodes = snapshot.nodes;
+      const body = nodes.findIndex((node) => node.tag === "body");
+      if (nodes[0]?.tag !== "html" || nodes[0].parent !== -1 || nodes[1]?.tag !== "head" || nodes[1].parent !== 0 || body < 2 || nodes[body].parent !== 0 || snapshot.textContent !== nodes[0].textContent) throw new Error("invalid document root structure");
+      const bodyTags = new Set("a address article aside b blockquote code div em footer header i main p section small span strong sub sup u script style area base br embed hr img input link meta param source track wbr".split(" "));
+      const ancestors = [0];
+      for (let index = 1; index < nodes.length; index++) {
+        const node = nodes[index];
+        while (ancestors.length > 0 && ancestors.at(-1) !== node.parent) ancestors.pop();
+        if (ancestors.length === 0 || (index !== 1 && index !== body && (node.parent === 0 || ["html", "head", "body"].includes(node.tag)))) throw new Error("invalid document root structure");
+        if (index !== 1 && index !== body && (index < body ? node.parent !== 1 || !["meta", "link", "script", "style", "title"].includes(node.tag) : node.parent < body || !bodyTags.has(node.tag) || ["script", "style", "area", "base", "br", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"].includes(nodes[node.parent].tag))) throw new Error("invalid document root structure");
+        ancestors.push(index);
       }
     }
     if (!consumeBudget("node", snapshot.nodes.length) || !consumeBudget("attribute", bytes)) throw new Error("document snapshot budget exceeded");

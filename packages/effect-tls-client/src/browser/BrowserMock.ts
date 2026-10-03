@@ -20,7 +20,7 @@ import {
   type BrowserScriptRuntime,
 } from "./BrowserScript.js";
 import { makeBrowserScriptRunnerSource } from "./BrowserScriptRunner.js";
-import { parseHtmlSnapshot } from "./HtmlSnapshot.js";
+import { parseHtmlDocument, parseHtmlSnapshot } from "./HtmlSnapshot.js";
 import {
   normalizeAllowedOrigins,
   resolveAllowedUrl,
@@ -92,6 +92,71 @@ const DocumentSnapshot = Schema.Struct({
   ),
 );
 
+const DocumentRoot = DocumentSnapshot.check(
+  Schema.makeFilter((snapshot) => {
+    const nodes = snapshot.nodes;
+    const body = nodes.findIndex((node) => node.tag === "body");
+    if (
+      nodes[0]?.tag !== "html" ||
+      nodes[0].parent !== -1 ||
+      nodes[1]?.tag !== "head" ||
+      nodes[1].parent !== 0 ||
+      body < 2 ||
+      nodes[body]?.parent !== 0 ||
+      snapshot.textContent !== nodes[0].textContent
+    )
+      return "invalid document root structure";
+    const bodyTags = new Set(
+      "a address article aside b blockquote code div em footer header i main p section small span strong sub sup u script style area base br embed hr img input link meta param source track wbr".split(
+        " ",
+      ),
+    );
+    const ancestors = [0];
+    for (let index = 1; index < nodes.length; index++) {
+      const node = nodes[index];
+      if (node === undefined) return "invalid document root structure";
+      while (ancestors.length > 0 && ancestors.at(-1) !== node.parent)
+        ancestors.pop();
+      if (
+        ancestors.length === 0 ||
+        (index !== 1 &&
+          index !== body &&
+          (node.parent === 0 || ["html", "head", "body"].includes(node.tag)))
+      )
+        return "invalid document root structure";
+      if (
+        index !== 1 &&
+        index !== body &&
+        (index < body
+          ? node.parent !== 1 ||
+            !["meta", "link", "script", "style", "title"].includes(node.tag)
+          : node.parent < body ||
+            !bodyTags.has(node.tag) ||
+            [
+              "script",
+              "style",
+              "area",
+              "base",
+              "br",
+              "embed",
+              "hr",
+              "img",
+              "input",
+              "link",
+              "meta",
+              "param",
+              "source",
+              "track",
+              "wbr",
+            ].includes(nodes[node.parent]?.tag ?? ""))
+      )
+        return "invalid document root structure";
+      ancestors.push(index);
+    }
+    return true;
+  }),
+);
+
 const RunnerStart = Schema.Struct({
   type: Schema.Literal("start"),
   timeoutMs: TimeoutMs,
@@ -104,7 +169,15 @@ const RunnerStart = Schema.Struct({
   referrer: Schema.String,
   authoritativeCookies: Schema.Boolean,
   documentSnapshot: Schema.optionalKey(DocumentSnapshot),
-});
+  documentRoot: Schema.optionalKey(DocumentRoot),
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      input.documentSnapshot === undefined ||
+      input.documentRoot === undefined ||
+      "conflicting document snapshots",
+  ),
+);
 const RunnerOutput = Schema.Union([
   Schema.Struct({
     ok: Schema.Literal(true),
@@ -262,6 +335,30 @@ const makeEvaluate = (
           }),
       ),
     );
+    if (context.html !== undefined && context.document !== undefined) {
+      return yield* new BrowserScriptError({
+        reason: "unsupported HTML document",
+      });
+    }
+    let documentRoot: Schema.Schema.Type<typeof DocumentRoot> | undefined;
+    if (context.document !== undefined) {
+      const parsed = parseHtmlDocument(context.document);
+      if (parsed._tag !== "Success") {
+        return yield* new BrowserScriptError({
+          reason:
+            parsed._tag === "Unsupported"
+              ? "unsupported HTML document"
+              : "HTML document exceeds " + parsed.limit + " limit",
+        });
+      }
+      documentRoot = yield* Schema.decodeEffect(DocumentRoot)(
+        parsed.snapshot,
+      ).pipe(
+        Effect.mapError(
+          () => new BrowserScriptError({ reason: "unsupported HTML document" }),
+        ),
+      );
+    }
     let documentSnapshot:
       | Schema.Schema.Type<typeof DocumentSnapshot>
       | undefined;
@@ -322,6 +419,7 @@ const makeEvaluate = (
       referrer: context.referrer ?? "",
       authoritativeCookies: host !== undefined,
       ...(documentSnapshot === undefined ? {} : { documentSnapshot }),
+      ...(documentRoot === undefined ? {} : { documentRoot }),
     }).pipe(
       Effect.mapError(
         (cause) =>

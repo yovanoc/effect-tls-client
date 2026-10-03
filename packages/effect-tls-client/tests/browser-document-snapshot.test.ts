@@ -1,7 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { expect, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
 import { Effect, Layer } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
+import { makeBrowserScriptRunnerSource } from "../src/browser/BrowserScriptRunner.js";
 import { BrowserMock, type BrowserScriptHost } from "../src/browser/index.js";
 
 const context = {
@@ -186,3 +188,224 @@ it.effect(
       expect(spawns).toBe(0);
     }),
 );
+
+const wholeDocument =
+  '<!doctype html><html lang="en" id="root"><head id="top" class="metadata"><meta name="fixture" content="yes"><style id="css">body{}</style><script id="inert" src="/never">throw 1;</script><title>Fixture</title></head><body id="page" class="main"><div id="seed" class="a b">one<span>two</span></div> </body></html>';
+
+it.layer(
+  BrowserMock.layer({
+    allowedOrigins: ["http://localhost:43127"],
+    timeoutMs: 4000,
+  }).pipe(Layer.provide(NodeServices.layer)),
+  { excludeTestServices: true },
+)("explicit complete document", (it) => {
+  it.effect(
+    "includes structural roots in the shared nonrefundable node quota",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const result = yield* runtime.evaluate(
+          `
+      const node = document.createElement('div'); node.id = 'new'; document.body.appendChild(node);
+      node.textContent = 'é'.repeat(8189);
+      let dataRejected = false; try { node.textContent = 'xx'; } catch(e) { dataRejected = e instanceof RangeError; }
+      if (!dataRejected) throw new Error('DOM data budget');
+      let rejected = false; try { document.createElement('script'); } catch(e) { rejected = e instanceof RangeError; }
+      if (!rejected) throw new Error('structural nodes not charged'); return 'ok';
+    `,
+          {
+            ...context,
+            document:
+              "<!doctype html><html><head></head><body>" +
+              "<span></span>".repeat(28) +
+              "</body></html>",
+          },
+        );
+        expect(result.value).toBe("ok");
+      }),
+  );
+  it.effect(
+    "materializes actual readonly roots, inert descendants and bounded append targets",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const result = yield* runtime.evaluate(
+          `
+      const root = document.documentElement, head = document.head, body = document.body;
+      if (root !== document.querySelector('html#root') || root !== document.getElementsByTagName('html')[0] || root.getAttribute('LANG') !== 'en') throw new Error('root');
+      if (head !== document.getElementById('top') || head !== document.querySelector('head.metadata') || head !== document.getElementsByTagName('head')[0]) throw new Error('head');
+      if (body !== document.getElementById('page') || body !== document.querySelector('body.main') || body !== document.getElementsByTagName('body')[0]) throw new Error('body');
+      if (body.textContent !== 'onetwo ' || root.textContent !== 'body{}throw 1;Fixtureonetwo ' || document.querySelector('title').textContent !== 'Fixture') throw new Error('text');
+      const addedHead = document.createElement('span'); addedHead.id = 'headAppend'; head.appendChild(addedHead);
+      addedHead.className = 'main';
+      if (document.querySelector('.main') !== addedHead) throw new Error('head append must precede body');
+      const addedBody = document.createElement('div'); addedBody.id = 'bodyAppend'; body.appendChild(addedBody);
+      if (document.querySelector('#seed').parentNode !== body || body.parentNode !== root || head.parentNode !== root || addedBody.parentNode !== body || addedHead.parentNode !== head) throw new Error('parent');
+      if ([...document.getElementsByTagName('div')].map(n => n.id).join(',') !== 'seed,bodyAppend' || [...document.getElementsByTagName('span')].map(n => n.id).join(',') !== 'headAppend,') throw new Error('order');
+      for (const node of [root, head, body, document.querySelector('#inert')]) {
+        for (const action of [() => node.id = 'changed', () => node.className = '', () => node.textContent = '', () => node.setAttribute('x','v'), () => node.attributes[0][1] = 'changed', () => node.innerHTML = '', () => body.appendChild(node)]) {
+          let rejected = false; try { action(); } catch { rejected = true; } if (!rejected) throw new Error('mutation');
+        }
+      }
+      if (typeof __documentRoot !== 'undefined' || typeof __documentSnapshot !== 'undefined') throw new Error('private binding');
+      const frame = document.createElement('iframe'); frame.src = '/child';
+      await new Promise((resolve, reject) => { frame.onload = resolve; frame.onerror = () => reject(new Error('child')); body.appendChild(frame); });
+      return 'ok';
+    `,
+          { ...context, document: wholeDocument },
+          {
+            ...host,
+            loadFrame: (url) =>
+              Effect.succeed({
+                parentUrl: context.url,
+                url,
+                origin: "http://localhost:43127",
+                status: 200,
+                headers: [],
+                cookie: null,
+                scripts: [
+                  "if (document.documentElement !== undefined || document.getElementById('root') !== null || document.body.textContent !== undefined || typeof __documentRoot !== 'undefined') throw new Error('root leaked');",
+                ],
+              }),
+          },
+        );
+        expect(result.value).toBe("ok");
+        expect(result.setCookies).toEqual([]);
+      }),
+  );
+});
+
+it.effect(
+  "rejects strict document failures and serialized overflow before any spawn",
+  () =>
+    Effect.gen(function* () {
+      let spawns = 0;
+      const layer = BrowserMock.layer().pipe(
+        Layer.provide(
+          Layer.mock(ChildProcessSpawner.ChildProcessSpawner, {
+            spawn: () => {
+              spawns += 1;
+              return Effect.die("unexpected spawn");
+            },
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const wrap = (body: string) =>
+          "<!doctype html><html><head></head><body>" + body + "</body></html>";
+        for (const [document, reason] of [
+          [
+            "<html><head></head><body></body></html>",
+            "unsupported HTML document",
+          ],
+          [wrap("<div>"), "unsupported HTML document"],
+          [
+            wrap("<div></div>".repeat(30)),
+            "HTML document exceeds elements limit",
+          ],
+          [
+            wrap('<div title="' + "x".repeat(8193) + '"></div>'),
+            "HTML document exceeds attributeValueCharacters limit",
+          ],
+          [
+            wrap('<div title="' + "é".repeat(8192) + '"></div>'),
+            "HTML document exceeds attributesUtf8Bytes limit",
+          ],
+          [wrap("é".repeat(65536)), "HTML document exceeds inputBytes limit"],
+          [
+            wrap("<div><span>" + "x".repeat(40000) + "</span></div>"),
+            "script IPC start input exceeds its 128 KiB limit",
+          ],
+          [
+            wrap("\u0001".repeat(12000)),
+            "script IPC start input exceeds its 128 KiB limit",
+          ],
+        ] satisfies ReadonlyArray<readonly [string, string]>) {
+          const error = yield* runtime
+            .evaluate('return "never";', { ...context, document })
+            .pipe(Effect.flip);
+          expect(error.reason).toBe(reason);
+        }
+        const conflict = yield* runtime
+          .evaluate('return "never";', {
+            ...context,
+            document: wholeDocument,
+            html: "<div></div>",
+          })
+          .pipe(Effect.flip);
+        expect(conflict.reason).toBe("unsupported HTML document");
+      }).pipe(Effect.provide(layer));
+      expect(spawns).toBe(0);
+    }),
+);
+
+it("rejects forged root structures on the runner IPC boundary before guest execution", () => {
+  const runner = makeBrowserScriptRunnerSource({
+    maxTimeoutMs: 120000,
+    maxInputLineBytes: 8388608,
+    maxControlInputLineBytes: 131072,
+    maxOutputLineBytes: 131072,
+    maxOutputBytes: 1048576,
+    maxCookieBytes: 65536,
+    maxCookieWrites: 64,
+    maxNetworkRequests: 8,
+    maxRequestBodyBytes: 16384,
+    maxTotalNetworkBytes: 1048576,
+    maxHeaders: 128,
+    maxHeaderBytes: 65536,
+    maxTimers: 64,
+    maxTimerDelayMs: 120000,
+  });
+  const node = (tag: string, parent: number) => ({
+    tag,
+    parent,
+    attributes: [],
+    textContent: "",
+  });
+  const forgedNodes = [
+    [],
+    [node("html", -1), node("body", 0), node("head", 0)],
+    [node("html", -1), node("head", 0), node("body", -1)],
+    [node("html", -1), node("head", 0), node("body", 1)],
+    [node("html", -1), node("head", 0), node("div", 1), node("body", 0)],
+    [node("html", -1), node("head", 0), node("body", 0), node("head", 2)],
+    [node("html", -1), node("head", 0), node("body", 0), node("span", 1)],
+    [node("html", -1), node("head", 0), node("body", 0), node("iframe", 2)],
+    [
+      node("html", -1),
+      node("head", 0),
+      node("body", 0),
+      node("script", 2),
+      node("span", 3),
+    ],
+    [
+      node("html", -1),
+      node("head", 0),
+      node("body", 0),
+      node("div", 2),
+      node("span", 2),
+      node("b", 3),
+    ],
+  ];
+  for (const documentRoot of [
+    null,
+    ...forgedNodes.map((nodes) => ({ nodes, textContent: "" })),
+  ]) {
+    const result = spawnSync(process.execPath, ["--permission", "-e", runner], {
+      input:
+        JSON.stringify({
+          type: "start",
+          timeoutMs: 1000,
+          source: 'return "GUEST_EXECUTED";',
+          ...context,
+          documentRoot,
+        }) + "\n",
+      encoding: "utf8",
+      timeout: 4000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.stdout).toMatch(/invalid document (root structure|snapshot)/);
+    expect(result.stdout).not.toContain("GUEST_EXECUTED");
+  }
+});
