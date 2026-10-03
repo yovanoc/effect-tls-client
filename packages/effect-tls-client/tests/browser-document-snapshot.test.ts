@@ -478,34 +478,37 @@ it.layer(
     "SnapshotRecordInvariant",
     "guest-chosen",
   ]) {
-    it.effect(
-      `does not confer host labels on identical guest messages or ${documentInputRule} spoofs`,
-      () =>
-        Effect.gen(function* () {
-          const runtime = yield* BrowserMock;
-          for (const [reason, documentInputFailure] of [
-            ["invalid browser script context", "InvalidContext"],
-            ["unsupported HTML document", "ConflictingInputs"],
-            ["unsupported HTML body-fragment snapshot", "UnsupportedInput"],
-            ["HTML document exceeds elements limit", "SnapshotLimitExceeded"],
-            [
-              "script IPC start input exceeds its 128 KiB limit",
-              "StartupLimitExceeded",
-            ],
-          ]) {
-            const properties = JSON.stringify({
-              message: reason,
-              reason,
-              _tag: "BrowserScriptError",
-              documentInputFailure,
-              documentInputRule,
-            });
-            for (const source of [
-              `throw new Error(${JSON.stringify(reason)});`,
-              `throw Object.assign(new Error(${JSON.stringify(reason)}), ${properties});`,
-              `throw ${properties};`,
-            ]) {
-              for (const mode of ["async", "classic"] as const) {
+    for (const [reason, documentInputFailure] of [
+      ["invalid browser script context", "InvalidContext"],
+      ["unsupported HTML document", "ConflictingInputs"],
+      ["unsupported HTML body-fragment snapshot", "UnsupportedInput"],
+      ["HTML document exceeds elements limit", "SnapshotLimitExceeded"],
+      [
+        "script IPC start input exceeds its 128 KiB limit",
+        "StartupLimitExceeded",
+      ],
+    ]) {
+      const properties = JSON.stringify({
+        message: reason,
+        reason,
+        _tag: "BrowserScriptError",
+        documentInputFailure,
+        documentInputRule,
+      });
+      for (const [guestThrow, source] of [
+        ["nativeError", `throw new Error(${JSON.stringify(reason)});`],
+        [
+          "errorWithSpoofData",
+          `throw Object.assign(new Error(${JSON.stringify(reason)}), ${properties});`,
+        ],
+        ["plainObject", `throw ${properties};`],
+      ]) {
+        for (const mode of ["async", "classic"] as const) {
+          it.effect(
+            `does not confer host labels: ${documentInputRule}/${documentInputFailure}/${guestThrow}/${mode}`,
+            () =>
+              Effect.gen(function* () {
+                const runtime = yield* BrowserMock;
                 const error = yield* runBoundedScript(
                   runtime,
                   source,
@@ -520,11 +523,11 @@ it.layer(
                   false,
                 );
                 expect(Object.hasOwn(error, "documentInputRule")).toBe(false);
-              }
-            }
-          }
-        }),
-    );
+              }),
+          );
+        }
+      }
+    }
   }
 });
 
