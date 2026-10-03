@@ -321,14 +321,49 @@ recurse. These async errors use the page URL as `filename`, with `lineno` and
 The nonstandard direct `document.loadScript` convenience API remains separate:
 parsing/execution failures reject with the existing `loaded script failed: `
 prefix, rather than reporting a Window event and resolving.
-This is not acquisition or clearance evidence. At most 32 script elements may
-be created per evaluation; cumulative script-attribute data is capped at 16 KiB,
-and each attribute value at 8,192 characters. Inline content, module or other
+This is not acquisition or clearance evidence. At most 32 combined snapshot,
+script, frame, and ordinary elements may exist per evaluation. Cumulative
+attribute-name/value data and mutable ordinary text share the existing 16 KiB
+UTF-8 budget; charges are never refunded. Each attribute value and each mutable
+text assignment is limited to 8,192 characters. Inline content, module or other
 non-JavaScript types, nonempty `integrity` (SRI is rejected, not ignored), any
 `crossorigin`, `defer`/`nomodule`, and setting `async = false` are unsupported
 and reject. `document.createElement` also accepts `"iframe"` as described
-below; other elements (including `div` and `canvas`) remain unsupported. This
-is not a general DOM or renderer and adds no `postMessage` API.
+below and the bounded ordinary tags listed next. This is not a general DOM or
+renderer and adds no `postMessage` API.
+
+### Caller-created ordinary elements
+
+`createElement` supports h1–h6, div, span, p, address, article, aside, b,
+blockquote, code, em, footer, header, i, main, section, small, strong, sub, sup,
+and u. Names use DOMString conversion and ASCII-only case folding, without
+trimming. Omitted/undefined/null options and dictionaries with no defined `is`
+are accepted for ordinary, script, and frame creation. Unknown dictionary
+members are ignored; defined `is` and legacy string options explicitly reject:
+there is no custom-element registry. Getter/conversion failures remain guest
+failures. Unsupported tags, including image/media/link, canvas, forms, SVG,
+and custom tags, reject rather than enabling resource or rendering behavior.
+
+Each ordinary record is a stable realm-local object with readonly
+`tagName`/`nodeName` and `parentNode`, mutable `id`, `className`, and `textContent`,
+and `getAttribute`/`setAttribute`/`hasAttribute`/`removeAttribute`. Writable
+attributes are id, class, title, lang, dir, role, and ASCII data-/aria- names.
+They store strings only; event-handler, style, and resource attributes reject.
+Null/undefined text becomes empty; text is literal, never parsed or executed.
+Text reads include ordinary descendants; a successful text assignment detaches
+children. Failed data-budget assignments leave attributes, text, and children
+unchanged. Snapshot text is still readonly and is not charged as mutable text.
+
+Head/body accept ordinary records, and ordinary `appendChild` accepts only other
+ordinary records from the same realm. It returns the same object, moves an
+already-parented ordinary record to the end, and rejects self/ancestor cycles,
+foreign objects, snapshot records, and executable script/frame children.
+Queries see only attached actual records in preorder, never detached creations
+or invented original-page elements. No removal API, text-node API, full native
+prototype hierarchy, general `innerHTML`, styles/layout, rendering, lifecycle
+callbacks, or automatic JS/frames/navigation/fetch/cookies is supplied.
+Unsupported property mutation explicitly rejects even in non-strict source.
+Ordinary append itself never initiates a request; child realms remain isolated.
 
 ### Explicit body-fragment snapshot (experimental)
 
@@ -361,8 +396,9 @@ Unsupported syntax and limits become finite `BrowserScriptError` reasons, withou
 embedding HTML. Raw HTML is not sent over IPC, fetched, or persisted by BrowserMock;
 only Schema-validated parsed records and complete textContent cross the boundary.
 
-Limits stay at 128 KiB UTF-8 input, 32 combined snapshot/script/frame elements,
-16 KiB cumulative UTF-8 attribute-name/value bytes, and 8,192 characters per value.
+Limits stay at 128 KiB UTF-8 input, 32 combined snapshot/script/frame/ordinary
+elements, 16 KiB cumulative UTF-8 attribute-name/value bytes (now also shared
+with mutable ordinary text), and 8,192 characters per value.
 The **actual serialized startup line including its newline** must fit 128 KiB.
 Repeated ancestor textContent and JSON escaping can exceed that limit even for a
 valid small fragment: fail before spawn, never trim text or raise quotas.
@@ -387,13 +423,14 @@ pseudo-classes or lists: unsupported syntax throws a realm-local TypeError, not
 order or `null`; tag-only head/body selectors return the existing append targets.
 IDs/classes are case-sensitive under this fixed standards-style fragment model;
 no original-page quirks mode or full-page first-match guarantee is claimed.
-There is no `querySelectorAll`, generic element creation, layout, rendering,
+There is no `querySelectorAll`, unbounded element creation, layout, rendering,
 native-browser fingerprinting or provider-selector support.
 
 ### Experimental modeled element lookup
 
-Without a snapshot, `document.getElementsByTagName` supports only `"head"`, `"body"`, and `"script"`
-(ASCII case-insensitive, without trimming). A snapshot additionally enables its actual tag names. Each realm caches VM-local,
+Without a snapshot, `document.getElementsByTagName` supports `"head"`, `"body"`,
+`"script"`, and all allowed ordinary tags (including empty collections before
+creation; ASCII case-insensitive, without trimming). A snapshot additionally enables its actual tag names. Each realm caches VM-local,
 read-only live collections: numeric access, `in` for currently present canonical
 numeric indices and actual collection properties, `length`, `item(index)`
 (unsigned 32-bit index coercion, `null` out of range), and iteration. Numeric
@@ -406,18 +443,19 @@ property definition, preventing extensions, and prototype replacement reject.
 Head/body lookup returns the actual frozen append targets, which cannot be
 replaced. Script lookup includes only successfully appended modeled script
 nodes, including nodes whose subsequent load fails, not merely created nodes.
-Order is head append order, supplied fragment preorder, then body append order. Duplicate
-append is a no-op, even to the other target: reparenting and removal are not
-modeled; no `parentNode` or `insertBefore` is supplied. Lookup itself performs
+Order is head subtree preorder, supplied fragment preorder, then body subtree
+preorder. Script/frame duplicate append remains a no-op even to the other target.
+Only ordinary records support reparenting and `parentNode`; `insertBefore` and
+removal are not supplied. Lookup itself performs
 no network request or execution and does not increase any quota.
 
 `document.getElementById(id)` performs a read-only scan of actual attached
-snapshot, modeled script and iframe records, returning the same node object or `null`.
+snapshot, ordinary, modeled script and iframe records, returning the same node object or `null`.
 IDs are exact and case-sensitive; an empty or missing ID matches no node. The
 argument uses DOMString coercion (omitting it or passing a Symbol rejects).
-Lookup follows head append order, fragment preorder, then body append order,
-including mixed scripts/frames; duplicate appends neither duplicate nor move
-nodes. Attribute changes are read live: script `id`/`setAttribute`/`removeAttribute`
+Lookup follows head subtree preorder, fragment preorder, then body subtree
+preorder, including mixed ordinary/scripts/frames. Script/frame duplicate
+appends neither duplicate nor move nodes; ordinary reparenting updates order. Attribute changes are read live: script `id`/`setAttribute`/`removeAttribute`
 and iframe `id`/`setAttribute` retain the existing cumulative UTF-8 attribute
 budget. Frame IDs can change after append, but frame navigation still rejects.
 The frozen head/body targets have no modeled ID attributes and cannot match.
@@ -429,10 +467,10 @@ not provider acquisition, Device Check compatibility, or clearance evidence.
 
 There is no HTML parsing or synthetic initial-page script node: the evaluated
 bootstrap and `document.loadScript` calls are VM programs, not DOM elements.
-Child realms get only their own targets and collections, never parent nodes;
-child dynamic script append remains unsupported. `"iframe"`, `"*"`, and all
-other tag queries explicitly reject rather than pretending to query a full
-DOM. This subset adds no lifecycle/DOMReady, history, worker, rendering,
+Child realms get only their own targets, ordinary nodes, and collections, never
+parent nodes; child dynamic script append remains unsupported. Without a snapshot
+containing the tag, `"iframe"`, `"*"`, and other unsupported tag queries explicitly
+reject rather than pretending to query a full DOM. This subset adds no lifecycle/DOMReady, history, worker, rendering,
 messaging, navigation, or cookie authority, and is not a Cloudflare resolver
 or evidence of clearance.
 

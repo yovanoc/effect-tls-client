@@ -1577,10 +1577,20 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (value.status < 200 || value.status >= 300) throw new TypeError("script load failed with HTTP " + value.status);
     return undefined;
   });
-  // Only external async classic scripts, not a DOM. New ceilings do not enlarge network budgets.
+  // Bounded realm records, not a renderer. No new network authority or quotas.
   const MAX_SCRIPT_NODES = 32;
   const MAX_SCRIPT_ATTRIBUTE_BYTES = 16 * 1024;
   const scriptNodes = new WeakMap();
+  const ordinaryNodes = new WeakMap();
+  const weakMapHas = WeakMap.prototype.has;
+  const setHas = Set.prototype.has;
+  const mapGet = Map.prototype.get, mapSet = Map.prototype.set, mapHas = Map.prototype.has, mapDelete = Map.prototype.delete;
+  const arrayPush = Array.prototype.push, arraySplice = Array.prototype.splice;
+  const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const ordinaryState = (node) => apply(weakMapGet, ordinaryNodes, [node]);
+  const isOrdinary = (node) => apply(weakMapHas, ordinaryNodes, [node]);
+  const ordinaryTags = new Set(["h1", "h2", "h3", "h4", "h5", "h6", "div", "span", "p", "address", "article", "aside", "b", "blockquote", "code", "em", "footer", "header", "i", "main", "section", "small", "strong", "sub", "sup", "u"]);
+  const asciiLower = (text) => text.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
   const snapshotRecords = new WeakMap();
   const readonlySnapshot = () => { throw new NativeTypeError("document snapshot is read-only"); };
   const immutableSnapshotArray = (values) => new Proxy(objectFreeze(values), {
@@ -1614,8 +1624,115 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   let scriptNodeCount = 0;
   let scriptAttributeBytes = 0;
   const scriptAttributeNames = ["src", "type", "integrity", "crossorigin", "async", "defer", "nomodule", "id", "nonce"];
-  const appendScript = (element, attached) => {
+  const getOrdinaryState = (element) => {
+    const state = ordinaryState(element);
+    if (state === undefined) throw new NativeTypeError("ordinary element method called on an incompatible receiver");
+    return state;
+  };
+  const appendOrdinary = (element, parent, attached) => {
     if (snapshotRecords.has(element)) return readonlySnapshot();
+    const state = getOrdinaryState(element);
+    for (let ancestor = parent; isOrdinary(ancestor); ancestor = getOrdinaryState(ancestor).parent) {
+      if (ancestor === element) throw new NativeTypeError("ordinary element append would create a cycle");
+    }
+    if (state.attached !== null) {
+      let index = 0;
+      while (state.attached[index] !== element) index += 1;
+      apply(arraySplice, state.attached, [index, 1]);
+    }
+    apply(arrayPush, attached, [element]);
+    state.parent = parent;
+    state.attached = attached;
+    return element;
+  };
+  const ordinaryText = (element) => {
+    const state = getOrdinaryState(element);
+    let text = state.text;
+    for (let index = 0; index < state.children.length; index += 1) text += ordinaryText(state.children[index]);
+    return text;
+  };
+  const chargeOrdinaryData = (text, key = "") => {
+    if (text.length > MAX_URL_INPUT_LENGTH) throw new NativeRangeError("DOM data exceeds 8192 characters");
+    if (!consumeBudget("attribute", utf8Length(key) + utf8Length(text))) throw new NativeRangeError("DOM data budget exceeded (16 KiB)");
+  };
+  const ordinaryAttribute = (name) => {
+    const key = asciiLower(domString(name));
+    if (!["id", "class", "title", "lang", "dir", "role"].includes(key) && !/^(?:data|aria)-[a-z0-9_.-]+$/.test(key)) {
+      throw new NativeTypeError("unsupported ordinary attribute: " + key);
+    }
+    return key;
+  };
+  const setOrdinaryAttribute = (element, name, value) => {
+    const state = getOrdinaryState(element);
+    const key = ordinaryAttribute(name);
+    const text = domString(value);
+    chargeOrdinaryData(text, key);
+    apply(mapSet, state.attributes, [key, text]);
+  };
+  const createOrdinary = (tag) => {
+    if (!consumeBudget("node", 1)) throw new NativeRangeError("element budget exceeded (32 nodes)");
+    const node = objectCreate(null);
+    objectDefineProperties(node, {
+      tagName: { value: tag.toUpperCase(), enumerable: true },
+      nodeName: { value: tag.toUpperCase(), enumerable: true },
+      parentNode: { get() { return getOrdinaryState(this).parent; }, enumerable: true },
+      textContent: {
+        get() { return ordinaryText(this); },
+        set(value) {
+          const state = getOrdinaryState(this);
+          const text = value == null ? "" : domString(value);
+          chargeOrdinaryData(text);
+          for (let index = 0; index < state.children.length; index += 1) {
+            const childState = getOrdinaryState(state.children[index]);
+            childState.parent = null; childState.attached = null;
+          }
+          state.children.length = 0;
+          state.text = text;
+        }, enumerable: true,
+      },
+      getAttribute: { value: function(name) {
+        const state = getOrdinaryState(this);
+        if (arguments.length === 0) throw new NativeTypeError("getAttribute requires a name");
+        return apply(mapGet, state.attributes, [asciiLower(domString(name))]) ?? null;
+      } },
+      hasAttribute: { value: function(name) {
+        const state = getOrdinaryState(this);
+        if (arguments.length === 0) throw new NativeTypeError("hasAttribute requires a name");
+        return apply(mapHas, state.attributes, [asciiLower(domString(name))]);
+      } },
+      setAttribute: { value: function(name, value) {
+        getOrdinaryState(this);
+        if (arguments.length < 2) throw new NativeTypeError("setAttribute requires a name and value");
+        setOrdinaryAttribute(this, name, value);
+      } },
+      removeAttribute: { value: function(name) {
+        const state = getOrdinaryState(this);
+        if (arguments.length === 0) throw new NativeTypeError("removeAttribute requires a name");
+        apply(mapDelete, state.attributes, [asciiLower(domString(name))]);
+      } },
+      appendChild: { value: function(element) { return appendOrdinary(element, this, getOrdinaryState(this).children); } },
+    });
+    for (const [key, attribute] of [["id", "id"], ["className", "class"]]) objectDefineProperties(node, {
+      [key]: {
+        get() { return apply(mapGet, getOrdinaryState(this).attributes, [attribute]) ?? ""; },
+        set(value) { setOrdinaryAttribute(this, attribute, value); }, enumerable: true,
+      },
+    });
+    const readonly = () => { throw new NativeTypeError("unsupported ordinary element mutation"); };
+    const element = new Proxy(objectFreeze(node), {
+      set(target, key, value, receiver) {
+        const setter = getOwnPropertyDescriptor(target, key)?.set;
+        if (setter === undefined) return readonly();
+        apply(setter, receiver, [value]); return true;
+      },
+      defineProperty: readonly, deleteProperty: readonly, setPrototypeOf: readonly, preventExtensions: readonly,
+    });
+    apply(weakMapSet, ordinaryNodes, [element, { attributes: new Map(), text: "", children: [], parent: null, attached: null }]);
+    return element;
+  };
+  const appendScript = (element, attached, parent) => {
+    if (snapshotRecords.has(element)) return readonlySnapshot();
+    if (isOrdinary(element)) return appendOrdinary(element, parent, attached);
     const frameState = frameNodes.get(element);
     if (frameState !== undefined) return appendFrame(element, frameState, attached);
     const state = scriptNodes.get(element);
@@ -1636,11 +1753,17 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const loadExternalScript = (url) => request("script.element", NativeString(url), "GET", new Headers([["accept", "text/javascript, application/javascript, */*"]]), null).then((value) => {
     if (value.status < 200 || value.status >= 300) throw new NativeTypeError("script load failed with HTTP " + value.status);
   });
-  document.createElement = (name, ...options) => {
-    if (NativeString(name).toLowerCase() === "iframe" && options.length === 0) return createFrame();
-    if (NativeString(name).toLowerCase() !== "script" || options.length !== 0) {
-      throw new NativeTypeError("BrowserMock createElement supports script only, without options");
+  document.createElement = function(name, options) {
+    if (arguments.length === 0) throw new NativeTypeError("createElement requires a tag name");
+    const tag = asciiLower(domString(name));
+    if (options != null) {
+      if (typeof options !== "object" && typeof options !== "function") throw new NativeTypeError("custom element options are unsupported");
+      const is = options.is;
+      if (is !== undefined) { domString(is); throw new NativeTypeError("custom element is options are unsupported"); }
     }
+    if (apply(setHas, ordinaryTags, [tag])) return createOrdinary(tag);
+    if (tag === "iframe") return createFrame();
+    if (tag !== "script") throw new NativeTypeError("unsupported createElement tag: " + tag);
     if (scriptNodeCount >= MAX_SCRIPT_NODES) throw new NativeRangeError("script element budget exceeded (32 nodes)");
     if (!consumeBudget("node", 1)) throw new NativeRangeError("script element budget exceeded (32 nodes)");
     scriptNodeCount += 1;
@@ -1764,13 +1887,21 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     return objectFreeze(element);
   };
   objectDefineProperties(document, {
-    head: { value: objectFreeze({ appendChild: (element) => appendScript(element, headNodes) }), enumerable: true },
-    body: { value: objectFreeze({ appendChild: (element) => appendScript(element, bodyNodes), ...(documentSnapshot === null ? {} : { textContent: documentSnapshot.textContent }) }), enumerable: true },
+    head: { value: objectFreeze({ appendChild: (element) => appendScript(element, headNodes, document.head) }), enumerable: true },
+    body: { value: objectFreeze({ appendChild: (element) => appendScript(element, bodyNodes, document.body), ...(documentSnapshot === null ? {} : { textContent: documentSnapshot.textContent }) }), enumerable: true },
   });
-  // Actual realm records only: head append order, fragment preorder, body append order.
-  const documentNodes = () => [...headNodes, ...snapshotNodes, ...bodyNodes];
+  // Actual realm records only: head subtree preorder, fragment preorder, body subtree preorder.
+  const ordinaryPreorder = (nodes, result = []) => {
+    for (let index = 0; index < nodes.length; index += 1) {
+      const node = nodes[index]; result[result.length] = node;
+      const state = ordinaryState(node);
+      if (state !== undefined) ordinaryPreorder(state.children, result);
+    }
+    return result;
+  };
+  const documentNodes = () => [...ordinaryPreorder(headNodes), ...snapshotNodes, ...ordinaryPreorder(bodyNodes)];
   const tagCollections = objectCreate(null);
-  const tags = new Set(["head", "body", "script", ...(documentSnapshot?.nodes ?? []).map((record) => record.tag)]);
+  const tags = new Set(["head", "body", "script", ...ordinaryTags, ...(documentSnapshot?.nodes ?? []).map((record) => record.tag)]);
   for (const tag of tags) {
     const matching = () => documentNodes().filter((node) => node.tagName.toLowerCase() === tag);
     const length = () => tag === "head" || tag === "body" ? 1 : matching().length;
@@ -1797,8 +1928,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
       preventExtensions: readonly,
     });
   }
-  document.getElementsByTagName = (name) => {
-    const tag = NativeString(name).replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+  document.getElementsByTagName = function(name) {
+    if (arguments.length === 0) throw new NativeTypeError("getElementsByTagName requires a tag name");
+    const tag = asciiLower(domString(name));
     if (!Object.hasOwn(tagCollections, tag)) throw new NativeTypeError("unsupported modeled element lookup: " + tag);
     return tagCollections[tag];
   };
@@ -1808,8 +1940,8 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (text === "") return null;
     // Bounded tree scan: actual records only, never guest-replaced getters or child globals.
     for (const node of documentNodes()) {
-      const state = snapshotRecords.get(node) ?? scriptNodes.get(node) ?? frameNodes.get(node);
-      if (state.attributes.get("id") === text) return node;
+      const state = snapshotRecords.get(node) ?? ordinaryState(node) ?? scriptNodes.get(node) ?? frameNodes.get(node);
+      if (apply(mapGet, state.attributes, ["id"]) === text) return node;
     }
     return null;
   };
@@ -1824,9 +1956,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if ((tag === "head" || tag === "body") && parts.length === 0) return document[tag];
     for (const node of documentNodes()) {
       if (tag !== undefined && node.tagName.toLowerCase() !== tag) continue;
-      const state = snapshotRecords.get(node) ?? scriptNodes.get(node) ?? frameNodes.get(node);
-      const classes = (state.attributes.get("class") ?? "").split(/[\t\n\f\r ]+/);
-      if (parts.every((part) => part[0] === "#" ? state.attributes.get("id") === part.slice(1) : classes.includes(part.slice(1)))) return node;
+      const state = snapshotRecords.get(node) ?? ordinaryState(node) ?? scriptNodes.get(node) ?? frameNodes.get(node);
+      const classes = (apply(mapGet, state.attributes, ["class"]) ?? "").split(/[\t\n\f\r ]+/);
+      if (parts.every((part) => part[0] === "#" ? apply(mapGet, state.attributes, ["id"]) === part.slice(1) : classes.includes(part.slice(1)))) return node;
     }
     return null;
   };

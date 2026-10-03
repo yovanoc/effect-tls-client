@@ -3104,6 +3104,222 @@ describe("browser layer", () => {
     }).pipe(Layer.provide(NodeServices.layer)),
     { excludeTestServices: true },
   )("dynamic external scripts", (it) => {
+    it.effect("creates inert ordinary records with live tree lookups", () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+        const result = yield* runtime.evaluate(
+          `
+          const divs = document.getElementsByTagName("DIV");
+          const checks = [divs.length === 0, document.querySelector("h2") === null];
+          const div = document.createElement({ toString: () => "DiV" }, {});
+          const heading = document.createElement("h2", undefined);
+          div.id = "authored"; div.className = "notice primary";
+          div.setAttribute("TITLE", 7); div.textContent = "prefix:";
+          heading.id = "heading"; heading.textContent = "Hello <script>not code</script>";
+          checks.push(div.tagName === "DIV", heading.nodeName === "H2",
+            div.getAttribute("title") === "7", div.hasAttribute("ID"),
+            divs.length === 0, document.getElementById("authored") === null,
+            div.appendChild(heading) === heading, heading.parentNode === div,
+            div.textContent === "prefix:Hello <script>not code</script>");
+          checks.push(document.body.appendChild(div) === div, div.parentNode === document.body,
+            divs.length === 1, divs[0] === div, divs.item(0) === div,
+            [...document.getElementsByTagName("h2")][0] === heading,
+            document.getElementById("heading") === heading,
+            document.querySelector("div#authored.notice.primary") === div);
+          const second = document.createElement("div", null);
+          second.id = "authored"; document.head.appendChild(second);
+          checks.push(document.getElementById("authored") === second);
+          document.head.appendChild(div);
+          checks.push(divs.length === 2, divs[0] === second, divs[1] === div);
+          document.head.appendChild(second);
+          checks.push(divs[0] === div, divs[1] === second);
+          const reject = (fn) => { try { fn(); return false; } catch (e) { return e.constructor === TypeError; } };
+          checks.push(reject(() => heading.appendChild(div)), reject(() => div.appendChild(div)),
+            heading.parentNode === div, div.parentNode === document.head,
+            reject(() => { div.innerHTML = "<img src='/no'>"; }),
+            reject(() => { div.style = {}; }), reject(() => { div.tagName = "IMG"; }),
+            reject(() => div.setAttribute("onclick", "code")), reject(() => div.setAttribute("src", "/no")),
+            reject(() => div.setAttribute("style", "color:red")),
+            reject(() => div.appendChild(document.createElement("script"))),
+            reject(() => div.appendChild({ tagName: "DIV" })),
+            reject(() => { divs[0] = second; }), reject(() => divs.namedItem("authored")),
+            reject(() => div.getAttribute.call({}, "id")),
+            Object.getPrototypeOf(div) === null, Object.isFrozen(div),
+            typeof __consumeBudget === "undefined", typeof __documentSnapshot === "undefined");
+          try { div.appendChild.constructor("return process")(); checks.push(false); }
+          catch (e) { checks.push(e instanceof ReferenceError); }
+          div.textContent = null;
+          checks.push(div.textContent === "", heading.parentNode === null,
+            document.getElementById("heading") === null, document.getElementsByTagName("h2").length === 0);
+          div.removeAttribute("ID"); checks.push(div.id === "", !div.hasAttribute("id"));
+          return String(checks.every(Boolean));
+        `,
+          {
+            url: "https://allowed.test/page",
+            cookie: "",
+            userAgent: "fixture",
+          },
+          recordingScriptHost(requests),
+        );
+        expect(result.value).toBe("true");
+        expect(requests).toHaveLength(0);
+        expect(result.setCookies).toEqual([]);
+      }),
+    );
+
+    it.effect(
+      "converts ordinary tags and default options without inventing custom elements",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          for (const mode of ["async", "classic"] as const) {
+            const body = `
+            const reject = (fn) => { try { fn(); return false; } catch (e) { return e.constructor === TypeError; } };
+            const checks = [];
+            for (const tag of ["h1", "h2", "h3", "h4", "h5", "h6", "span", "p", "code", "strong"]) {
+              checks.push(document.getElementsByTagName(tag).length === 0,
+                document.createElement(tag).tagName === tag.toUpperCase());
+            }
+            for (const options of [undefined, null, {}, { is: undefined }, { signal: true }]) {
+              checks.push(document.createElement("div", options).tagName === "DIV",
+                document.createElement("script", options).tagName === "SCRIPT");
+            }
+            const frame = document.createElement("iframe", {});
+            checks.push(frame.tagName === "IFRAME");
+            for (const name of [Symbol(), " div ", "ſpan", "svg", "custom-tag", "img", "link", "canvas", "form", "style"]) {
+              checks.push(reject(() => document.createElement(name)));
+            }
+            checks.push(reject(() => document.createElement()),
+              reject(() => document.getElementsByTagName(Symbol())),
+              reject(() => document.getElementsByTagName("svg")));
+            for (const options of [{ is: "custom-heading" }, { is: "" }, { is: null }, { is: Symbol() }, "", "custom-heading", 7, true]) {
+              checks.push(reject(() => document.createElement("div", options)));
+            }
+            let conversions = 0;
+            const tag = { toString() { conversions++; return "DiV"; } };
+            document.createElement(tag); checks.push(conversions === 1);
+            const error = new Error("options getter"); let observed;
+            try { document.createElement("div", { get is() { throw error; } }); } catch (e) { observed = e; }
+            checks.push(observed === error);
+            const outcome = String(checks.every(Boolean));
+          `;
+            const result = yield* runBoundedScript(
+              runtime,
+              body + (mode === "async" ? "return outcome;" : "outcome;"),
+              undefined,
+              undefined,
+              mode,
+            );
+            expect(result.value).toBe("true");
+          }
+        }),
+    );
+
+    it.effect(
+      "shares nonrefundable ordinary data and node budgets atomically",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const result = yield* runtime.evaluate(
+            `
+          const div = document.createElement("div"); div.id = "kept";
+          const child = document.createElement("span"); child.textContent = "kept";
+          div.appendChild(child); document.body.appendChild(div);
+          const reject = (fn) => { try { fn(); return false; } catch (e) { return e.constructor === RangeError; } };
+          const checks = [reject(() => { div.textContent = "x".repeat(8193); }),
+            div.textContent === "kept", child.parentNode === div,
+            reject(() => div.setAttribute("title", "x".repeat(8193))), !div.hasAttribute("title")];
+          div.setAttribute("title", "é".repeat(4096)); div.removeAttribute("title");
+          checks.push(reject(() => { div.textContent = "é".repeat(4096); }),
+            div.textContent === "kept", child.parentNode === div,
+            reject(() => { div.id = "é".repeat(4096); }), div.id === "kept");
+          for (let i = 0; i < 28; i++) document.createElement("p");
+          document.createElement("script");
+          checks.push(reject(() => document.createElement("h2")),
+            document.getElementsByTagName("div").length === 2,
+            document.getElementsByTagName("p").length === 0);
+          return String(checks.every(Boolean));
+        `,
+            {
+              url: "https://allowed.test/page",
+              cookie: "",
+              userAgent: "fixture",
+              html: '<div id="snapshot"></div>',
+            },
+          );
+          expect(result.value).toBe("true");
+        }),
+    );
+
+    it.effect(
+      "keeps mixed ordinary snapshot script and frame records truthful and isolated",
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          const requests: Parameters<BrowserScriptHost["request"]>[0][] = [];
+          const host: BrowserScriptHost = {
+            ...recordingScriptHost(requests),
+            loadFrame: (url) =>
+              Effect.succeed({
+                parentUrl: "https://allowed.test/page",
+                url,
+                origin: "https://allowed.test",
+                status: 200,
+                headers: [],
+                cookie: null,
+                scripts: [
+                  `
+              if (document.getElementById("parent") !== null || document.getElementById("snapshot") !== null || document.getElementsByTagName("div").length !== 0) throw new Error("parent leak");
+              const child = document.createElement("div"); child.id = "child";
+              document.body.appendChild(child);
+              if (document.getElementById("child") !== child || child.parentNode !== document.body) throw new Error("child record");
+            `,
+                ],
+              }),
+          };
+          const result = yield* runtime.evaluate(
+            `
+          const snapshot = document.getElementById("snapshot");
+          const divs = document.getElementsByTagName("div");
+          const parent = document.createElement("div"); parent.id = "parent";
+          const nested = document.createElement("div"); nested.id = "snapshot"; parent.appendChild(nested);
+          document.body.appendChild(parent);
+          const script = document.createElement("script"); script.id = "snapshot"; script.src = "/authored.js";
+          await new Promise((resolve, reject) => { script.onload = resolve; script.onerror = reject; document.head.appendChild(script); });
+          const frame = document.createElement("iframe"); frame.id = "snapshot"; frame.src = "/frame";
+          await new Promise((resolve, reject) => { frame.onload = resolve; frame.onerror = reject; document.body.appendChild(frame); });
+          const checks = [document.getElementById("snapshot") === script,
+            document.querySelector("div#snapshot") === snapshot,
+            divs[0] === snapshot, divs[1] === parent, divs[2] === nested,
+            document.querySelector("iframe#snapshot") === frame,
+            document.getElementById("child") === null, document.body.textContent === "inert",
+            snapshot.textContent === "inert", snapshot.id === "snapshot"];
+          for (const fn of [() => { snapshot.textContent = "changed"; }, () => parent.appendChild(snapshot),
+            () => document.body.appendChild(snapshot), () => { snapshot.attributes[0][1] = "changed"; }]) {
+            try { fn(); checks.push(false); } catch (e) { checks.push(e.constructor === TypeError); }
+          }
+          document.head.appendChild(parent);
+          checks.push(divs[0] === parent, divs[1] === nested, divs[2] === snapshot,
+            document.getElementById("snapshot") === script, snapshot.textContent === "inert");
+          return String(checks.every(Boolean));
+        `,
+            {
+              url: "https://allowed.test/page",
+              cookie: "",
+              userAgent: "fixture",
+              html: '<div id="snapshot">inert</div>',
+            },
+            host,
+          );
+          expect(result.value).toBe("true");
+          expect(requests.map(({ url }) => url)).toEqual([
+            "https://allowed.test/authored.js",
+          ]);
+          expect(result.setCookies).toEqual([]);
+        }),
+    );
+
     it.effect(
       "looks up only attached modeled nodes with live readonly collections",
       () =>
@@ -3136,7 +3352,7 @@ describe("browser layer", () => {
             query("script") === scripts, !Array.isArray(scripts), Object.isFrozen(scripts) === true,
             Reflect.isExtensible(scripts) === false];
           const localReject = (fn) => { try { fn(); return false; } catch (e) { return e instanceof TypeError && e.constructor === TypeError; } };
-          checks.push(["*", "div", "iframe", " script ", "ſcript"].every((tag) => localReject(() => query(tag))),
+          checks.push(query("div").length === 0, ["*", "canvas", "iframe", " script ", "ſcript"].every((tag) => localReject(() => query(tag))),
             localReject(() => scripts.namedItem("id")), Object.getPrototypeOf(scripts) === null,
             localReject(() => { scripts[0] = document.head; }), localReject(() => { scripts.length = 100; }),
             localReject(() => Object.defineProperty(scripts, "0", { value: document.head })),
