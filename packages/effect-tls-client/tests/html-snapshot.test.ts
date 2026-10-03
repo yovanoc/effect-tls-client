@@ -201,7 +201,10 @@ describe("parseHtmlSnapshot", () => {
   ])("rejects %s rather than repairing or truncating it", (_case, html) => {
     const result = parseHtmlSnapshot(html);
     expect(result._tag).toBe("Unsupported");
-    if (result._tag === "Unsupported") expect(result.reason).toBeTruthy();
+    if (result._tag === "Unsupported") {
+      expect(result.reason).toBeTruthy();
+      expect(Object.keys(result)).toEqual(["_tag", "reason"]);
+    }
   });
 
   it("accepts the element budget and reports element and per-attribute overflow", () => {
@@ -449,7 +452,10 @@ describe("parseHtmlDocument", () => {
     (_case, html) => {
       const result = parseHtmlDocument(html);
       expect(result._tag).toBe("Unsupported");
-      if (result._tag === "Unsupported") expect(result.reason).toBeTruthy();
+      if (result._tag === "Unsupported") {
+        expect(result.reason).toBeTruthy();
+        expect(result.rule).toBeDefined();
+      }
     },
   );
 
@@ -484,6 +490,62 @@ describe("parseHtmlDocument", () => {
     const text = "x".repeat(131_072 - prefix.length - suffix.length);
     expect(parseHtmlDocument(`${prefix}${text}${suffix}`)._tag).toBe("Success");
     expect(parseHtmlDocument(`${prefix}${text}x${suffix}`)).toEqual({
+      _tag: "LimitExceeded",
+      limit: "inputBytes",
+    });
+  });
+});
+
+describe("document-only rejection families", () => {
+  const wrap = (body: string) =>
+    "<!doctype html><html><head></head><body>" + body + "</body></html>";
+  it.each([
+    ["InputEncoding", wrap("\u0000")],
+    ["Doctype", "<html><head></head><body></body></html>"],
+    ["DocumentStructure", "<!doctype html><head></head><body></body>"],
+    [
+      "HeadContentSubset",
+      "<!doctype html><html><head><table></table></head><body></body></html>",
+    ],
+    ["CommentSyntax", wrap("<!--unfinished")],
+    ["MarkupSyntax", wrap("<?instruction>")],
+    ["CharacterReference", wrap("&copy;")],
+    ["TagSyntax", wrap("<custom-widget></custom-widget>")],
+    ["ClosingStructure", wrap("<div></span>")],
+    ["ImplicitRepair", wrap("<p><div></div></p>")],
+    ["AttributeSyntax", wrap('<div a="x"b="y"></div>')],
+    ["SelfClosingNormal", wrap("<div/>")],
+    ["RawTextSubset", wrap("<script><!--x--></script>")],
+    [
+      "TitleRcdataSubset",
+      "<!doctype html><html><head><title><b>x</b></title></head><body></body></html>",
+    ],
+    ["DocumentElementSubset", wrap("<html></html>")],
+    ["TableSubset", wrap("<table></table>")],
+    ["SelectSubset", wrap("<select></select>")],
+    ["TemplateSubset", wrap("<template></template>")],
+    ["ScriptingDependentSubset", wrap("<noscript></noscript>")],
+    ["ForeignContentSubset", wrap("<svg></svg>")],
+    ["ElementSubset", wrap("<form></form>")],
+  ])("labels %s without accepting or repairing the document", (rule, input) => {
+    const result = parseHtmlDocument(input);
+    expect(result).toMatchObject({ _tag: "Unsupported", rule });
+    expect(Object.keys(result)).toEqual(["_tag", "reason", "rule"]);
+  });
+  it("keeps the first rejection and exact fragment shapes", () => {
+    expect(parseHtmlDocument(wrap("&copy;<table>"))).toMatchObject({
+      _tag: "Unsupported",
+      rule: "CharacterReference",
+    });
+    expect(parseHtmlSnapshot("<div/>")).toEqual({
+      _tag: "Unsupported",
+      reason: "self-closing syntax for normal element <div> is unsupported",
+    });
+    expect(parseHtmlSnapshot("")).toEqual({
+      _tag: "Success",
+      snapshot: { nodes: [], textContent: "" },
+    });
+    expect(parseHtmlSnapshot("x".repeat(131073))).toEqual({
       _tag: "LimitExceeded",
       limit: "inputBytes",
     });

@@ -351,6 +351,9 @@ const makeEvaluate = (
             parsed._tag === "Unsupported"
               ? "unsupported HTML document"
               : "HTML document exceeds " + parsed.limit + " limit",
+          ...(parsed._tag === "Unsupported" && parsed.rule !== undefined
+            ? { documentInputRule: parsed.rule }
+            : {}),
           documentInputFailure:
             parsed._tag === "Unsupported"
               ? "UnsupportedInput"
@@ -365,6 +368,7 @@ const makeEvaluate = (
             new BrowserScriptError({
               reason: "unsupported HTML document",
               documentInputFailure: "UnsupportedInput",
+              documentInputRule: "SnapshotRecordInvariant",
             }),
         ),
       );

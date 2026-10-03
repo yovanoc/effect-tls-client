@@ -1,5 +1,7 @@
 import { Duration, Effect, Schema, type Option } from "effect";
 
+import { DOCUMENT_INPUT_RULES } from "./HtmlSnapshot.js";
+
 const MAX_SOURCE_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
 
@@ -12,6 +14,9 @@ export class BrowserScriptError extends Schema.TaggedError<BrowserScriptError>()
     /** BrowserMock pre-spawn host validation only; never populated from guest IPC.
      * Caller-supplied runtimes remain caller authority, not a sandbox guarantee.
      */
+    documentInputRule: Schema.optionalKey(
+      Schema.Literals(DOCUMENT_INPUT_RULES),
+    ),
     documentInputFailure: Schema.optionalKey(
       Schema.Literals([
         "InvalidContext",

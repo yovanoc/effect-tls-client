@@ -1,3 +1,5 @@
+import { vi } from "vitest";
+import * as HtmlSnapshot from "../src/browser/HtmlSnapshot.js";
 import { spawnSync } from "node:child_process";
 import { expect, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
@@ -198,6 +200,7 @@ it.effect(
             .pipe(Effect.flip);
           expect(error.reason).toMatch(/snapshot|128 KiB/);
           expect(error.documentInputFailure).toBe(failure);
+          expect(Object.hasOwn(error, "documentInputRule")).toBe(false);
         }
       }).pipe(Effect.provide(layer));
       expect(spawns).toBe(0);
@@ -355,6 +358,8 @@ it.effect(
           expect(error).toBeInstanceOf(BrowserScriptError);
           expect(error._tag).toBe("BrowserScriptError");
           expect(error.documentInputFailure).toBe(failure);
+          if (failure !== "UnsupportedInput")
+            expect(Object.hasOwn(error, "documentInputRule")).toBe(false);
         }
         const conflict = yield* runtime
           .evaluate('return "never";', {
@@ -365,6 +370,7 @@ it.effect(
           .pipe(Effect.flip);
         expect(conflict.reason).toBe("unsupported HTML document");
         expect(conflict.documentInputFailure).toBe("ConflictingInputs");
+        expect(Object.hasOwn(conflict, "documentInputRule")).toBe(false);
         const invalid = yield* runtime
           .evaluate('return "never";', {
             ...context,
@@ -374,6 +380,7 @@ it.effect(
         expect(invalid.reason).toBe("invalid browser script context");
         expect(invalid.documentInputFailure).toBe("InvalidContext");
         expect(invalid.cause).toBeDefined();
+        expect(Object.hasOwn(invalid, "documentInputRule")).toBe(false);
         const startup = yield* runtime
           .evaluate('return "never";', {
             ...context,
@@ -384,6 +391,7 @@ it.effect(
           "script IPC start input exceeds its 128 KiB limit",
         );
         expect(startup.documentInputFailure).toBe("StartupLimitExceeded");
+        expect(Object.hasOwn(startup, "documentInputRule")).toBe(false);
       }).pipe(Effect.provide(layer));
       expect(spawns).toBe(0);
     }),
@@ -465,49 +473,59 @@ it.layer(
   ),
   { excludeTestServices: true },
 )("document failure provenance across process IPC", (it) => {
-  it.effect(
-    "does not confer host labels on identical guest messages or property-shaped spoofs",
-    () =>
-      Effect.gen(function* () {
-        const runtime = yield* BrowserMock;
-        for (const [reason, documentInputFailure] of [
-          ["invalid browser script context", "InvalidContext"],
-          ["unsupported HTML document", "ConflictingInputs"],
-          ["unsupported HTML body-fragment snapshot", "UnsupportedInput"],
-          ["HTML document exceeds elements limit", "SnapshotLimitExceeded"],
-          [
-            "script IPC start input exceeds its 128 KiB limit",
-            "StartupLimitExceeded",
-          ],
-        ]) {
-          const properties = JSON.stringify({
-            message: reason,
-            reason,
-            _tag: "BrowserScriptError",
-            documentInputFailure,
-          });
-          for (const source of [
-            `throw new Error(${JSON.stringify(reason)});`,
-            `throw Object.assign(new Error(${JSON.stringify(reason)}), ${properties});`,
-            `throw ${properties};`,
+  for (const documentInputRule of [
+    "Doctype",
+    "SnapshotRecordInvariant",
+    "guest-chosen",
+  ]) {
+    it.effect(
+      `does not confer host labels on identical guest messages or ${documentInputRule} spoofs`,
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          for (const [reason, documentInputFailure] of [
+            ["invalid browser script context", "InvalidContext"],
+            ["unsupported HTML document", "ConflictingInputs"],
+            ["unsupported HTML body-fragment snapshot", "UnsupportedInput"],
+            ["HTML document exceeds elements limit", "SnapshotLimitExceeded"],
+            [
+              "script IPC start input exceeds its 128 KiB limit",
+              "StartupLimitExceeded",
+            ],
           ]) {
-            for (const mode of ["async", "classic"] as const) {
-              const error = yield* runBoundedScript(
-                runtime,
-                source,
-                context,
-                undefined,
-                mode,
-              ).pipe(Effect.flip);
-              expect(error).toBeInstanceOf(BrowserScriptError);
-              expect(error._tag).toBe("BrowserScriptError");
-              expect(error.reason).toBe(reason);
-              expect(Object.hasOwn(error, "documentInputFailure")).toBe(false);
+            const properties = JSON.stringify({
+              message: reason,
+              reason,
+              _tag: "BrowserScriptError",
+              documentInputFailure,
+              documentInputRule,
+            });
+            for (const source of [
+              `throw new Error(${JSON.stringify(reason)});`,
+              `throw Object.assign(new Error(${JSON.stringify(reason)}), ${properties});`,
+              `throw ${properties};`,
+            ]) {
+              for (const mode of ["async", "classic"] as const) {
+                const error = yield* runBoundedScript(
+                  runtime,
+                  source,
+                  context,
+                  undefined,
+                  mode,
+                ).pipe(Effect.flip);
+                expect(error).toBeInstanceOf(BrowserScriptError);
+                expect(error._tag).toBe("BrowserScriptError");
+                expect(error.reason).toBe(reason);
+                expect(Object.hasOwn(error, "documentInputFailure")).toBe(
+                  false,
+                );
+                expect(Object.hasOwn(error, "documentInputRule")).toBe(false);
+              }
             }
           }
-        }
-      }),
-  );
+        }),
+    );
+  }
 });
 
 it.effect(
@@ -520,6 +538,7 @@ it.effect(
         cause,
       });
       expect(original.cause).toBe(cause);
+      expect(Object.hasOwn(original, "documentInputRule")).toBe(false);
       expect(original._tag).toBe("BrowserScriptError");
       expect(Object.hasOwn(original, "documentInputFailure")).toBe(false);
       const decoded = yield* Schema.decodeEffect(BrowserScriptError)({
@@ -527,6 +546,7 @@ it.effect(
         reason: "authored reason",
       });
       expect(decoded.reason).toBe(original.reason);
+      expect(Object.hasOwn(decoded, "documentInputRule")).toBe(false);
       expect(Object.hasOwn(decoded, "documentInputFailure")).toBe(false);
       const invalid = yield* Schema.decodeUnknownEffect(BrowserScriptError)({
         _tag: "BrowserScriptError",
@@ -534,5 +554,126 @@ it.effect(
         documentInputFailure: "guest-chosen",
       }).pipe(Effect.result);
       expect(invalid._tag).toBe("Failure");
+      const invalidRule = yield* Schema.decodeUnknownEffect(BrowserScriptError)(
+        {
+          _tag: "BrowserScriptError",
+          reason: "authored reason",
+          documentInputRule: "guest-chosen",
+        },
+      ).pipe(Effect.result);
+      expect(invalidRule._tag).toBe("Failure");
+      for (const documentInputRule of HtmlSnapshot.DOCUMENT_INPUT_RULES) {
+        const labeled = yield* Schema.decodeEffect(BrowserScriptError)({
+          _tag: "BrowserScriptError",
+          reason: "authored reason",
+          documentInputRule,
+        });
+        expect(labeled.documentInputRule).toBe(documentInputRule);
+      }
+    }),
+);
+
+it.effect(
+  "labels host document rejection families in both modes before any external effects",
+  () =>
+    Effect.gen(function* () {
+      let spawns = 0,
+        requests = 0,
+        writes = 0;
+      const layer = BrowserMock.layer().pipe(
+        Layer.provide(
+          Layer.mock(ChildProcessSpawner.ChildProcessSpawner, {
+            spawn: () => {
+              spawns += 1;
+              return Effect.die("unexpected spawn");
+            },
+          }),
+        ),
+      );
+      const inertHost: BrowserScriptHost = {
+        request: () => {
+          requests += 1;
+          return Effect.die("unexpected request");
+        },
+        setCookie: () => {
+          writes += 1;
+          return Effect.die("unexpected cookie write");
+        },
+      };
+      yield* Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const wrap = (body: string) =>
+          "<!doctype html><html><head></head><body>" + body + "</body></html>";
+        for (const [rule, document] of [
+          ["InputEncoding", wrap("\u0000")],
+          ["Doctype", "<html></html>"],
+          ["DocumentStructure", "<!doctype html><head></head>"],
+          [
+            "HeadContentSubset",
+            "<!doctype html><html><head><table></table></head><body></body></html>",
+          ],
+          ["CommentSyntax", wrap("<!--unfinished")],
+          ["MarkupSyntax", wrap("<?instruction>")],
+          ["CharacterReference", wrap("&copy;")],
+          ["TagSyntax", wrap("<custom-widget>")],
+          ["ClosingStructure", wrap("<div></span>")],
+          ["ImplicitRepair", wrap("<p><div></div></p>")],
+          ["AttributeSyntax", wrap('<div a="x"b="y"></div>')],
+          ["SelfClosingNormal", wrap("<div/>")],
+          ["RawTextSubset", wrap("<script><!--x--></script>")],
+          [
+            "TitleRcdataSubset",
+            "<!doctype html><html><head><title><b>x</b></title></head><body></body></html>",
+          ],
+          ["DocumentElementSubset", wrap("<html></html>")],
+          ["TableSubset", wrap("<table></table>")],
+          ["SelectSubset", wrap("<select></select>")],
+          ["TemplateSubset", wrap("<template></template>")],
+          ["ScriptingDependentSubset", wrap("<noscript></noscript>")],
+          ["ForeignContentSubset", wrap("<svg></svg>")],
+          ["ElementSubset", wrap("<form></form>")],
+        ] satisfies ReadonlyArray<readonly [string, string]>) {
+          for (const mode of ["async", "classic"] as const) {
+            const error = yield* runBoundedScript(
+              runtime,
+              'throw new Error("never");',
+              { ...context, document },
+              inertHost,
+              mode,
+            ).pipe(Effect.flip);
+            expect(error.reason).toBe("unsupported HTML document");
+            expect(error.documentInputFailure).toBe("UnsupportedInput");
+            expect(error).toMatchObject({ documentInputRule: rule });
+          }
+        }
+        const spy = vi
+          .spyOn(HtmlSnapshot, "parseHtmlDocument")
+          .mockReturnValue({
+            _tag: "Success",
+            snapshot: { nodes: [], textContent: "" },
+          });
+        try {
+          for (const mode of ["async", "classic"] as const) {
+            const error = yield* runBoundedScript(
+              runtime,
+              'return "never";',
+              { ...context, document: wholeDocument },
+              inertHost,
+              mode,
+            ).pipe(Effect.flip);
+            expect(error.reason).toBe("unsupported HTML document");
+            expect(error.documentInputFailure).toBe("UnsupportedInput");
+            expect(error).toMatchObject({
+              documentInputRule: "SnapshotRecordInvariant",
+            });
+          }
+        } finally {
+          spy.mockRestore();
+        }
+        expect(HtmlSnapshot.parseHtmlDocument(wholeDocument)._tag).toBe(
+          "Success",
+        );
+      }).pipe(Effect.provide(layer));
+      expect([spawns, requests, writes]).toEqual([0, 0, 0]);
     }),
 );

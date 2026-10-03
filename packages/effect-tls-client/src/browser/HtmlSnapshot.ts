@@ -12,6 +12,34 @@
  * selected subset rejects the entire snapshot.
  */
 
+/** Code-owned document rejection families; never derived from input operands. */
+export const DOCUMENT_INPUT_RULES = [
+  "InputEncoding",
+  "Doctype",
+  "DocumentStructure",
+  "HeadContentSubset",
+  "CommentSyntax",
+  "MarkupSyntax",
+  "CharacterReference",
+  "TagSyntax",
+  "ClosingStructure",
+  "ImplicitRepair",
+  "AttributeSyntax",
+  "SelfClosingNormal",
+  "RawTextSubset",
+  "TitleRcdataSubset",
+  "DocumentElementSubset",
+  "TableSubset",
+  "SelectSubset",
+  "TemplateSubset",
+  "ScriptingDependentSubset",
+  "ForeignContentSubset",
+  "ElementSubset",
+  "SnapshotRecordInvariant",
+] as const;
+
+export type DocumentInputRule = (typeof DOCUMENT_INPUT_RULES)[number];
+
 interface HtmlSnapshotNode {
   readonly tag: string;
   /** Preorder index of the parent element, or -1 for a fragment child. */
@@ -29,7 +57,11 @@ interface HtmlSnapshot {
 
 type HtmlSnapshotParseResult =
   | { readonly _tag: "Success"; readonly snapshot: HtmlSnapshot }
-  | { readonly _tag: "Unsupported"; readonly reason: string }
+  | {
+      readonly _tag: "Unsupported";
+      readonly reason: string;
+      readonly rule?: DocumentInputRule;
+    }
   | {
       readonly _tag: "LimitExceeded";
       readonly limit:
@@ -206,9 +238,14 @@ const utf8ByteLength = (value: string): number => {
 const normalizedLineEndings = (input: string): string =>
   input.replace(/\r\n?/g, "\n");
 
-const unsupportedTagReason = (tag: string): string => {
+const unsupportedTagReason = (
+  tag: string,
+): readonly [string, DocumentInputRule] => {
   if (tag === "html" || tag === "head" || tag === "body") {
-    return `document element <${tag}> semantics are unsupported`;
+    return [
+      `document element <${tag}> semantics are unsupported`,
+      "DocumentElementSubset",
+    ];
   }
   if (
     tag === "table" ||
@@ -221,7 +258,10 @@ const unsupportedTagReason = (tag: string): string => {
     tag === "caption" ||
     tag === "colgroup"
   ) {
-    return `table repair semantics for <${tag}> are unsupported`;
+    return [
+      `table repair semantics for <${tag}> are unsupported`,
+      "TableSubset",
+    ];
   }
   if (
     tag === "select" ||
@@ -229,13 +269,20 @@ const unsupportedTagReason = (tag: string): string => {
     tag === "optgroup" ||
     tag === "datalist"
   ) {
-    return `select semantics for <${tag}> are unsupported`;
+    return [`select semantics for <${tag}> are unsupported`, "SelectSubset"];
   }
-  if (tag === "template") return "template contents are unsupported";
+  if (tag === "template")
+    return ["template contents are unsupported", "TemplateSubset"];
   if (tag === "noscript")
-    return "scripting-dependent noscript parsing is unsupported";
+    return [
+      "scripting-dependent noscript parsing is unsupported",
+      "ScriptingDependentSubset",
+    ];
   if (tag === "svg" || tag === "math") {
-    return `foreign-content semantics for <${tag}> are unsupported`;
+    return [
+      `foreign-content semantics for <${tag}> are unsupported`,
+      "ForeignContentSubset",
+    ];
   }
   if (
     tag === "textarea" ||
@@ -246,12 +293,21 @@ const unsupportedTagReason = (tag: string): string => {
     tag === "xmp" ||
     tag === "plaintext"
   ) {
-    return `special text or embedded semantics for <${tag}> are unsupported`;
+    return [
+      `special text or embedded semantics for <${tag}> are unsupported`,
+      "ElementSubset",
+    ];
   }
   if (tag === "form" || tag === "button") {
-    return `form-control parsing semantics for <${tag}> are unsupported`;
+    return [
+      `form-control parsing semantics for <${tag}> are unsupported`,
+      "ElementSubset",
+    ];
   }
-  return `element <${tag}> is outside the supported fragment subset`;
+  return [
+    `element <${tag}> is outside the supported fragment subset`,
+    "ElementSubset",
+  ];
 };
 
 const parseHtml = (
@@ -265,7 +321,11 @@ const parseHtml = (
     return { _tag: "LimitExceeded", limit: "inputBytes" };
   }
   if (!isWellFormedInput(input)) {
-    return { _tag: "Unsupported", reason: "NUL or malformed UTF-16 input" };
+    return {
+      _tag: "Unsupported",
+      reason: "NUL or malformed UTF-16 input",
+      ...(mode === "document" ? { rule: "InputEncoding" as const } : {}),
+    };
   }
 
   const source = normalizedLineEndings(input);
@@ -281,8 +341,12 @@ const parseHtml = (
   const abort = (result: ParseFailure): never => {
     throw new ParseAbort(result);
   };
-  const reject = (reason: string): never =>
-    abort({ _tag: "Unsupported", reason });
+  const reject = (reason: string, rule: DocumentInputRule): never =>
+    abort({
+      _tag: "Unsupported",
+      reason,
+      ...(mode === "document" ? { rule } : {}),
+    });
   const exceed = (
     limit: Extract<
       HtmlSnapshotParseResult,
@@ -308,23 +372,26 @@ const parseHtml = (
       !source.startsWith("<!", cursor) ||
       !asciiEqualsAt(cursor + 2, "doctype")
     ) {
-      reject("only the standard <!doctype html> is supported");
+      reject("only the standard <!doctype html> is supported", "Doctype");
     }
     cursor += 9;
     if (!isHtmlWhitespace(source[cursor])) {
-      reject("doctype keyword and name must be separated by whitespace");
+      reject(
+        "doctype keyword and name must be separated by whitespace",
+        "Doctype",
+      );
     }
     while (isHtmlWhitespace(source[cursor])) cursor += 1;
     if (!asciiEqualsAt(cursor, "html")) {
-      reject("only the standard <!doctype html> is supported");
+      reject("only the standard <!doctype html> is supported", "Doctype");
     }
     cursor += 4;
     if (!isHtmlWhitespace(source[cursor]) && source[cursor] !== ">") {
-      reject("legacy doctype identifiers are unsupported");
+      reject("legacy doctype identifiers are unsupported", "Doctype");
     }
     while (isHtmlWhitespace(source[cursor])) cursor += 1;
     if (source[cursor] !== ">") {
-      reject("legacy doctype identifiers are unsupported");
+      reject("legacy doctype identifiers are unsupported", "Doctype");
     }
     cursor += 1;
     documentPhase = "beforeHtml";
@@ -390,7 +457,7 @@ const parseHtml = (
         semicolon += 1;
       }
       if (semicolon === value.length) {
-        reject("character reference without a semicolon");
+        reject("character reference without a semicolon", "CharacterReference");
       }
 
       const reference = value.slice(start + 1, semicolon);
@@ -405,7 +472,7 @@ const parseHtml = (
           digit += 1;
         }
         if (digit === reference.length) {
-          reject("invalid numeric character reference");
+          reject("invalid numeric character reference", "CharacterReference");
         }
         let codePoint = 0;
         for (; digit < reference.length; digit += 1) {
@@ -422,11 +489,14 @@ const parseHtml = (
             valueDigit = character.toLowerCase().charCodeAt(0) - 87;
           }
           if (valueDigit < 0 || valueDigit >= radix) {
-            reject("invalid numeric character reference");
+            reject("invalid numeric character reference", "CharacterReference");
           }
           codePoint = codePoint * radix + valueDigit;
           if (codePoint > 0x10ffff) {
-            reject("numeric character reference is outside Unicode");
+            reject(
+              "numeric character reference is outside Unicode",
+              "CharacterReference",
+            );
           }
         }
         if (
@@ -439,11 +509,17 @@ const parseHtml = (
             codePoint !== 0x0d) ||
           (codePoint >= 0x7f && codePoint <= 0x9f)
         ) {
-          reject("numeric character reference is not supported");
+          reject(
+            "numeric character reference is not supported",
+            "CharacterReference",
+          );
         }
         decoded += String.fromCodePoint(codePoint);
       } else {
-        reject(`unknown character reference &${reference};`);
+        reject(
+          `unknown character reference &${reference};`,
+          "CharacterReference",
+        );
       }
       start = semicolon + 1;
     }
@@ -452,7 +528,7 @@ const parseHtml = (
 
   const parseEndTag = (pop = true): string => {
     cursor += 2;
-    if (!isAsciiLetter(source[cursor])) reject("invalid end tag");
+    if (!isAsciiLetter(source[cursor])) reject("invalid end tag", "TagSyntax");
     const nameStart = cursor;
     while (
       cursor < source.length &&
@@ -461,18 +537,22 @@ const parseHtml = (
       source[cursor] !== "/"
     ) {
       if (!isAsciiLetter(source[cursor])) {
-        reject("non-ASCII-letter tag name");
+        reject("non-ASCII-letter tag name", "TagSyntax");
       }
       cursor += 1;
     }
     const tag = source.slice(nameStart, cursor).toLowerCase();
     while (isHtmlWhitespace(source[cursor])) cursor += 1;
-    if (source[cursor] !== ">") reject(`ambiguous closing tag </${tag}>`);
+    if (source[cursor] !== ">")
+      reject(`ambiguous closing tag </${tag}>`, "TagSyntax");
     cursor += 1;
 
     const parent = stack[stack.length - 1];
     if (parent === undefined || nodes[parent]?.tag !== tag) {
-      reject(`unexpected or mismatched closing tag </${tag}>`);
+      reject(
+        `unexpected or mismatched closing tag </${tag}>`,
+        "ClosingStructure",
+      );
     }
     if (pop) stack.pop();
     return tag;
@@ -512,10 +592,14 @@ const parseHtml = (
         ) {
           end += 1;
         }
-        if (end + 2 >= source.length) reject("unterminated comment");
+        if (end + 2 >= source.length)
+          reject("unterminated comment", "CommentSyntax");
         const comment = source.slice(cursor + 4, end);
         if (comment.startsWith(">") || comment.includes("--")) {
-          reject("comment syntax is outside the supported subset");
+          reject(
+            "comment syntax is outside the supported subset",
+            "CommentSyntax",
+          );
         }
         cursor = end + 3;
         continue;
@@ -533,14 +617,20 @@ const parseHtml = (
               currentPhase() === "beforeHead" ||
               currentPhase() === "inHead"
             ) {
-              reject("non-whitespace text would trigger document repair");
+              reject(
+                "non-whitespace text would trigger document repair",
+                "DocumentStructure",
+              );
             }
             if (
               currentPhase() === "afterHead" ||
               currentPhase() === "afterBody" ||
               currentPhase() === "afterHtml"
             ) {
-              reject("non-whitespace text outside the body is unsupported");
+              reject(
+                "non-whitespace text outside the body is unsupported",
+                "DocumentStructure",
+              );
             }
           }
           if (
@@ -565,11 +655,14 @@ const parseHtml = (
             if (tag === "body") documentPhase = "afterBody";
           } else if (currentPhase() === "afterBody") {
             if (parseEndTag(false) !== "html") {
-              reject("only </html> may follow the body");
+              reject("only </html> may follow the body", "DocumentStructure");
             }
             documentPhase = "afterHtml";
           } else {
-            reject("unexpected end tag in document structure");
+            reject(
+              "unexpected end tag in document structure",
+              "DocumentStructure",
+            );
           }
         } else {
           parseEndTag();
@@ -583,10 +676,11 @@ const parseHtml = (
       if (source.startsWith("<!", cursor) || source.startsWith("<?", cursor)) {
         reject(
           "doctype, declaration, and processing-instruction syntax is unsupported",
+          "MarkupSyntax",
         );
       }
       if (!isAsciiLetter(source[cursor + 1])) {
-        reject("ambiguous markup beginning with '<'");
+        reject("ambiguous markup beginning with '<'", "MarkupSyntax");
       }
 
       cursor += 1;
@@ -598,7 +692,7 @@ const parseHtml = (
         source[cursor] !== ">"
       ) {
         if (!isAsciiLetter(source[cursor])) {
-          reject("non-ASCII-letter tag name");
+          reject("non-ASCII-letter tag name", "TagSyntax");
         }
         cursor += 1;
       }
@@ -606,18 +700,26 @@ const parseHtml = (
       const isVoid = VOID_TAGS.has(tag);
       if (!isSupportedStartTag(tag)) {
         if (mode === "fragment" || currentPhase() === "inBody") {
-          reject(unsupportedTagReason(tag));
+          reject(...unsupportedTagReason(tag));
         }
-        reject(`unexpected <${tag}> in document structure`);
+        reject(
+          `unexpected <${tag}> in document structure`,
+          currentPhase() === "inHead"
+            ? "HeadContentSubset"
+            : "DocumentStructure",
+        );
       }
       if (
         stack.some((index) => nodes[index]?.tag === "p") &&
         PARAGRAPH_CLOSING_START_TAGS.has(tag)
       ) {
-        reject(`start tag <${tag}> would implicitly close an open paragraph`);
+        reject(
+          `start tag <${tag}> would implicitly close an open paragraph`,
+          "ImplicitRepair",
+        );
       }
       if (tag === "a" && stack.some((index) => nodes[index]?.tag === "a")) {
-        reject("nested anchors require HTML repair");
+        reject("nested anchors require HTML repair", "ImplicitRepair");
       }
 
       const attributes: Array<[string, string]> = [];
@@ -632,13 +734,13 @@ const parseHtml = (
         if (source[cursor] === "/") {
           cursor += 1;
           if (source[cursor] !== ">")
-            reject("ambiguous self-closing tag syntax");
+            reject("ambiguous self-closing tag syntax", "TagSyntax");
           cursor += 1;
           selfClosing = true;
           break;
         }
         if (!isAttributeNameStart(source[cursor])) {
-          reject(`invalid attribute syntax on <${tag}>`);
+          reject(`invalid attribute syntax on <${tag}>`, "AttributeSyntax");
         }
 
         const attributeStart = cursor;
@@ -658,7 +760,10 @@ const parseHtml = (
             while (cursor < source.length && source[cursor] !== quote)
               cursor += 1;
             if (cursor === source.length)
-              reject(`unterminated value for attribute ${name}`);
+              reject(
+                `unterminated value for attribute ${name}`,
+                "AttributeSyntax",
+              );
             rawValue = source.slice(valueStart, cursor);
             cursor += 1;
             if (
@@ -666,7 +771,10 @@ const parseHtml = (
               source[cursor] !== "/" &&
               source[cursor] !== ">"
             ) {
-              reject(`missing separator after attribute ${name}`);
+              reject(
+                `missing separator after attribute ${name}`,
+                "AttributeSyntax",
+              );
             }
           } else if (source[cursor] === ">") {
             rawValue = "";
@@ -685,7 +793,10 @@ const parseHtml = (
                 character === "=" ||
                 character === "<"
               ) {
-                reject(`invalid unquoted value for attribute ${name}`);
+                reject(
+                  `invalid unquoted value for attribute ${name}`,
+                  "AttributeSyntax",
+                );
               }
               cursor += 1;
             }
@@ -712,6 +823,7 @@ const parseHtml = (
       if (selfClosing && !isVoid) {
         reject(
           `self-closing syntax for normal element <${tag}> is unsupported`,
+          "SelfClosingNormal",
         );
       }
       if (nodes.length >= MAX_ELEMENTS) exceed("elements");
@@ -731,12 +843,12 @@ const parseHtml = (
         let closing = cursor;
         while (closing < source.length && !rawTextCloseAt(closing, tag)) {
           if (tag === "script" && source.startsWith("<!--", closing)) {
-            reject("script escape syntax is unsupported");
+            reject("script escape syntax is unsupported", "RawTextSubset");
           }
           closing += 1;
         }
         if (closing === source.length)
-          reject(`unterminated raw-text element <${tag}>`);
+          reject(`unterminated raw-text element <${tag}>`, "RawTextSubset");
         appendText(source.slice(cursor, closing));
         cursor = closing;
         parseEndTag();
@@ -744,11 +856,15 @@ const parseHtml = (
         let closing = cursor;
         while (closing < source.length && !rawTextCloseAt(closing, "title")) {
           if (source[closing] === "<") {
-            reject("literal markup inside title RCDATA is unsupported");
+            reject(
+              "literal markup inside title RCDATA is unsupported",
+              "TitleRcdataSubset",
+            );
           }
           closing += 1;
         }
-        if (closing === source.length) reject("unterminated title element");
+        if (closing === source.length)
+          reject("unterminated title element", "TitleRcdataSubset");
         appendText(decodeReferences(source.slice(cursor, closing)));
         cursor = closing;
         parseEndTag();
@@ -759,6 +875,7 @@ const parseHtml = (
       if (stack.length > 0) {
         reject(
           `unclosed element <${nodes[stack[stack.length - 1] ?? 0]?.tag ?? "?"}>`,
+          "ClosingStructure",
         );
       }
     } else if (
@@ -766,7 +883,7 @@ const parseHtml = (
       stack.length !== 1 ||
       nodes[0]?.tag !== "html"
     ) {
-      reject("incomplete or repaired HTML document");
+      reject("incomplete or repaired HTML document", "DocumentStructure");
     }
 
     if (mode === "document") {
@@ -776,7 +893,10 @@ const parseHtml = (
         htmlChildren[0]?.tag !== "head" ||
         htmlChildren[1]?.tag !== "body"
       ) {
-        reject("document must have exactly one head followed by one body");
+        reject(
+          "document must have exactly one head followed by one body",
+          "DocumentStructure",
+        );
       }
     }
 
