@@ -332,12 +332,14 @@ const makeEvaluate = (
           new BrowserScriptError({
             reason: "invalid browser script context",
             cause,
+            documentInputFailure: "InvalidContext",
           }),
       ),
     );
     if (context.html !== undefined && context.document !== undefined) {
       return yield* new BrowserScriptError({
         reason: "unsupported HTML document",
+        documentInputFailure: "ConflictingInputs",
       });
     }
     let documentRoot: Schema.Schema.Type<typeof DocumentRoot> | undefined;
@@ -349,13 +351,21 @@ const makeEvaluate = (
             parsed._tag === "Unsupported"
               ? "unsupported HTML document"
               : "HTML document exceeds " + parsed.limit + " limit",
+          documentInputFailure:
+            parsed._tag === "Unsupported"
+              ? "UnsupportedInput"
+              : "SnapshotLimitExceeded",
         });
       }
       documentRoot = yield* Schema.decodeEffect(DocumentRoot)(
         parsed.snapshot,
       ).pipe(
         Effect.mapError(
-          () => new BrowserScriptError({ reason: "unsupported HTML document" }),
+          () =>
+            new BrowserScriptError({
+              reason: "unsupported HTML document",
+              documentInputFailure: "UnsupportedInput",
+            }),
         ),
       );
     }
@@ -370,13 +380,21 @@ const makeEvaluate = (
             parsed._tag === "Unsupported"
               ? "unsupported HTML body-fragment snapshot"
               : "HTML snapshot exceeds " + parsed.limit + " limit",
+          documentInputFailure:
+            parsed._tag === "Unsupported"
+              ? "UnsupportedInput"
+              : "SnapshotLimitExceeded",
         });
       }
       documentSnapshot = yield* Schema.decodeEffect(DocumentSnapshot)(
         parsed.snapshot,
       ).pipe(
         Effect.mapError(
-          () => new BrowserScriptError({ reason: "invalid document snapshot" }),
+          () =>
+            new BrowserScriptError({
+              reason: "invalid document snapshot",
+              documentInputFailure: "UnsupportedInput",
+            }),
         ),
       );
     }
@@ -403,6 +421,7 @@ const makeEvaluate = (
     ) {
       return yield* new BrowserScriptError({
         reason: "script IPC start input exceeds its 128 KiB limit",
+        documentInputFailure: "StartupLimitExceeded",
       });
     }
     const start = yield* Schema.encodeEffect(RunnerStartJson)({
@@ -445,6 +464,7 @@ const makeEvaluate = (
     ) {
       return yield* new BrowserScriptError({
         reason: "script IPC start input exceeds its 128 KiB limit",
+        documentInputFailure: "StartupLimitExceeded",
       });
     }
     const output = yield* Effect.scoped(

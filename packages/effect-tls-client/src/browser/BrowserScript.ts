@@ -9,6 +9,18 @@ export class BrowserScriptError extends Schema.TaggedError<BrowserScriptError>()
   {
     reason: Schema.String,
     cause: Schema.optionalKey(Schema.Defect()),
+    /** BrowserMock pre-spawn host validation only; never populated from guest IPC.
+     * Caller-supplied runtimes remain caller authority, not a sandbox guarantee.
+     */
+    documentInputFailure: Schema.optionalKey(
+      Schema.Literals([
+        "InvalidContext",
+        "ConflictingInputs",
+        "UnsupportedInput",
+        "SnapshotLimitExceeded",
+        "StartupLimitExceeded",
+      ]),
+    ),
   },
 ) {}
 

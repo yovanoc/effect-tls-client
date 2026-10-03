@@ -1,10 +1,15 @@
 import { spawnSync } from "node:child_process";
 import { expect, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Schema } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { makeBrowserScriptRunnerSource } from "../src/browser/BrowserScriptRunner.js";
-import { BrowserMock, type BrowserScriptHost } from "../src/browser/index.js";
+import {
+  BrowserMock,
+  BrowserScriptError,
+  type BrowserScriptHost,
+} from "../src/browser/index.js";
+import { runBoundedScript } from "../src/browser/BrowserScript.js";
 
 const context = {
   url: "http://localhost:43127/page",
@@ -170,19 +175,29 @@ it.effect(
       );
       yield* Effect.gen(function* () {
         const runtime = yield* BrowserMock;
-        for (const html of [
-          "<html></html>",
-          "<p><div></div></p>",
-          "<div></div>".repeat(33),
-          '<div title="' + "é".repeat(8192) + '"></div>',
-          "é".repeat(65537),
-          "<div><span>" + "x".repeat(50000) + "</span></div>",
-          "<span>" + "\u0001".repeat(23000) + "</span>",
-        ]) {
+        for (const [html, failure] of [
+          ["<html></html>", "UnsupportedInput"],
+          ["<p><div></div></p>", "UnsupportedInput"],
+          ["<div></div>".repeat(33), "SnapshotLimitExceeded"],
+          [
+            '<div title="' + "é".repeat(8192) + '"></div>',
+            "SnapshotLimitExceeded",
+          ],
+          ["é".repeat(65537), "SnapshotLimitExceeded"],
+          [
+            "<div><span>" + "x".repeat(50000) + "</span></div>",
+            "StartupLimitExceeded",
+          ],
+          [
+            "<span>" + "\u0001".repeat(23000) + "</span>",
+            "StartupLimitExceeded",
+          ],
+        ] satisfies ReadonlyArray<readonly [string, string]>) {
           const error = yield* runtime
             .evaluate('return "never";', { ...context, html })
             .pipe(Effect.flip);
           expect(error.reason).toMatch(/snapshot|128 KiB/);
+          expect(error.documentInputFailure).toBe(failure);
         }
       }).pipe(Effect.provide(layer));
       expect(spawns).toBe(0);
@@ -294,38 +309,52 @@ it.effect(
         const runtime = yield* BrowserMock;
         const wrap = (body: string) =>
           "<!doctype html><html><head></head><body>" + body + "</body></html>";
-        for (const [document, reason] of [
+        for (const [document, reason, failure] of [
           [
             "<html><head></head><body></body></html>",
             "unsupported HTML document",
+            "UnsupportedInput",
           ],
-          [wrap("<div>"), "unsupported HTML document"],
+          [wrap("<div>"), "unsupported HTML document", "UnsupportedInput"],
           [
             wrap("<div></div>".repeat(30)),
             "HTML document exceeds elements limit",
+            "SnapshotLimitExceeded",
           ],
           [
             wrap('<div title="' + "x".repeat(8193) + '"></div>'),
             "HTML document exceeds attributeValueCharacters limit",
+            "SnapshotLimitExceeded",
           ],
           [
             wrap('<div title="' + "é".repeat(8192) + '"></div>'),
             "HTML document exceeds attributesUtf8Bytes limit",
+            "SnapshotLimitExceeded",
           ],
-          [wrap("é".repeat(65536)), "HTML document exceeds inputBytes limit"],
+          [
+            wrap("é".repeat(65536)),
+            "HTML document exceeds inputBytes limit",
+            "SnapshotLimitExceeded",
+          ],
           [
             wrap("<div><span>" + "x".repeat(40000) + "</span></div>"),
             "script IPC start input exceeds its 128 KiB limit",
+            "StartupLimitExceeded",
           ],
           [
             wrap("\u0001".repeat(12000)),
             "script IPC start input exceeds its 128 KiB limit",
+            "StartupLimitExceeded",
           ],
-        ] satisfies ReadonlyArray<readonly [string, string]>) {
-          const error = yield* runtime
-            .evaluate('return "never";', { ...context, document })
-            .pipe(Effect.flip);
+        ] satisfies ReadonlyArray<readonly [string, string, string]>) {
+          const error = yield* runBoundedScript(runtime, 'return "never";', {
+            ...context,
+            document,
+          }).pipe(Effect.flip);
           expect(error.reason).toBe(reason);
+          expect(error).toBeInstanceOf(BrowserScriptError);
+          expect(error._tag).toBe("BrowserScriptError");
+          expect(error.documentInputFailure).toBe(failure);
         }
         const conflict = yield* runtime
           .evaluate('return "never";', {
@@ -335,6 +364,26 @@ it.effect(
           })
           .pipe(Effect.flip);
         expect(conflict.reason).toBe("unsupported HTML document");
+        expect(conflict.documentInputFailure).toBe("ConflictingInputs");
+        const invalid = yield* runtime
+          .evaluate('return "never";', {
+            ...context,
+            languages: Array.from({ length: 17 }, () => "en"),
+          })
+          .pipe(Effect.flip);
+        expect(invalid.reason).toBe("invalid browser script context");
+        expect(invalid.documentInputFailure).toBe("InvalidContext");
+        expect(invalid.cause).toBeDefined();
+        const startup = yield* runtime
+          .evaluate('return "never";', {
+            ...context,
+            userAgent: "x".repeat(131073),
+          })
+          .pipe(Effect.flip);
+        expect(startup.reason).toBe(
+          "script IPC start input exceeds its 128 KiB limit",
+        );
+        expect(startup.documentInputFailure).toBe("StartupLimitExceeded");
       }).pipe(Effect.provide(layer));
       expect(spawns).toBe(0);
     }),
@@ -409,3 +458,81 @@ it("rejects forged root structures on the runner IPC boundary before guest execu
     expect(result.stdout).not.toContain("GUEST_EXECUTED");
   }
 });
+
+it.layer(
+  BrowserMock.layer({ timeoutMs: 4000 }).pipe(
+    Layer.provide(NodeServices.layer),
+  ),
+  { excludeTestServices: true },
+)("document failure provenance across process IPC", (it) => {
+  it.effect(
+    "does not confer host labels on identical guest messages or property-shaped spoofs",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        for (const [reason, documentInputFailure] of [
+          ["invalid browser script context", "InvalidContext"],
+          ["unsupported HTML document", "ConflictingInputs"],
+          ["unsupported HTML body-fragment snapshot", "UnsupportedInput"],
+          ["HTML document exceeds elements limit", "SnapshotLimitExceeded"],
+          [
+            "script IPC start input exceeds its 128 KiB limit",
+            "StartupLimitExceeded",
+          ],
+        ]) {
+          const properties = JSON.stringify({
+            message: reason,
+            reason,
+            _tag: "BrowserScriptError",
+            documentInputFailure,
+          });
+          for (const source of [
+            `throw new Error(${JSON.stringify(reason)});`,
+            `throw Object.assign(new Error(${JSON.stringify(reason)}), ${properties});`,
+            `throw ${properties};`,
+          ]) {
+            for (const mode of ["async", "classic"] as const) {
+              const error = yield* runBoundedScript(
+                runtime,
+                source,
+                context,
+                undefined,
+                mode,
+              ).pipe(Effect.flip);
+              expect(error).toBeInstanceOf(BrowserScriptError);
+              expect(error._tag).toBe("BrowserScriptError");
+              expect(error.reason).toBe(reason);
+              expect(Object.hasOwn(error, "documentInputFailure")).toBe(false);
+            }
+          }
+        }
+      }),
+  );
+});
+
+it.effect(
+  "retains the error schema and omitted-field construction contract",
+  () =>
+    Effect.gen(function* () {
+      const cause = new Error("authored cause");
+      const original = new BrowserScriptError({
+        reason: "authored reason",
+        cause,
+      });
+      expect(original.cause).toBe(cause);
+      expect(original._tag).toBe("BrowserScriptError");
+      expect(Object.hasOwn(original, "documentInputFailure")).toBe(false);
+      const decoded = yield* Schema.decodeEffect(BrowserScriptError)({
+        _tag: "BrowserScriptError",
+        reason: "authored reason",
+      });
+      expect(decoded.reason).toBe(original.reason);
+      expect(Object.hasOwn(decoded, "documentInputFailure")).toBe(false);
+      const invalid = yield* Schema.decodeUnknownEffect(BrowserScriptError)({
+        _tag: "BrowserScriptError",
+        reason: "authored reason",
+        documentInputFailure: "guest-chosen",
+      }).pipe(Effect.result);
+      expect(invalid._tag).toBe("Failure");
+    }),
+);
