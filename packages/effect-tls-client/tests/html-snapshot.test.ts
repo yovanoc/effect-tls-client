@@ -432,10 +432,6 @@ describe("parseHtmlDocument", () => {
       "<!doctype html><html><head></head><body><table><tr><td>x</td></tr></table></body></html>",
     ],
     [
-      "body noscript semantics",
-      "<!doctype html><html><head></head><body><noscript>x</noscript></body></html>",
-    ],
-    [
       "body foreign content",
       "<!doctype html><html><head></head><body><svg></svg></body></html>",
     ],
@@ -524,7 +520,6 @@ describe("document-only rejection families", () => {
     ["TableSubset", wrap("<table></table>")],
     ["SelectSubset", wrap("<select></select>")],
     ["TemplateSubset", wrap("<template></template>")],
-    ["ScriptingDependentSubset", wrap("<noscript></noscript>")],
     ["ForeignContentSubset", wrap("<svg></svg>")],
     ["ElementSubset", wrap("<form></form>")],
   ])("labels %s without accepting or repairing the document", (rule, input) => {
@@ -549,5 +544,145 @@ describe("document-only rejection families", () => {
       _tag: "LimitExceeded",
       limit: "inputBytes",
     });
+  });
+});
+
+describe("document body noscript RAWTEXT", () => {
+  const wrap = (body: string) =>
+    "<!doctype html><html><head></head><body>" + body + "</body></html>";
+  it.each([false, true])(
+    "retains literal text and preorder under an ordinary parent: %s",
+    (nested) => {
+      const raw = '<div id="raw">&amp;<script>authored()</script>';
+      const markup =
+        '<noscript ID="fallback" CLASS="fixture">' + raw + "</noscript>";
+      const result = parseHtmlDocument(
+        wrap(nested ? "<div>before" + markup + "after</div>" : markup),
+      );
+      const text = nested ? "before" + raw + "after" : raw;
+      expect(result).toEqual({
+        _tag: "Success",
+        snapshot: {
+          textContent: text,
+          nodes: [
+            { tag: "html", parent: -1, attributes: [], textContent: text },
+            { tag: "head", parent: 0, attributes: [], textContent: "" },
+            { tag: "body", parent: 0, attributes: [], textContent: text },
+            ...(nested
+              ? [{ tag: "div", parent: 2, attributes: [], textContent: text }]
+              : []),
+            {
+              tag: "noscript",
+              parent: nested ? 3 : 2,
+              attributes: [
+                ["id", "fallback"],
+                ["class", "fixture"],
+              ],
+              textContent: raw,
+            },
+          ],
+        },
+      });
+    },
+  );
+  it.each([
+    ["", ""],
+    ["a\r\nb\rc", "a\nb\nc"],
+    [
+      "</noscriptx>&unknown;<!--<script><!--x--></script>--><!declaration><?instruction>",
+      "</noscriptx>&unknown;<!--<script><!--x--></script>--><!declaration><?instruction>",
+    ],
+  ])("keeps all RAWTEXT %j", (raw, text) => {
+    const result = parseHtmlDocument(
+      wrap("<NoScRiPt>" + raw + "</NoScRiPt \t>"),
+    );
+    expect(result).toMatchObject({
+      _tag: "Success",
+      snapshot: {
+        textContent: text,
+        nodes: [
+          { textContent: text },
+          {},
+          { textContent: text },
+          { tag: "noscript", textContent: text },
+        ],
+      },
+    });
+    if (result._tag === "Success")
+      expect(result.snapshot.nodes).toHaveLength(4);
+  });
+  it.each([
+    ["<noscript>x", "RawTextSubset"],
+    ["<noscript>x</noscript", "RawTextSubset"],
+    ["<noscript>x</noscript/>", "TagSyntax"],
+    ["<noscript>x</noscript attr>", "TagSyntax"],
+    ["<noscript>x</noscript/>later</noscript>", "TagSyntax"],
+    ["<noscript>x</noscript ", "TagSyntax"],
+    ["<noscript/>", "SelfClosingNormal"],
+  ])("rejects unrepaired %s", (body, rule) => {
+    expect(parseHtmlDocument(wrap(body))).toMatchObject({
+      _tag: "Unsupported",
+      rule,
+    });
+  });
+  it("keeps head, fragment and first-failure contracts unchanged", () => {
+    expect(
+      parseHtmlDocument(
+        "<!doctype html><html><head><noscript>x</noscript></head><body></body></html>",
+      ),
+    ).toEqual({
+      _tag: "Unsupported",
+      reason: "unexpected <noscript> in document structure",
+      rule: "HeadContentSubset",
+    });
+    expect(parseHtmlSnapshot("<noscript>x</noscript>")).toEqual({
+      _tag: "Unsupported",
+      reason: "scripting-dependent noscript parsing is unsupported",
+    });
+    expect(
+      parseHtmlDocument(wrap("<noscript>&unknown;</noscript><table><form>")),
+    ).toMatchObject({ _tag: "Unsupported", rule: "TableSubset" });
+    expect(
+      parseHtmlDocument(wrap("&unknown;<noscript></noscript>")),
+    ).toMatchObject({ _tag: "Unsupported", rule: "CharacterReference" });
+  });
+  it("preserves all quotas without charging parsed text as mutable text", () => {
+    expect(
+      parseHtmlDocument(wrap("<noscript></noscript>" + "<br>".repeat(28)))._tag,
+    ).toBe("Success");
+    expect(
+      parseHtmlDocument(wrap("<noscript></noscript>" + "<br>".repeat(29))),
+    ).toEqual({ _tag: "LimitExceeded", limit: "elements" });
+    expect(
+      parseHtmlDocument(
+        wrap('<noscript a="' + "x".repeat(8192) + '"></noscript>'),
+      )._tag,
+    ).toBe("Success");
+    expect(
+      parseHtmlDocument(
+        wrap('<noscript a="' + "x".repeat(8193) + '"></noscript>'),
+      ),
+    ).toEqual({ _tag: "LimitExceeded", limit: "attributeValueCharacters" });
+    expect(
+      parseHtmlDocument(
+        wrap('<noscript a="x' + "é".repeat(8191) + '"></noscript>'),
+      )._tag,
+    ).toBe("Success");
+    expect(
+      parseHtmlDocument(
+        wrap('<noscript a="' + "é".repeat(8192) + '"></noscript>'),
+      ),
+    ).toEqual({ _tag: "LimitExceeded", limit: "attributesUtf8Bytes" });
+    const raw = "x".repeat(131072 - wrap("<noscript></noscript>").length);
+    expect(
+      parseHtmlDocument(wrap("<noscript>" + raw + "</noscript>"))._tag,
+    ).toBe("Success");
+    expect(
+      parseHtmlDocument(wrap("<noscript>" + raw + "x</noscript>")),
+    ).toEqual({ _tag: "LimitExceeded", limit: "inputBytes" });
+    for (const raw of ["\0", "\ud800"])
+      expect(
+        parseHtmlDocument(wrap("<noscript>" + raw + "</noscript>")),
+      ).toMatchObject({ _tag: "Unsupported", rule: "InputEncoding" });
   });
 });

@@ -709,7 +709,7 @@ describeRealIntegration("real BrowserMock integration", () => {
         const valid = "<!doctype html><html><head></head><body></body></html>";
         for (const body of [
           valid,
-          valid.replace("<body>", "<body><noscript>x</noscript>"),
+          valid.replace("<body>", "<body><template>x</template>"),
           valid + "x",
           valid.replace(
             "<body>",

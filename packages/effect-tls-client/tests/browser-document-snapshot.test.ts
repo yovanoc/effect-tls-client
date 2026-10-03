@@ -297,7 +297,19 @@ it.effect(
   "rejects strict document failures and serialized overflow before any spawn",
   () =>
     Effect.gen(function* () {
-      let spawns = 0;
+      let spawns = 0,
+        requests = 0,
+        writes = 0;
+      const inertHost: BrowserScriptHost = {
+        request: () => {
+          requests++;
+          return Effect.die("unexpected request");
+        },
+        setCookie: () => {
+          writes++;
+          return Effect.die("unexpected cookie write");
+        },
+      };
       const layer = BrowserMock.layer().pipe(
         Layer.provide(
           Layer.mock(ChildProcessSpawner.ChildProcessSpawner, {
@@ -319,6 +331,16 @@ it.effect(
             "UnsupportedInput",
           ],
           [wrap("<div>"), "unsupported HTML document", "UnsupportedInput"],
+          [
+            wrap("<noscript>" + "x".repeat(40000) + "</noscript>"),
+            "script IPC start input exceeds its 128 KiB limit",
+            "StartupLimitExceeded",
+          ],
+          [
+            wrap("<noscript>" + "\u0001".repeat(12000) + "</noscript>"),
+            "script IPC start input exceeds its 128 KiB limit",
+            "StartupLimitExceeded",
+          ],
           [
             wrap("<div></div>".repeat(30)),
             "HTML document exceeds elements limit",
@@ -350,10 +372,15 @@ it.effect(
             "StartupLimitExceeded",
           ],
         ] satisfies ReadonlyArray<readonly [string, string, string]>) {
-          const error = yield* runBoundedScript(runtime, 'return "never";', {
-            ...context,
-            document,
-          }).pipe(Effect.flip);
+          const error = yield* runBoundedScript(
+            runtime,
+            'return "never";',
+            {
+              ...context,
+              document,
+            },
+            inertHost,
+          ).pipe(Effect.flip);
           expect(error.reason).toBe(reason);
           expect(error).toBeInstanceOf(BrowserScriptError);
           expect(error._tag).toBe("BrowserScriptError");
@@ -393,7 +420,7 @@ it.effect(
         expect(startup.documentInputFailure).toBe("StartupLimitExceeded");
         expect(Object.hasOwn(startup, "documentInputRule")).toBe(false);
       }).pipe(Effect.provide(layer));
-      expect(spawns).toBe(0);
+      expect([spawns, requests, writes]).toEqual([0, 0, 0]);
     }),
 );
 
@@ -421,6 +448,13 @@ it("rejects forged root structures on the runner IPC boundary before guest execu
     textContent: "",
   });
   const forgedNodes = [
+    ...["script", "iframe", "div"].map((tag) => [
+      node("html", -1),
+      node("head", 0),
+      node("body", 0),
+      node("noscript", 2),
+      node(tag, 3),
+    ]),
     [],
     [node("html", -1), node("body", 0), node("head", 0)],
     [node("html", -1), node("head", 0), node("body", -1)],
@@ -632,7 +666,6 @@ it.effect(
           ["TableSubset", wrap("<table></table>")],
           ["SelectSubset", wrap("<select></select>")],
           ["TemplateSubset", wrap("<template></template>")],
-          ["ScriptingDependentSubset", wrap("<noscript></noscript>")],
           ["ForeignContentSubset", wrap("<svg></svg>")],
           ["ElementSubset", wrap("<form></form>")],
         ] satisfies ReadonlyArray<readonly [string, string]>) {
@@ -656,19 +689,34 @@ it.effect(
             snapshot: { nodes: [], textContent: "" },
           });
         try {
-          for (const mode of ["async", "classic"] as const) {
-            const error = yield* runBoundedScript(
-              runtime,
-              'return "never";',
-              { ...context, document: wholeDocument },
-              inertHost,
-              mode,
-            ).pipe(Effect.flip);
-            expect(error.reason).toBe("unsupported HTML document");
-            expect(error.documentInputFailure).toBe("UnsupportedInput");
-            expect(error).toMatchObject({
-              documentInputRule: "SnapshotRecordInvariant",
+          for (const nodes of [
+            [],
+            ...["script", "iframe", "div"].map((tag) => [
+              { tag: "html", parent: -1, attributes: [], textContent: "" },
+              { tag: "head", parent: 0, attributes: [], textContent: "" },
+              { tag: "body", parent: 0, attributes: [], textContent: "" },
+              { tag: "noscript", parent: 2, attributes: [], textContent: "" },
+              { tag, parent: 3, attributes: [], textContent: "" },
+            ]),
+          ]) {
+            spy.mockReturnValue({
+              _tag: "Success",
+              snapshot: { nodes, textContent: "" },
             });
+            for (const mode of ["async", "classic"] as const) {
+              const error = yield* runBoundedScript(
+                runtime,
+                'return "never";',
+                { ...context, document: wholeDocument },
+                inertHost,
+                mode,
+              ).pipe(Effect.flip);
+              expect(error.reason).toBe("unsupported HTML document");
+              expect(error.documentInputFailure).toBe("UnsupportedInput");
+              expect(error).toMatchObject({
+                documentInputRule: "SnapshotRecordInvariant",
+              });
+            }
           }
         } finally {
           spy.mockRestore();
@@ -680,3 +728,114 @@ it.effect(
       expect([spawns, requests, writes]).toEqual([0, 0, 0]);
     }),
 );
+
+it.layer(BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)), {
+  excludeTestServices: true,
+})("authored inert body noscript", (it) => {
+  it.effect(
+    "charges noscript nodes and attributes but not parsed literal text as mutable data",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* BrowserMock;
+        const wrap = (body: string) =>
+          "<!doctype html><html><head></head><body>" + body + "</body></html>";
+        const result = yield* runtime.evaluate(
+          `
+        const node = document.createElement('div'); node.textContent = 'x'.repeat(8192); document.body.appendChild(node);
+        if (document.querySelector('noscript').textContent.length !== 9000) throw new Error('parsed text');
+        return 'ok';
+      `,
+          {
+            ...context,
+            document: wrap("<noscript>" + "x".repeat(9000) + "</noscript>"),
+          },
+        );
+        expect(result.value).toBe("ok");
+        const quota = yield* runtime.evaluate(
+          `
+        for (const action of [() => document.createElement('div'), () => document.createElement('script')]) {
+          let rejected = false; try { action(); } catch(e) { rejected = e instanceof RangeError; } if (!rejected) throw new Error('nodes');
+        }
+        return 'ok';
+      `,
+          {
+            ...context,
+            document: wrap("<noscript></noscript>" + "<br>".repeat(28)),
+          },
+        );
+        expect(quota.value).toBe("ok");
+        const attrs = yield* runtime.evaluate(
+          `
+        const node = document.createElement('div');
+        let rejected = false; try { node.textContent = 'x'; } catch(e) { rejected = e instanceof RangeError; } if (!rejected) throw new Error('attributes');
+        return 'ok';
+      `,
+          {
+            ...context,
+            document: wrap(
+              '<noscript a="x' + "é".repeat(8191) + '"></noscript>',
+            ),
+          },
+        );
+        expect(attrs.value).toBe("ok");
+      }),
+  );
+
+  for (const mode of ["async", "classic"] as const) {
+    for (const nested of [false, true]) {
+      it.effect(
+        `keeps actual readonly aliases and literal contents: ${mode}/${nested}`,
+        () =>
+          Effect.gen(function* () {
+            const runtime = yield* BrowserMock;
+            let requests = 0,
+              writes = 0,
+              frames = 0;
+            const raw =
+              '<div id="raw">&amp;<script>authored()</script><iframe src="/never"></iframe><!--literal-->';
+            const markup =
+              '<noscript id="fallback" class="fixture">' + raw + "</noscript>";
+            const document =
+              '<!doctype html><html id="root"><head></head><body id="page">' +
+              (nested ? '<div id="parent">' + markup + "</div>" : markup) +
+              "</body></html>";
+            const checks = `
+            const node = document.getElementById('fallback'), root = document.documentElement, body = document.body;
+            if (node !== document.querySelector('NoScRiPt#fallback.fixture') || node !== document.getElementsByTagName('NOSCRIPT')[0] || node !== document.getElementsByTagName('noscript').item(0) || [...document.getElementsByTagName('noscript')][0] !== node) throw new Error('identity');
+            if (node.tagName !== 'NOSCRIPT' || node.nodeName !== 'NOSCRIPT' || node.id !== 'fallback' || node.className !== 'fixture' || node.getAttribute('ID') !== 'fallback' || !node.hasAttribute('class') || node.textContent !== '${raw}') throw new Error('literal');
+            if (body !== document.querySelector('body#page') || root !== document.getElementById('root') || body.parentNode !== root || node.parentNode !== ${nested ? "document.getElementById('parent')" : "body"} || root.textContent !== node.textContent || body.textContent !== node.textContent) throw new Error('roots');
+            if (document.getElementById('raw') !== null || document.querySelector('script') !== null || document.querySelector('iframe') !== null || document.getElementsByTagName('script').length !== 0 || typeof window.authored !== 'undefined' || document.readyState !== 'complete') throw new Error('inert');
+            for (const action of [() => node.id = 'changed', () => node.className = '', () => node.textContent = '', () => node.setAttribute('id','changed'), () => node.attributes[0][1] = 'changed', () => node.attributes.push(['x','y']), () => Object.defineProperty(node,'id',{value:'changed'}), () => node.appendChild(document.createElement('div')), () => body.appendChild(node), () => document.createElement('noscript')]) {
+              let rejected = false; try { action(); } catch { rejected = true; } if (!rejected) throw new Error('mutation');
+            }
+            if (node !== document.getElementById('fallback') || node.getAttribute('id') !== 'fallback') throw new Error('changed');
+          `;
+            const result = yield* runBoundedScript(
+              runtime,
+              checks + (mode === "async" ? 'return "ok";' : '"ok";'),
+              { ...context, document },
+              {
+                request: () => {
+                  requests++;
+                  return Effect.die("request");
+                },
+                setCookie: () => {
+                  writes++;
+                  return Effect.die("cookie");
+                },
+                loadFrame: () => {
+                  frames++;
+                  return Effect.die("frame");
+                },
+              },
+              mode,
+            );
+            expect(result.value).toBe("ok");
+            expect(result.setCookies).toEqual([]);
+            expect([requests, writes, frames]).toEqual([0, 0, 0]);
+            expect(Object.hasOwn(result, "documentInputRule")).toBe(false);
+          }),
+      );
+    }
+  }
+});

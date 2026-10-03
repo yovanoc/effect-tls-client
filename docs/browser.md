@@ -451,15 +451,29 @@ retained, or the entire input fails with `Unsupported` or `LimitExceeded`;
 there is no fragment extraction, HTML repair, rendering, or automatic execution.
 Head accepts only meta/link/title/script/style; title supports conservative
 character references but no `<`, and script/style text remains inert.
-Body uses the existing strict fragment grammar. Table, noscript, foreign content,
-form, base, omitted structural parts, legacy doctypes, and BOMs reject.
+Body uses the existing strict fragment grammar plus body-only `noscript` RAWTEXT,
+also under supported ordinary parents. This document model fixes parsing to
+**scripting enabled**, with parsed scripts inert (the WHATWG `Inert` distinction):
+preventing execution does not switch parsing to scripting disabled. Noscript has
+one readonly actual `NOSCRIPT` record; its complete literal text (including
+`&amp;`, unknown references, comments, declarations, and embedded tags) is retained
+without decoding or creating inner element records. Only line endings normalize.
+ASCII-case-insensitive appropriate closing tags terminate RAWTEXT; explicit,
+unattributed, unslashed closure is still required. No trimming, repair, omission,
+or fabricated IDs occurs. Head and fragment noscript remain unsupported, and
+`createElement("noscript")` is still unsupported. Noscript cannot accept appended
+children or attribute/text writes. Table, foreign content, form, base, omitted
+structural parts, legacy doctypes, and BOMs reject.
 Whitespace after `</body>` or `</html>` is appended to html/body `textContent`, following the native insertion-mode rules.
 
 Original parsed html/head/body attributes and record identity are readonly;
 `document.documentElement` is the actual root, also reachable by the supported
 query, tag, and ID lookups. Head/body bounded append delegates only to existing
 explicit caller-created script, frame, and ordinary-element authorization.
-Parsed LINK/META/SCRIPT/STYLE never load resources, run code, or fire events.
+Parsed LINK/META/SCRIPT/STYLE/NOSCRIPT never load resources, run code, or fire
+events. This body-only grammar choice adds no automatic selected scripts, resource
+loading, lifecycle, renderer, or original-document/full-browser faithfulness claim.
+Reviewed classic source remains separately and manually selected, unchanged.
 
 The limits are 32 elements including these three roots, 16 KiB cumulative attribute-name/value
 bytes (shared with later mutable ordinary text), and 8,192 characters per attribute value or
@@ -468,6 +482,9 @@ serialized IPC-line limits. Repeated ancestor `textContent` or JSON escaping can
 Child frames do not share the parent document. This is a source VM snapshot,
 not a full browser: no layout, styles, or `classList` support is claimed.
 Default challenge evaluation does not automatically supply response HTML or JS.
+Successful supported noscript input has no rejection-rule metadata. Optional
+`documentInputRule` labels only actual host document rejections; its closed
+22-value catalog is unchanged, not a claim that all families remain reachable.
 The existing `html` fragment contract is unchanged; without `document`,
 `document.documentElement` remains absent.
 

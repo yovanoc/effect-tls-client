@@ -107,7 +107,7 @@ const DocumentRoot = DocumentSnapshot.check(
     )
       return "invalid document root structure";
     const bodyTags = new Set(
-      "a address article aside b blockquote code div em footer header i main p section small span strong sub sup u script style area base br embed hr img input link meta param source track wbr".split(
+      "a address article aside b blockquote code div em footer header i main p section small span strong sub sup u script style noscript area base br embed hr img input link meta param source track wbr".split(
         " ",
       ),
     );
@@ -135,6 +135,7 @@ const DocumentRoot = DocumentSnapshot.check(
             [
               "script",
               "style",
+              "noscript",
               "area",
               "base",
               "br",

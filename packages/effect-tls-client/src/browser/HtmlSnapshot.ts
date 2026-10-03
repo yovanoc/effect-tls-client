@@ -7,7 +7,9 @@
  * nested (anchors cannot nest, and p cannot contain a p-closing start tag).
  * Simple comments, quoted/unquoted/boolean attributes, and only the five named
  * references below plus valid decimal/hex numeric references are supported.
- * Script and style are raw text only; script escape syntax is unsupported.
+ * Script/style and document in-body noscript are inert raw text; document
+ * parsing models scripting enabled, not automatic execution. Script escape
+ * syntax is unsupported; head/fragment noscript remains unsupported.
  * No document repair, execution, or loading occurs. Any syntax outside the
  * selected subset rejects the entire snapshot.
  */
@@ -414,7 +416,7 @@ const parseHtml = (
       case "afterHead":
         return tag === "body";
       case "inBody":
-        return VOID_TAGS.has(tag) || NORMAL_TAGS.has(tag);
+        return tag === "noscript" || VOID_TAGS.has(tag) || NORMAL_TAGS.has(tag);
       default:
         return false;
     }
@@ -839,7 +841,13 @@ const parseHtml = (
         else if (tag === "body") documentPhase = "inBody";
       }
 
-      if (tag === "script" || tag === "style") {
+      if (
+        tag === "script" ||
+        tag === "style" ||
+        (mode === "document" &&
+          currentPhase() === "inBody" &&
+          tag === "noscript")
+      ) {
         let closing = cursor;
         while (closing < source.length && !rawTextCloseAt(closing, tag)) {
           if (tag === "script" && source.startsWith("<!--", closing)) {

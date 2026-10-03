@@ -2417,13 +2417,13 @@ const start = (input) => {
       const nodes = snapshot.nodes;
       const body = nodes.findIndex((node) => node.tag === "body");
       if (nodes[0]?.tag !== "html" || nodes[0].parent !== -1 || nodes[1]?.tag !== "head" || nodes[1].parent !== 0 || body < 2 || nodes[body].parent !== 0 || snapshot.textContent !== nodes[0].textContent) throw new Error("invalid document root structure");
-      const bodyTags = new Set("a address article aside b blockquote code div em footer header i main p section small span strong sub sup u script style area base br embed hr img input link meta param source track wbr".split(" "));
+      const bodyTags = new Set("a address article aside b blockquote code div em footer header i main p section small span strong sub sup u script style noscript area base br embed hr img input link meta param source track wbr".split(" "));
       const ancestors = [0];
       for (let index = 1; index < nodes.length; index++) {
         const node = nodes[index];
         while (ancestors.length > 0 && ancestors.at(-1) !== node.parent) ancestors.pop();
         if (ancestors.length === 0 || (index !== 1 && index !== body && (node.parent === 0 || ["html", "head", "body"].includes(node.tag)))) throw new Error("invalid document root structure");
-        if (index !== 1 && index !== body && (index < body ? node.parent !== 1 || !["meta", "link", "script", "style", "title"].includes(node.tag) : node.parent < body || !bodyTags.has(node.tag) || ["script", "style", "area", "base", "br", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"].includes(nodes[node.parent].tag))) throw new Error("invalid document root structure");
+        if (index !== 1 && index !== body && (index < body ? node.parent !== 1 || !["meta", "link", "script", "style", "title"].includes(node.tag) : node.parent < body || !bodyTags.has(node.tag) || ["script", "style", "noscript", "area", "base", "br", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"].includes(nodes[node.parent].tag))) throw new Error("invalid document root structure");
         ancestors.push(index);
       }
     }
