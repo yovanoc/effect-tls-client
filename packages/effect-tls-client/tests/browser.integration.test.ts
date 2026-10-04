@@ -7,8 +7,12 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
+  Cause,
   ConfigProvider,
+  Deferred,
   Effect,
+  Exit,
+  Fiber,
   Layer,
   Option,
   Result,
@@ -527,6 +531,107 @@ const awsWafHandler = (
   });
 
 describeRealIntegration("real BrowserMock integration", () => {
+  it.live(
+    "cancels a pending classic SDK request without closing the Browser session",
+    () =>
+      Effect.gen(function* () {
+        const sdkStarted = yield* Deferred.make<void>();
+        const sdkClosed = yield* Deferred.make<void>();
+        let sdkRequests = 0;
+        let healthRequests = 0;
+        const source = [
+          'const pending = document.loadScript("/sdk.js");',
+          "pending.catch(() => {});",
+          "new Promise(() => {});",
+        ].join("\n");
+        const body = `<!doctype html><html><head><title>Local cancellation fixture</title></head><body><script>${source}</script></body></html>`;
+        const server = createServer((request, response) => {
+          if (request.method === "GET" && request.url === "/page") {
+            // Authored local marker, not a vendor challenge or clearance flow.
+            response.writeHead(409, {
+              "cf-mitigated": "challenge",
+              "content-type": "text/html",
+            });
+            response.end(body);
+          } else if (request.method === "GET" && request.url === "/sdk.js") {
+            sdkRequests += 1;
+            request.socket.once("close", () => {
+              Deferred.doneUnsafe(sdkClosed, Effect.void);
+            });
+            Deferred.doneUnsafe(sdkStarted, Effect.void);
+            // Hold headers and body until caller cancellation closes the socket.
+          } else if (request.method === "GET" && request.url === "/health") {
+            healthRequests += 1;
+            response.writeHead(200);
+            response.end("local session healthy");
+          } else {
+            response.writeHead(404);
+            response.end();
+          }
+        });
+        const url = yield* Effect.acquireRelease(
+          Effect.tryPromise({
+            try: () => listenLocal(server),
+            catch: () => "local fixture failed to listen",
+          }),
+          () =>
+            Effect.callback<void>((resume) => {
+              server.close(() => {
+                resume(Effect.void);
+              });
+              server.closeAllConnections();
+            }),
+        );
+        yield* withChallengeBrowser(
+          { url },
+          (_, context) =>
+            Effect.gen(function* () {
+              expect(context.body).toBe(body);
+              yield* context.evaluateClassic(source, { document: "response" });
+              return Option.none();
+            }),
+          (browser) =>
+            Effect.gen(function* () {
+              const startedAt = performance.now();
+              const navigation = yield* Effect.scoped(
+                browser.navigate(`${url}/page`),
+              ).pipe(Effect.forkScoped);
+              yield* Deferred.await(sdkStarted).pipe(
+                Effect.timeout("2 seconds"),
+              );
+              expect(sdkRequests).toBe(1);
+              expect(yield* Deferred.isDone(sdkClosed)).toBe(false);
+              // Interrupt before the unchanged 2-second native evaluation deadline.
+              expect(performance.now() - startedAt < 2_000).toBe(true);
+              yield* Fiber.interrupt(navigation);
+              const exit = yield* Fiber.await(navigation);
+              expect(
+                Exit.isFailure(exit) &&
+                  exit.cause.reasons.some(Cause.isInterruptReason) &&
+                  exit.cause.reasons.every(Cause.isInterruptReason),
+              ).toBe(true);
+              yield* Deferred.await(sdkClosed).pipe(
+                Effect.timeout("2 seconds"),
+              );
+              expect(server.listening).toBe(true);
+              const health = yield* browser.navigate(`${url}/health`);
+              expect(health.status).toBe(200);
+              expect(health.body).toBe("local session healthy");
+              expect(healthRequests).toBe(1);
+              expect(sdkRequests).toBe(1);
+            }),
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.exit,
+        Effect.flatMap((exit) =>
+          Effect.sync(() => {
+            expect(Exit.isSuccess(exit)).toBe(true);
+          }),
+        ),
+      ),
+  );
+
   it.live(
     "opts into the entire original response document without activating markup",
     () =>
