@@ -627,6 +627,35 @@ const runtimeLayer = Browser.BrowserMock.layer({
 });
 ```
 
+### `BrowserScriptError.hostBoundary`
+
+The optional `BrowserScriptError.hostBoundary` is a fixed label for a
+host-observed construction/control branch in the default `BrowserMock` flow,
+not a root cause or origin/authenticity claim. `ScriptErrorFrameReceived` and
+`ChildReportedFailure` mean their respective validated child branches were
+received; `NativeDeadlineElapsed` means the host timer/remap was selected, not
+that termination succeeded, a numeric exit status, or a Go timeout. The label
+is not derived from `reason` or `cause`; matching text does not establish
+origin.
+
+Absence means unclassified, not success. Callers, custom runtimes, hosts, and
+spawners can forge this optional field; its schema, tag, or typed catch alone
+is not authentication. Treat it as meaningful only in the default trusted
+service construction flow; this is not a malicious-code sandbox. No label
+proves SDK delivery or acquisition, fresh authoritative Go state, an awaited
+cookie flush, a same-session protected non-challenge 2xx, or clearance. This
+host-side error metadata is not part of guest IPC.
+
+The available labels are:
+
+- `NativeProcessIoFailure` — native process I/O wrapper failed.
+- `NativeOutputRejected` — host output guard or schema rejected output.
+- `ScriptErrorFrameReceived` — validated child `script.error` frame received.
+- `ChildReportedFailure` — validated failed-result discriminant received.
+- `NativeProcessCompletionFailure` — exit-code Effect failed or stdout completed without a result.
+- `NativeDeadlineElapsed` — host timer/remap branch was selected.
+- `NativeResultRejected` — host result-schema guard rejected the result.
+
 ### Opt-in reviewed challenge handler
 
 `reviewedChallengeHandler` runs only the source you supply, never extracts or

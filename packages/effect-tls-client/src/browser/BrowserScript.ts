@@ -11,6 +11,21 @@ export class BrowserScriptError extends Schema.TaggedError<BrowserScriptError>()
   {
     reason: Schema.String,
     cause: Schema.optionalKey(Schema.Defect()),
+    /** Default BrowserMock host-observed construction branch, not failure origin.
+     * Never copied from guest IPC; custom runtimes/hosts/spawners/callers can forge
+     * this optional field. Absence is unclassified, not a sandbox guarantee.
+     */
+    hostBoundary: Schema.optionalKey(
+      Schema.Literals([
+        "NativeProcessIoFailure",
+        "NativeOutputRejected",
+        "ScriptErrorFrameReceived",
+        "ChildReportedFailure",
+        "NativeProcessCompletionFailure",
+        "NativeDeadlineElapsed",
+        "NativeResultRejected",
+      ]),
+    ),
     /** BrowserMock pre-spawn host validation only; never populated from guest IPC.
      * Caller-supplied runtimes remain caller authority, not a sandbox guarantee.
      */

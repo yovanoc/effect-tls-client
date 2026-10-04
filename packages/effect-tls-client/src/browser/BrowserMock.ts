@@ -55,6 +55,7 @@ const MAX_TIMER_DELAY_MS = 120_000;
 const timeoutError = () =>
   new BrowserScriptError({
     reason: "script evaluation timed out and the process was terminated",
+    hostBoundary: "NativeDeadlineElapsed",
   });
 
 const DocumentSnapshot = Schema.Struct({
@@ -494,6 +495,7 @@ const makeEvaluate = (
                 new BrowserScriptError({
                   reason: "failed to spawn browser script process",
                   cause,
+                  hostBoundary: "NativeProcessIoFailure",
                 }),
             ),
           );
@@ -758,12 +760,14 @@ const makeEvaluate = (
             if (lineLength > MAX_OUTPUT_LINE_BYTES) {
               return yield* new BrowserScriptError({
                 reason: "script process emitted an oversized IPC line",
+                hostBoundary: "NativeOutputRejected",
               });
             }
             const bytes = state.bytes + lineLength + 1;
             if (bytes > MAX_OUTPUT_BYTES) {
               return yield* new BrowserScriptError({
                 reason: "script process output exceeds the 1 MiB limit",
+                hostBoundary: "NativeOutputRejected",
               });
             }
             const event = yield* Schema.decodeEffect(RunnerMessageJson)(
@@ -774,6 +778,7 @@ const makeEvaluate = (
                   new BrowserScriptError({
                     reason: "script process emitted an invalid IPC message",
                     cause,
+                    hostBoundary: "NativeOutputRejected",
                   }),
               ),
             );
@@ -787,7 +792,10 @@ const makeEvaluate = (
               };
             }
             if (event.type === "script.error") {
-              return yield* new BrowserScriptError({ reason: event.reason });
+              return yield* new BrowserScriptError({
+                reason: event.reason,
+                hostBoundary: "ScriptErrorFrameReceived",
+              });
             }
             if (event.type === "frame.load") {
               const perform = Effect.gen(function* () {
@@ -1008,6 +1016,7 @@ const makeEvaluate = (
               : new BrowserScriptError({
                   reason: "failed to read script process output",
                   cause,
+                  hostBoundary: "NativeProcessIoFailure",
                 }),
           ),
         );
@@ -1019,6 +1028,7 @@ const makeEvaluate = (
                   new BrowserScriptError({
                     reason: "failed to start browser script process",
                     cause,
+                    hostBoundary: "NativeProcessIoFailure",
                   }),
               ),
             ),
@@ -1030,6 +1040,7 @@ const makeEvaluate = (
                 new BrowserScriptError({
                   reason: "browser script process exited without a result",
                   cause,
+                  hostBoundary: "NativeProcessCompletionFailure",
                 }),
             ),
           );
@@ -1037,11 +1048,13 @@ const makeEvaluate = (
           if (collected.result === undefined) {
             return yield* new BrowserScriptError({
               reason: "browser script process exited without a result",
+              hostBoundary: "NativeProcessCompletionFailure",
             });
           }
           if (!collected.result.ok) {
             return yield* new BrowserScriptError({
               reason: collected.result.reason,
+              hostBoundary: "ChildReportedFailure",
             });
           }
           return yield* Schema.decodeEffect(BrowserScriptResult)({
@@ -1053,6 +1066,7 @@ const makeEvaluate = (
                 new BrowserScriptError({
                   reason: "browser script result failed validation",
                   cause,
+                  hostBoundary: "NativeResultRejected",
                 }),
             ),
           );
