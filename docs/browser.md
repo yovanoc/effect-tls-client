@@ -309,11 +309,13 @@ a full DOMException interface is not supplied). `supportedEntryTypes` is the
 same frozen empty realm-local array on each read; observers never call callbacks,
 and `takeRecords()` returns a fresh empty realm-local array. These APIs are an
 unrecorded timeline subset, not Resource Timing or acquisition evidence.
-`document.readyState` is read-only and statically `"complete"` as a model
-convention, not proof that the actual reviewed page's lifecycle completed.
-Challenge response HTML is not passed into the realm: head/body are synthetic
-append targets containing only explicitly created and appended modeled nodes.
-No HTML parsing, loading/interactive transitions, lifecycle simulation,
+`document.readyState` is read-only. Outside explicit document-script mode it is
+statically `"complete"` as a model convention, not proof that the actual reviewed
+page's lifecycle completed.
+Without an explicit snapshot, challenge response HTML is not passed into the
+realm: head/body are synthetic append targets containing only explicitly created
+and appended modeled nodes.
+Without explicit `evaluateDocument()`, no loading/interactive transitions,
 `readystatechange`, `DOMContentLoaded`, or document/window lifecycle `load`
 events are generated. Modeled element load events remain separate.
 It exposes context-local `URL` and `URLSearchParams` backed by a private,
@@ -348,9 +350,10 @@ first and registration order within each group; duplicate
 `(type, callback, capture)` registrations are ignored, matching removals,
 `once`, and `passive` work; `AbortSignal` listeners are unsupported and reject.
 `dispatchEvent` accepts only this runtime's synthetic `Event` instances
-(`isTrusted` is always `false`). There is no DOM tree, event propagation, or
-automatic lifecycle/user-event delivery. Listener exceptions are reported as
-`BrowserScriptError` and fail evaluation. Context-local `Blob` supports UTF-8
+(`isTrusted` is always `false`). There is no general DOM event propagation or
+automatic user-event delivery. Explicit document-script evaluation supplies only
+the lifecycle subset below. Listener exceptions use the modeled Window
+`ErrorEvent` reporting described below. Context-local `Blob` supports UTF-8
 strings, ArrayBuffers, views, nested Blobs, `size`, `type`, `text()`,
 `arrayBuffer()`, and `slice()`. Its cumulative per-evaluation allocation quota
 is 1 MiB, including Blob data, type metadata, and materialized reads; quota
@@ -636,8 +639,7 @@ bridges explicitly re-enter the owning realm. Promise resolution, thenable looku
 and species construction use captured guest intrinsics under the remaining deadline.
 Only a settlement flag and bounded encoded string reach the host completion waiter;
 no host Promise resolver, rejection callback, or capability executor is passed to
-user constructors. Public Promise objects remain mutable. This adds no document
-lifecycle events and does not make the VM a malicious-code sandbox.
+user constructors. Public Promise objects remain mutable. This does not make the VM a malicious-code sandbox.
 Static external classic scripts use the existing script host and exact
 origin allowlist: blocking scripts finish before later inline scripts; deferred
 external scripts run in order afterward; async external scripts run when loaded
@@ -650,8 +652,59 @@ This uses the same scoped evaluation resources, Go-backed cookies, network and
 source budgets, hard deadline, and bounded post-success natural-work retention
 as classic evaluation. Pending cookie writes flush before it returns; inspect
 `context.transport.exportCookies` and the retry response for authoritative
-state and clearance evidence. There are no document lifecycle events, renderer,
+state and clearance evidence. The modeled lifecycle below adds no renderer,
 iframe SDK grants, or browser-fidelity/clearance claims.
+
+#### Document-mode readiness and load (modeled subset)
+
+Only the root of explicit document-script evaluation starts at `"loading"`.
+After blocking and inline classics finish, readiness becomes `"interactive"`
+and `readystatechange` dispatches synchronously on `document`. Ordered deferred
+scripts then execute. A queued lifecycle task dispatches `DOMContentLoaded` at
+`document`, with `bubbles: true`, continuing to `window` unless propagation is
+stopped. Listeners and `document.onreadystatechange` / `window.onload` run under
+the remaining VM deadline; `once`, `stopPropagation`, `stopImmediatePropagation`,
+`target`, and `currentTarget` use the existing synthetic listener subset.
+Capturing listeners run first **on each target**, not along a browser capture
+path. There is no general element-tree bubbling or capture framework.
+
+Static async scripts and appended external scripts / explicitly reviewed frames
+must finish before document load. Dynamic load delays release only after their
+synthetic element `load` or `error` dispatch, including listeners and their
+nested resource creation. Timers, fetch/XHR, FileReader, and cookie synchronization
+are natural work, not load delays. A queued completion task checks the private
+load-delay counter inside the same VM call that sets `"complete"`, dispatches
+`readystatechange`, and dispatches `load` on `window` with `target === document`.
+If work appeared before that task entered, it waits on a captured guest-native
+load-idle Promise and queues another checked completion task; an earlier idle
+observation cannot authorize completion. Resources created by complete-readiness
+or window-load listeners are **post-completion** work: they do not undo readiness,
+postpone that load event, or generate another lifecycle. Existing bounded
+natural-work retention applies afterward, then pending cookie writes flush.
+
+Lifecycle boundary tasks use host `setImmediate` with deadline-clamped VM
+re-entry, not host callbacks handed to scripts. Each VM entry drains nested
+Promise jobs via Node's `microtaskMode: "afterEvaluate"`. Adjacent inline classics
+still have a microtask checkpoint but no intervening timer task. All lifecycle
+events remain synthetic (`isTrusted === false`). A nonterminating listener,
+infinite jobs, or unresolved pre-completion load delay fails under the deadline;
+it never becomes post-success retention expiry. Required static resource
+failures still run later scripts and the lifecycle, then return the existing
+`document script resource load failed` failure. Fatal VM/child execution failures
+remain failures, not successful resource loads.
+
+This follows the ordering of WHATWG [stop parsing](https://html.spec.whatwg.org/multipage/parsing.html#the-end)
+and [script preparation/load delaying](https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element),
+using Node's documented [VM microtask/deadline rules](https://nodejs.org/docs/latest-v25.x/api/vm.html#timeout-interactions-with-asynchronous-tasks-and-promises).
+It is not a streaming HTML parser: the whole strict readonly snapshot already
+exists during `"loading"`, defer fetching remains sequential after blocking
+scripts, and parsed resource nodes other than supported classic scripts remain
+inert. No `currentScript`, CSS/image/font load delays, pageshow, rendering,
+performance entries, trusted events, child lifecycle, SDK completion, or
+clearance is supplied. Classic/async evaluation (even with a document snapshot)
+and reviewed child realms retain static `"complete"` without automatic lifecycle.
+Origins, frame review, cookie authority, and every existing IPC/source/network
+quota remain unchanged.
 
 `BrowserScriptRuntime.evaluateDocument(context, host)` is optional. A runtime
 without it fails with `BrowserScriptError`, reason
@@ -705,7 +758,7 @@ bootstrap and `document.loadScript` calls are VM programs, not DOM elements.
 Child realms get only their own targets, ordinary nodes, and collections, never
 parent nodes; child dynamic script append remains unsupported. Without a snapshot
 containing the tag, `"iframe"`, `"*"`, and other unsupported tag queries explicitly
-reject rather than pretending to query a full DOM. This subset adds no lifecycle/DOMReady, history, worker, rendering,
+reject rather than pretending to query a full DOM. Lookup itself adds no lifecycle/DOMReady, history, worker, rendering,
 messaging, navigation, or cookie authority, and is not a Cloudflare resolver
 or evidence of clearance.
 

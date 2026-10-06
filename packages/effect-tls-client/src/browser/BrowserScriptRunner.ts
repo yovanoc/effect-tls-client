@@ -30,6 +30,8 @@ export const makeBrowserScriptRunnerSource = (
     if (!post('{"type":"retention.wait"}')) { idleResolve = undefined; resolve(); }
   });
   const childRealm = __childRealm;
+  const documentMode = Boolean(__documentMode);
+  delete globalThis.__documentMode;
   const consumeBudget = __consumeBudget;
   delete globalThis.__childRealm; delete globalThis.__consumeBudget;
   // Host helpers exchange only primitives; no host objects enter the VM.
@@ -1267,6 +1269,7 @@ export const makeBrowserScriptRunnerSource = (
       this._currentTarget = null;
       this._dispatching = false;
       this._immediateStopped = false;
+      this._propagationStopped = false;
       this._inPassiveListener = false;
     }
     get type() { return this._type; }
@@ -1279,7 +1282,8 @@ export const makeBrowserScriptRunnerSource = (
     preventDefault() {
       if (this.cancelable && !this._inPassiveListener) this._defaultPrevented = true;
     }
-    stopImmediatePropagation() { this._immediateStopped = true; }
+    stopPropagation() { this._propagationStopped = true; }
+    stopImmediatePropagation() { this._immediateStopped = true; this._propagationStopped = true; }
   }
   class ErrorEvent extends Event {
     constructor(type, options = {}) {
@@ -1352,6 +1356,7 @@ export const makeBrowserScriptRunnerSource = (
       });
     }
   }
+  const eventDispatchers = new WeakMap();
   const makeEventTarget = (target) => {
     const listeners = new Map();
     const captureOf = (options) => typeof options === "boolean" ? options : Boolean(options && options.capture);
@@ -1377,7 +1382,7 @@ export const makeBrowserScriptRunnerSource = (
       if (index !== -1) entries.splice(index, 1);
       if (entries.length === 0) listeners.delete(name);
     };
-    target.dispatchEvent = (event) => {
+    const dispatch = (event, eventTarget = target, bubbleTarget = null) => {
       if (!(event instanceof Event)) throw new TypeError("dispatchEvent expects an Event");
       if (event._dispatching) throw new TypeError("event is already being dispatched");
       const name = event.type;
@@ -1385,9 +1390,10 @@ export const makeBrowserScriptRunnerSource = (
         (left, right) => Number(right.capture) - Number(left.capture),
       );
       event._dispatching = true;
-      event._target = target;
+      event._target = eventTarget;
       event._currentTarget = target;
       event._immediateStopped = false;
+      event._propagationStopped = false;
       try {
         for (const entry of entries) {
           if (!(listeners.get(name) || []).includes(entry)) continue;
@@ -1409,8 +1415,14 @@ export const makeBrowserScriptRunnerSource = (
         event._inPassiveListener = false;
         event._immediateStopped = false;
       }
+      if (bubbleTarget !== null && event.bubbles && !event._propagationStopped) {
+        apply(weakMapGet, eventDispatchers, [bubbleTarget])(event, eventTarget);
+      }
+      event._propagationStopped = false;
       return !event.defaultPrevented;
     };
+    apply(weakMapSet, eventDispatchers, [target, dispatch]);
+    target.dispatchEvent = (event) => dispatch(event);
     return target;
   };
   const bindEventHandlers = (target, types) => {
@@ -1594,8 +1606,18 @@ export const makeBrowserScriptRunnerSource = (
     ? { get: () => location, set: () => { throw new NativeTypeError("frame navigation is unsupported"); }, enumerable: true }
     : { value: location, enumerable: true });
   Object.defineProperty(document, "referrer", { value: initialReferrer, enumerable: true });
-  // The modeled document has no parser; scripts always observe a completed document.
-  Object.defineProperty(document, "readyState", { value: "complete", enumerable: true });
+  let readyState = documentMode ? "loading" : "complete";
+  Object.defineProperty(document, "readyState", { get: () => readyState, enumerable: true });
+  bindEventHandlers(document, ["readystatechange"]);
+  let loadDelayCount = 0;
+  const loadIdleWaiters = [];
+  const loadDelay = (delta) => {
+    if (!documentMode) return;
+    loadDelayCount += delta;
+    if (loadDelayCount === 0) {
+      for (const resolve of loadIdleWaiters.splice(0)) resolve();
+    }
+  };
   document.loadScript = (url) => request("script", String(url), "GET", new Headers([["accept", "text/javascript, application/javascript, */*"]]), null).then((value) => {
     if (value.status < 200 || value.status >= 300) throw new TypeError("script load failed with HTTP " + value.status);
     return undefined;
@@ -1770,10 +1792,13 @@ export const makeBrowserScriptRunnerSource = (
     state.started = true;
     attached[attached.length] = element;
     naturalWork(1);
-    apply(promiseThen, loadExternalScript(src), [
-      () => { try { element.dispatchEvent(new Event("load")); } finally { naturalWork(-1); } },
-      () => { try { element.dispatchEvent(new Event("error")); } finally { naturalWork(-1); } },
-    ]);
+    loadDelay(1);
+    try {
+      apply(promiseThen, loadExternalScript(src), [
+        () => { try { element.dispatchEvent(new Event("load")); } finally { loadDelay(-1); naturalWork(-1); } },
+        () => { try { element.dispatchEvent(new Event("error")); } finally { loadDelay(-1); naturalWork(-1); } },
+      ]);
+    } catch (cause) { loadDelay(-1); naturalWork(-1); throw cause; }
     return element;
   };
   // Distinct internal pending kind; the host still sees the ordinary script request.
@@ -1859,19 +1884,23 @@ export const makeBrowserScriptRunnerSource = (
     state.started = true;
     attached[attached.length] = element;
     const id = ++nextRequestId;
+    loadDelay(1);
     const task = new NativePromise((resolve, reject) => {
       pending.set(id, { resolve, reject, kind: "frame" });
       if (!postLine(jsonStringify({ type: "frame.load", id, url: state.attributes.get("src") }))) {
         pending.delete(id); reject(new NativeTypeError("frame IPC budget exceeded"));
       }
     });
-    apply(promiseThen, task, [() => {
-      state.window = opaqueWindow();
-      element.dispatchEvent(new Event("load"));
-    }, () => {
-      // Denials expose only an error event and no child identity or fake SDK message.
-      element.dispatchEvent(new Event("error"));
-    }]);
+    try {
+      apply(promiseThen, task, [() => {
+        try { state.window = opaqueWindow(); element.dispatchEvent(new Event("load")); }
+        finally { loadDelay(-1); }
+      }, () => {
+        // Denials expose only an error event and no child identity or fake SDK message.
+        try { element.dispatchEvent(new Event("error")); }
+        finally { loadDelay(-1); }
+      }]);
+    } catch (cause) { loadDelay(-1); throw cause; }
     return element;
   };
   const createFrame = () => {
@@ -2005,7 +2034,34 @@ export const makeBrowserScriptRunnerSource = (
   if (childRealm) {
     Object.defineProperties(window, { parent: { value: opaqueWindow() }, top: { value: opaqueWindow() }, postMessage: { value: unsupportedFrameOperation } });
   }
-  bindEventHandlers(window, ["error"]);
+  bindEventHandlers(window, ["error", "load"]);
+  const dispatchDocumentEvent = apply(weakMapGet, eventDispatchers, [document]);
+  const dispatchLifecycleWindowEvent = apply(weakMapGet, eventDispatchers, [window]);
+  Object.defineProperty(globalThis, "__documentLifecycle", {
+    configurable: true,
+    value: (step) => {
+      if (!documentMode) throw new NativeTypeError("document lifecycle is unsupported in this realm");
+      if (step === "interactive") {
+        readyState = "interactive";
+        dispatchDocumentEvent(new Event("readystatechange"));
+      } else if (step === "domcontentloaded") {
+        dispatchDocumentEvent(new Event("DOMContentLoaded", { bubbles: true }), document, window);
+      } else if (step === "idle") {
+        return new NativePromise((resolve) => {
+          if (loadDelayCount === 0) resolve();
+          else loadIdleWaiters.push(resolve);
+        });
+      } else if (step === "complete") {
+        // The authoritative check and readiness/load dispatch share one VM entry.
+        // Resources created by these listeners are post-completion natural work.
+        if (loadDelayCount !== 0) return "WAIT";
+        readyState = "complete";
+        dispatchDocumentEvent(new Event("readystatechange"));
+        dispatchLifecycleWindowEvent(new Event("load"), document);
+        return "DONE";
+      } else throw new NativeTypeError("invalid document lifecycle step");
+    },
+  });
   const RealmErrorEvent = ErrorEvent;
   const dispatchWindowEvent = window.dispatchEvent;
   let inErrorReportingMode = false;
@@ -2235,6 +2291,7 @@ const frames = new Map();
 const receivers = new WeakMap();
 const scriptErrorReporters = new WeakMap();
 const documentScriptLoaders = new WeakMap();
+const documentLifecycles = new WeakMap();
 const realmGlobals = new WeakMap();
 const realmPromiseBridges = new WeakMap();
 const promiseWaiters = new Map();
@@ -2367,7 +2424,7 @@ const post = (line, owner = context) => {
 const bootstrap = ${JSON.stringify(bootstrap)};
 // Node 25 can retain VM-created globals after deletion through the host sandbox.
 // These fixed kernel sources run before any guest code and verify realm-local removal.
-const cleanupPrivateBindings = "{ for (const key of ['__bridgePromise', '__settlePromise', '__loadDocumentScript', '__scriptErrorReporter', '__receive', '__post', '__naturalWork', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupPrivateBindings = "{ for (const key of ['__documentMode', '__documentLifecycle', '__bridgePromise', '__settlePromise', '__loadDocumentScript', '__scriptErrorReporter', '__receive', '__post', '__naturalWork', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage', '__waitForIdle']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const handleParentLine = (line) => {
   try {
@@ -2475,8 +2532,21 @@ const runDocument = async (input) => {
     else if (attributes.has("defer")) deferred.push(attributes);
     else await load(attributes);
   }
+  const lifecycle = (step) => invokeInRealm(context, documentLifecycles.get(context), step);
+  const lifecycleTask = (step) => new Promise((resolve, reject) => {
+    setImmediate(() => {
+      if (finished) { reject(new Error("script evaluation timed out")); return; }
+      try { resolve(lifecycle(step)); }
+      catch (cause) { reject(cause); }
+    });
+  });
+  lifecycle("interactive");
   for (const attributes of deferred) await load(attributes);
+  await lifecycleTask("domcontentloaded");
   await Promise.all(asynchronous);
+  while (await lifecycleTask("complete") === "WAIT") {
+    await outerPromise(context, lifecycle("idle"));
+  }
   if (resourceFailed) throw "document script resource load failed";
 };
 const createRealm = (input, childRealm) => {
@@ -2517,6 +2587,7 @@ const createRealm = (input, childRealm) => {
     },
     __naturalWork: naturalWork,
     __childRealm: childRealm,
+    __documentMode: !childRealm && input.mode === "document",
     __documentSnapshot: JSON.stringify(childRealm ? null : input.documentSnapshot ?? null),
     __documentRoot: JSON.stringify(childRealm ? null : input.documentRoot ?? null),
     __consumeBudget: consumeBudget,
@@ -2551,6 +2622,7 @@ const createRealm = (input, childRealm) => {
   receivers.set(realm, run("__receive", realm));
   scriptErrorReporters.set(realm, run("__scriptErrorReporter", realm));
   documentScriptLoaders.set(realm, run("__loadDocumentScript", realm));
+  documentLifecycles.set(realm, run("__documentLifecycle", realm));
   run(cleanupPrivateBindings, realm);
   if (childRealm) run(cleanupCookieBindings, realm);
   return realm;
