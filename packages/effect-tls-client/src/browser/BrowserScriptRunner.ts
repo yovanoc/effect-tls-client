@@ -17,7 +17,7 @@ interface RunnerLimits {
 
 export const makeBrowserScriptRunnerSource = (
   limits: RunnerLimits,
-  deadlineNanos?: bigint,
+  deadlineEpochMs?: number,
 ): string => {
   const bootstrap = String.raw`
 (() => {
@@ -2522,10 +2522,11 @@ const start = (input) => {
     }
     if (!consumeBudget("node", snapshot.nodes.length) || !consumeBudget("attribute", bytes)) throw new Error("document snapshot budget exceeded");
   }
-  // Translate the parent's OS monotonic deadline into this process's performance
-  // clock. Standalone runners have no host deadline; BrowserMock always supplies it.
-  const nativeDeadline = ${deadlineNanos === undefined ? "undefined" : `${deadlineNanos}n`};
-  const remainingMs = nativeDeadline === undefined ? input.timeoutMs : Math.min(input.timeoutMs, Number(nativeDeadline - process.hrtime.bigint()) / 1e6);
+  // Epoch time is shared across Node/Bun processes; hrtime origins are not.
+  // After startup, all VM clamps and retention use this process's monotonic clock.
+  // The parent independently terminates the process at its monotonic deadline.
+  const nativeDeadline = ${deadlineEpochMs === undefined ? "undefined" : deadlineEpochMs};
+  const remainingMs = nativeDeadline === undefined ? input.timeoutMs : Math.min(input.timeoutMs, nativeDeadline - Date.now());
   if (remainingMs <= 0) throw new Error("script evaluation timed out");
   rootInput = input; deadline = hostMonotonicNow() + remainingMs;
   setTimeout(() => writeFinal({ ok: false, reason: "script evaluation timed out" }), Math.max(1, Math.ceil(deadline - hostMonotonicNow())));

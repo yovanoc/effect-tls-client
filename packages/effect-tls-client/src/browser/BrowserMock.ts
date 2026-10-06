@@ -283,7 +283,10 @@ const RunnerInputMessage = Schema.Union([
 const RunnerStartJson = Schema.fromJsonString(RunnerStart);
 const RunnerMessageJson = Schema.fromJsonString(RunnerMessage);
 
-const makeRunnerSource = (maxNetworkRequests: number, deadlineNanos: bigint) =>
+const makeRunnerSource = (
+  maxNetworkRequests: number,
+  deadlineEpochMs: number,
+) =>
   makeBrowserScriptRunnerSource(
     {
       maxTimeoutMs: MAX_TIMEOUT_MS,
@@ -301,7 +304,7 @@ const makeRunnerSource = (maxNetworkRequests: number, deadlineNanos: bigint) =>
       maxTimers: MAX_TIMERS,
       maxTimerDelayMs: MAX_TIMER_DELAY_MS,
     },
-    deadlineNanos,
+    deadlineEpochMs,
   );
 
 interface Output {
@@ -496,11 +499,10 @@ const makeEvaluate = (
     }
     const output = yield* Effect.scoped(
       Effect.gen(function* () {
-        // hrtime uses the OS monotonic clock in Node and Bun, shared by parent
-        // and child. Translate the Effect clock's remaining duration, not its origin.
+        // Bun and Node hrtime origins differ. Only an epoch deadline can cross
+        // processes; the host still enforces its monotonic cutoff independently.
         const remainingNanos = deadline - (yield* Clock.monotonicTimeNanos);
-        const nativeDeadline =
-          globalThis.process.hrtime.bigint() + remainingNanos;
+        const nativeDeadline = Date.now() + Number(remainingNanos) / 1_000_000;
         const handle = yield* spawner
           .spawn(
             ChildProcess.make(

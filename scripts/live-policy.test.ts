@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Cause, Effect, Result } from "effect";
+import { Cause, Effect, Result, Schema } from "effect";
 import {
   BrowserScriptError,
   type BrowserScriptHost,
@@ -7,6 +7,7 @@ import {
 import { restrictHost } from "./live-policy.js";
 import {
   classifyEvaluation,
+  FailureReason,
   inlineClassicPrograms,
   staticHtmlObservations,
 } from "./live-challenge.js";
@@ -158,28 +159,75 @@ describe("unchanged inline classic selection", () => {
   });
 });
 
-describe("evaluation receipt failure classes", () => {
+describe("evaluation receipt failure metadata", () => {
   effectIt(
-    "classifies success, typed tags, interruption, and defects without payloads",
+    "classifies success, timeout, interruption and defects without free text",
     () =>
       Effect.gen(function* () {
-        const scriptError = new BrowserScriptError({ reason: "not inspected" });
-        Object.defineProperty(scriptError, "reason", {
-          get: () => {
-            throw new Error("error payload read");
-          },
+        expect(yield* classifyEvaluation(Effect.void)).toEqual({
+          failureClass: "NONE",
+          failureReason: "NONE",
         });
-        expect(yield* classifyEvaluation(Effect.void)).toBe("NONE");
-        expect(yield* classifyEvaluation(Effect.fail(scriptError))).toBe(
-          "SCRIPT",
-        );
         expect(
           yield* classifyEvaluation(Effect.fail(new Cause.TimeoutError())),
-        ).toBe("TIMEOUT");
-        expect(yield* classifyEvaluation(Effect.interrupt)).toBe("TIMEOUT");
-        expect(yield* classifyEvaluation(Effect.die("not inspected"))).toBe(
-          "OTHER",
-        );
+        ).toEqual({ failureClass: "TIMEOUT", failureReason: "TIMEOUT" });
+        expect(yield* classifyEvaluation(Effect.interrupt)).toEqual({
+          failureClass: "TIMEOUT",
+          failureReason: "INTERRUPTED",
+        });
+        expect(
+          yield* classifyEvaluation(Effect.die("private payload")),
+        ).toEqual({ failureClass: "OTHER", failureReason: "OTHER" });
       }),
   );
+  for (const [reason, label] of [
+    ["unsupported HTML document", "UNSUPPORTED_DOCUMENT"],
+    ["invalid document snapshot", "INVALID_SNAPSHOT"],
+    ["document evaluation requires a complete document", "MISSING_DOCUMENT"],
+    ["HTML document exceeds elements limit", "DOCUMENT_ELEMENTS"],
+    ["script IPC start input exceeds its 128 KiB limit", "START_INPUT_LIMIT"],
+    [
+      "Runtime does not support document script evaluation",
+      "RUNTIME_UNSUPPORTED",
+    ],
+    ["live network policy denied", "LIVE_POLICY_DENIED"],
+    ["script evaluation timed out", "TIMEOUT"],
+    [
+      "script evaluation timed out and the process was terminated",
+      "PROCESS_TIMEOUT",
+    ],
+    [
+      "BrowserMock requires Node 25+ network permission denial support",
+      "NODE_UNSUPPORTED",
+    ],
+    ["private guest data", "OTHER"],
+    ["unsupported HTML document private suffix", "OTHER"],
+    ["prefix script evaluation timed out", "OTHER"],
+    ["__proto__", "OTHER"],
+  ] as const) {
+    effectIt(`maps exact authored reason to ${label}`, () =>
+      Effect.gen(function* () {
+        const error = new BrowserScriptError({ reason });
+        Object.defineProperty(error, "cause", {
+          get: () => {
+            throw new Error("cause read");
+          },
+        });
+        const result = yield* classifyEvaluation(Effect.fail(error));
+        expect(result).toEqual({
+          failureClass: "SCRIPT",
+          failureReason: label,
+        });
+        expect(
+          Schema.decodeUnknownSync(FailureReason)(result.failureReason),
+        ).toBe(label);
+        expect(Object.keys(result)).toEqual(["failureClass", "failureReason"]);
+      }),
+    );
+  }
+  it("rejects free text as receipt metadata", () => {
+    expect(() =>
+      Schema.decodeUnknownSync(FailureReason)("private guest data"),
+    ).toThrow();
+  });
 });

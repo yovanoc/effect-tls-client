@@ -378,6 +378,16 @@ describe("parseHtmlDocument", () => {
     });
   });
 
+  it.each(["<!DOCTYPE html >", "<!doctype html\t\n\f\r >"])(
+    "accepts trailing HTML whitespace in %s without changing the snapshot",
+    (doctype) => {
+      const document = "<html><head></head><body>content</body></html>";
+      expect(parseHtmlDocument(`${doctype}${document}`)).toEqual(
+        parseHtmlDocument(`<!doctype html>${document}`),
+      );
+    },
+  );
+
   it("accepts an omitted doctype only before an explicit html root", () => {
     const document = "<html><head></head><body>content</body></html>";
     const withDoctype = parseHtmlDocument(`<!doctype html>${document}`);

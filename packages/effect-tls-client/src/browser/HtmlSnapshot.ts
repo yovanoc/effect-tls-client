@@ -397,6 +397,11 @@ const parseHtml = (
       reject("legacy doctype identifiers are unsupported", "Doctype");
     }
     while (isHtmlWhitespace(source[cursor])) cursor += 1;
+    if (source[cursor] === ">") {
+      cursor += 1;
+      documentPhase = "beforeHtml";
+      return;
+    }
     if (
       !asciiEqualsAt(cursor, "system") ||
       !isHtmlWhitespace(source[cursor + 6])

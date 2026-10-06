@@ -10,7 +10,95 @@ type Target = typeof Target.Type;
 const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 const FailureClass = Schema.Literals(["NONE", "TIMEOUT", "SCRIPT", "OTHER"]);
 
-/** Classify only typed tags and Exit/Cause variants; never inspect error payloads. */
+export const FailureReason = Schema.Literals([
+  "NONE",
+  "OTHER",
+  "TIMEOUT",
+  "PROCESS_TIMEOUT",
+  "INTERRUPTED",
+  "UNSUPPORTED_DOCUMENT",
+  "UNSUPPORTED_FRAGMENT",
+  "MISSING_DOCUMENT",
+  "INVALID_CONTEXT",
+  "INVALID_SNAPSHOT",
+  "DOCUMENT_INPUT_BYTES",
+  "DOCUMENT_ELEMENTS",
+  "DOCUMENT_ATTRIBUTES",
+  "DOCUMENT_ATTRIBUTE_VALUE",
+  "START_INPUT_LIMIT",
+  "SOURCE_LIMIT",
+  "RUNTIME_UNSUPPORTED",
+  "LIVE_POLICY_DENIED",
+  "ORIGIN_DENIED",
+  "INVALID_ORIGIN_POLICY",
+  "HOST_UNAVAILABLE",
+  "NETWORK_FAILED",
+  "NETWORK_BYTE_LIMIT",
+  "SPAWN_FAILED",
+  "START_FAILED",
+  "INPUT_ENCODING_FAILED",
+  "OUTPUT_INVALID",
+  "OUTPUT_LINE_LIMIT",
+  "OUTPUT_LIMIT",
+  "PROCESS_NO_RESULT",
+  "RESULT_INVALID",
+  "DOCUMENT_BUDGET",
+  "NODE_UNSUPPORTED",
+]);
+
+// Exact code-owned strings only. Never match substrings, serialize causes, or
+// return guest-provided error text (including strings similar to these constants).
+const failureReasons = new Map<string, typeof FailureReason.Type>([
+  ["script evaluation timed out", "TIMEOUT"],
+  [
+    "script evaluation timed out and the process was terminated",
+    "PROCESS_TIMEOUT",
+  ],
+  ["unsupported HTML document", "UNSUPPORTED_DOCUMENT"],
+  ["unsupported HTML body-fragment snapshot", "UNSUPPORTED_FRAGMENT"],
+  ["document evaluation requires a complete document", "MISSING_DOCUMENT"],
+  ["invalid browser script context", "INVALID_CONTEXT"],
+  ["invalid document snapshot", "INVALID_SNAPSHOT"],
+  ["HTML document exceeds inputBytes limit", "DOCUMENT_INPUT_BYTES"],
+  ["HTML document exceeds elements limit", "DOCUMENT_ELEMENTS"],
+  ["HTML document exceeds attributesUtf8Bytes limit", "DOCUMENT_ATTRIBUTES"],
+  [
+    "HTML document exceeds attributeValueCharacters limit",
+    "DOCUMENT_ATTRIBUTE_VALUE",
+  ],
+  ["script IPC start input exceeds its 128 KiB limit", "START_INPUT_LIMIT"],
+  ["script source exceeds the 64 KiB limit", "SOURCE_LIMIT"],
+  [
+    "Runtime does not support document script evaluation",
+    "RUNTIME_UNSUPPORTED",
+  ],
+  ["live network policy denied", "LIVE_POLICY_DENIED"],
+  ["script origin is not allowed", "ORIGIN_DENIED"],
+  ["invalid script network origin policy", "INVALID_ORIGIN_POLICY"],
+  ["script network host is unavailable", "HOST_UNAVAILABLE"],
+  ["script network request failed", "NETWORK_FAILED"],
+  ["script network byte budget exceeded", "NETWORK_BYTE_LIMIT"],
+  ["failed to spawn browser script process", "SPAWN_FAILED"],
+  ["failed to start browser script process", "START_FAILED"],
+  ["failed to encode browser script input", "INPUT_ENCODING_FAILED"],
+  ["script process emitted an invalid IPC message", "OUTPUT_INVALID"],
+  ["script process emitted an oversized IPC line", "OUTPUT_LINE_LIMIT"],
+  ["script process output exceeds the 1 MiB limit", "OUTPUT_LIMIT"],
+  ["browser script process exited without a result", "PROCESS_NO_RESULT"],
+  ["browser script result failed validation", "RESULT_INVALID"],
+  ["script runtime returned an invalid result", "RESULT_INVALID"],
+  ["document snapshot budget exceeded", "DOCUMENT_BUDGET"],
+  [
+    "BrowserMock requires Node 25+ network permission denial support",
+    "NODE_UNSUPPORTED",
+  ],
+]);
+const EvaluationReceipt = Schema.Struct({
+  failureClass: FailureClass,
+  failureReason: FailureReason,
+});
+
+/** Only exact authored reasons enter metadata; every other payload stays private. */
 export const classifyEvaluation = Effect.fnUntraced(function* (
   evaluation: Effect.Effect<
     void,
@@ -18,19 +106,33 @@ export const classifyEvaluation = Effect.fnUntraced(function* (
   >,
 ) {
   const exit = yield* evaluation.pipe(
-    Effect.as(FailureClass.make("NONE")),
-    Effect.catchTag("BrowserScriptError", () =>
-      Effect.succeed(FailureClass.make("SCRIPT")),
+    Effect.as(
+      EvaluationReceipt.make({ failureClass: "NONE", failureReason: "NONE" }),
+    ),
+    Effect.catchTag("BrowserScriptError", (error) =>
+      Effect.succeed(
+        EvaluationReceipt.make({
+          failureClass: "SCRIPT",
+          failureReason: failureReasons.get(error.reason) ?? "OTHER",
+        }),
+      ),
     ),
     Effect.catchTag("TimeoutError", () =>
-      Effect.succeed(FailureClass.make("TIMEOUT")),
+      Effect.succeed(
+        EvaluationReceipt.make({
+          failureClass: "TIMEOUT",
+          failureReason: "TIMEOUT",
+        }),
+      ),
     ),
     Effect.exit,
   );
   if (Exit.isSuccess(exit)) return exit.value;
-  return Cause.hasInterrupts(exit.cause)
-    ? FailureClass.make("TIMEOUT")
-    : FailureClass.make("OTHER");
+  return EvaluationReceipt.make(
+    Cause.hasInterrupts(exit.cause)
+      ? { failureClass: "TIMEOUT", failureReason: "INTERRUPTED" }
+      : { failureClass: "OTHER", failureReason: "OTHER" },
+  );
 });
 const Receipt = Schema.Struct({
   kind: Schema.Literal("LIVE_CHALLENGE"),
@@ -51,6 +153,7 @@ const Receipt = Schema.Struct({
   iframes: Count,
   evaluations: Schema.Struct({ success: Count, failure: Count }),
   failureClass: FailureClass,
+  failureReason: FailureReason,
   network: Schema.Struct({ allowed: Count, denied: Count }),
   providerCookieBefore: Schema.Boolean,
   providerCookieAfter: Schema.Boolean,
@@ -215,6 +318,50 @@ export const staticHtmlObservations = (body: string, pageUrl: string) => {
   };
 };
 
+/** Shared by the live measurement and local document-path regression fixtures. */
+export const restrictRuntime = (
+  runtime: Browser.BrowserScriptRuntime,
+  rules: ReadonlyArray<LiveRule>,
+  network: { allowed: number; denied: number },
+): Browser.BrowserScriptRuntime => {
+  const wrap = (
+    evaluate: Browser.BrowserScriptRuntime["evaluate"],
+  ): Browser.BrowserScriptRuntime["evaluate"] =>
+    Effect.fnUntraced(function* (source, context, host) {
+      if (host === undefined || context === undefined)
+        return yield* new Browser.BrowserScriptError({
+          reason: "live host missing",
+        });
+      const restricted = restrictHost(rules, host, context.url);
+      return yield* evaluate
+        .call(runtime, source, context, restricted.host)
+        .pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              network.allowed += restricted.counters.allowed;
+              network.denied += restricted.counters.denied;
+            }),
+          ),
+        );
+    });
+  const evaluateDocument = runtime.evaluateDocument;
+  return {
+    ...runtime,
+    evaluate: wrap(runtime.evaluate),
+    ...(runtime.evaluateClassic === undefined
+      ? {}
+      : { evaluateClassic: wrap(runtime.evaluateClassic) }),
+    ...(evaluateDocument === undefined
+      ? {}
+      : {
+          evaluateDocument: (context, host) =>
+            wrap((_source, _context, restrictedHost) =>
+              evaluateDocument.call(runtime, context, restrictedHost),
+            )("", context, host),
+        }),
+  };
+};
+
 export const measure = Effect.fnUntraced(function* (target: Target) {
   const pageUrl =
     target === "datadome"
@@ -244,6 +391,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     iframes: 0,
     evaluations: { success: 0, failure: 0 },
     failureClass: FailureClass.make("NONE"),
+    failureReason: FailureReason.make("NONE"),
     network: { allowed: 0, denied: 0 },
     providerCookieBefore: false,
     providerCookieAfter: false,
@@ -309,7 +457,9 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     );
     state.iframes = parsed.iframes;
     const started = yield* Clock.monotonicTimeNanos;
-    state.failureClass = yield* classifyEvaluation(context.evaluateDocument());
+    const evaluation = yield* classifyEvaluation(context.evaluateDocument());
+    state.failureClass = evaluation.failureClass;
+    state.failureReason = evaluation.failureReason;
     const ended = yield* Clock.monotonicTimeNanos;
     const ms = Math.max(
       0,
@@ -332,27 +482,6 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
   const program = Effect.scoped(
     Effect.gen(function* () {
       const runtime = yield* Browser.BrowserMock;
-      const wrap = (
-        evaluate: Browser.BrowserScriptRuntime["evaluate"],
-      ): Browser.BrowserScriptRuntime["evaluate"] =>
-        Effect.fnUntraced(function* (source, context, host) {
-          if (host === undefined || context === undefined)
-            return yield* new Browser.BrowserScriptError({
-              reason: "live host missing",
-            });
-          const restricted = restrictHost(rules, host, context.url);
-          return yield* evaluate
-            .call(runtime, source, context, restricted.host)
-            .pipe(
-              Effect.ensuring(
-                Effect.sync(() => {
-                  state.network.allowed += restricted.counters.allowed;
-                  state.network.denied += restricted.counters.denied;
-                }),
-              ),
-            );
-        });
-      const evaluateDocument = runtime.evaluateDocument;
       const browser = yield* Browser.open(
         {
           transport: { profile: "chrome_152_PSK" },
@@ -360,21 +489,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
           challengeHandlerTimeoutMs: 30_000,
         },
         {
-          scriptRuntime: {
-            ...runtime,
-            evaluate: wrap(runtime.evaluate),
-            ...(runtime.evaluateClassic === undefined
-              ? {}
-              : { evaluateClassic: wrap(runtime.evaluateClassic) }),
-            ...(evaluateDocument === undefined
-              ? {}
-              : {
-                  evaluateDocument: (context, host) =>
-                    wrap((_source, _context, restrictedHost) =>
-                      evaluateDocument.call(runtime, context, restrictedHost),
-                    )("", context, host),
-                }),
-          },
+          scriptRuntime: restrictRuntime(runtime, rules, state.network),
           challengeHandler: handler,
           responseHandler: handler,
         },
