@@ -107,26 +107,53 @@ describe("live script network policy", () => {
 });
 
 describe("static HTML observations", () => {
-  it("counts provider, same-origin, other, and unparsable scripts plus iframes", () => {
+  const pageUrl = "https://page.test/path";
+  const html = `<script src="/app.js"></script>
+    <script src="https://js.datadome.co/tags.js"></script>
+    <script src="https://api-js.datadome.co/tags.js"></script>
+    <script src="https://captcha-delivery.com/a.js"></script>
+    <script src="https://geo.captcha-delivery.com/a.js"></script>
+    <script src="https://challenges.cloudflare.com/a.js"></script>
+    <script src="/cdn-cgi/challenge-platform/a.js"></script>
+    <script src="https://other.test/a.js"></script>
+    <script src="http://[::1"></script>
+    <iframe></iframe><IFRAME src="frame.html"></IFRAME>`;
+  const dataDomeAllowedOrigins = [
+    "https://page.test",
+    "https://js.datadome.co",
+    "https://api-js.datadome.co",
+  ];
+  const cloudflareAllowedOrigins = ["https://page.test"];
+
+  it("counts each finite script class plus iframes", () => {
     expect(
-      staticHtmlObservations(
-        `<script src="/app.js"></script>
-        <script src="https://js.datadome.co/tags.js"></script>
-        <script src="https://api-js.datadome.co/tags.js"></script>
-        <script src="https://captcha-delivery.com/a.js"></script>
-        <script src="https://geo.captcha-delivery.com/a.js"></script>
-        <script src="https://challenges.cloudflare.com/a.js"></script>
-        <script src="/cdn-cgi/challenge-platform/a.js"></script>
-        <script src="https://other.test/a.js"></script>
-        <script src="http://[::1"></script>
-        <iframe></iframe><IFRAME src="frame.html"></IFRAME>`,
-        "https://page.test/path",
-      ),
+      staticHtmlObservations(html, pageUrl, dataDomeAllowedOrigins),
     ).toEqual({
-      staticScripts: { sameOrigin: 1, provider: 6, other: 1, unparsable: 1 },
+      staticScripts: {
+        sameOrigin: 1,
+        datadomeTag: 1,
+        datadomeApi: 1,
+        captchaDelivery: 2,
+        cloudflare: 2,
+        other: 1,
+        unparsable: 1,
+      },
+      staticScriptsNotAllowed: 4,
       iframes: 2,
     });
   });
+
+  for (const [target, allowedOrigins, expected] of [
+    ["DataDome", dataDomeAllowedOrigins, 4],
+    ["Cloudflare", cloudflareAllowedOrigins, 6],
+  ] as const) {
+    it(`counts static origins outside the ${target} allowlist`, () => {
+      expect(
+        staticHtmlObservations(html, pageUrl, allowedOrigins)
+          .staticScriptsNotAllowed,
+      ).toBe(expected);
+    });
+  }
 });
 
 describe("unchanged inline classic selection", () => {

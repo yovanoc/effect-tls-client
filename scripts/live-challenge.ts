@@ -146,10 +146,14 @@ const Receipt = Schema.Struct({
   ).check(Schema.isMaxLength(16)),
   staticScripts: Schema.Struct({
     sameOrigin: Count,
-    provider: Count,
+    datadomeTag: Count,
+    datadomeApi: Count,
+    captchaDelivery: Count,
+    cloudflare: Count,
     other: Count,
     unparsable: Count,
   }),
+  staticScriptsNotAllowed: Count,
   iframes: Count,
   evaluations: Schema.Struct({ success: Count, failure: Count }),
   failureClass: FailureClass,
@@ -276,44 +280,66 @@ const tokenizeHtml = (body: string) => {
 const classifyStaticScripts = (
   sources: ReadonlyArray<string>,
   pageUrl: string,
+  allowedOrigins: ReadonlyArray<string>,
 ) => {
-  const counts = { sameOrigin: 0, provider: 0, other: 0, unparsable: 0 };
+  const counts = {
+    sameOrigin: 0,
+    datadomeTag: 0,
+    datadomeApi: 0,
+    captchaDelivery: 0,
+    cloudflare: 0,
+    other: 0,
+    unparsable: 0,
+  };
+  let staticScriptsNotAllowed = 0;
   let page: URL;
   try {
     page = new URL(pageUrl);
   } catch {
-    return { ...counts, unparsable: sources.length };
+    return {
+      staticScripts: { ...counts, unparsable: sources.length },
+      staticScriptsNotAllowed,
+    };
   }
+  const allowed = new Set(allowedOrigins);
   for (const source of sources) {
     try {
       const url = new URL(source, page);
+      if (!allowed.has(url.origin)) staticScriptsNotAllowed++;
       const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
-      if (
-        hostname === "js.datadome.co" ||
-        hostname === "api-js.datadome.co" ||
+      if (hostname === "js.datadome.co") counts.datadomeTag++;
+      else if (hostname === "api-js.datadome.co") counts.datadomeApi++;
+      else if (
         hostname === "captcha-delivery.com" ||
-        hostname.endsWith(".captcha-delivery.com") ||
+        hostname.endsWith(".captcha-delivery.com")
+      )
+        counts.captchaDelivery++;
+      else if (
         hostname === "challenges.cloudflare.com" ||
         (url.origin === page.origin &&
           url.pathname.startsWith("/cdn-cgi/challenge-platform/"))
       )
-        counts.provider++;
+        counts.cloudflare++;
       else if (url.origin === page.origin) counts.sameOrigin++;
       else counts.other++;
     } catch {
       counts.unparsable++;
     }
   }
-  return counts;
+  return { staticScripts: counts, staticScriptsNotAllowed };
 };
 
 export const inlineClassicPrograms = (body: string): ReadonlyArray<string> =>
   tokenizeHtml(body).programs;
 
-export const staticHtmlObservations = (body: string, pageUrl: string) => {
+export const staticHtmlObservations = (
+  body: string,
+  pageUrl: string,
+  allowedOrigins: ReadonlyArray<string>,
+) => {
   const { scriptSources, iframes } = tokenizeHtml(body);
   return {
-    staticScripts: classifyStaticScripts(scriptSources, pageUrl),
+    ...classifyStaticScripts(scriptSources, pageUrl, allowedOrigins),
     iframes,
   };
 };
@@ -387,7 +413,16 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     hookInvoked: false,
     inlinePrograms: 0,
     evaluationTimings: [] as Array<{ ms: number; reachedBound: boolean }>,
-    staticScripts: { sameOrigin: 0, provider: 0, other: 0, unparsable: 0 },
+    staticScripts: {
+      sameOrigin: 0,
+      datadomeTag: 0,
+      datadomeApi: 0,
+      captchaDelivery: 0,
+      cloudflare: 0,
+      other: 0,
+      unparsable: 0,
+    },
+    staticScriptsNotAllowed: 0,
     iframes: 0,
     evaluations: { success: 0, failure: 0 },
     failureClass: FailureClass.make("NONE"),
@@ -451,10 +486,13 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
         new Browser.BrowserScriptError({ reason: "inline selection failed" }),
     });
     state.inlinePrograms = parsed.programs.length;
-    state.staticScripts = classifyStaticScripts(
+    const staticScripts = classifyStaticScripts(
       parsed.scriptSources,
       context.response.url,
+      allowedOrigins,
     );
+    state.staticScripts = staticScripts.staticScripts;
+    state.staticScriptsNotAllowed = staticScripts.staticScriptsNotAllowed;
     state.iframes = parsed.iframes;
     const started = yield* Clock.monotonicTimeNanos;
     const evaluation = yield* classifyEvaluation(context.evaluateDocument());
