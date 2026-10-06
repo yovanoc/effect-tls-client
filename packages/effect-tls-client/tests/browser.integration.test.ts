@@ -532,6 +532,49 @@ const awsWafHandler = (
 
 describeRealIntegration("real BrowserMock integration", () => {
   it.live(
+    "counts A -> B -> A redirects even when the final URL is unchanged",
+    () =>
+      Effect.gen(function* () {
+        const paths: Array<string> = [];
+        let visitsToA = 0;
+        const server = createServer((request, response) => {
+          const route = request.url ?? "/";
+          paths.push(route);
+          if (route === "/a" && ++visitsToA === 1) {
+            response.writeHead(302, { location: "/b" });
+            response.end();
+          } else if (route === "/b") {
+            response.writeHead(302, { location: "/a" });
+            response.end();
+          } else {
+            response.writeHead(200, { "content-type": "text/html" });
+            response.end("local application");
+          }
+        });
+        const url = yield* Effect.acquireRelease(
+          Effect.promise(() => listenLocal(server)),
+          () => Effect.promise(() => close(server)),
+        );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const browser = yield* Browser.open({
+              transport: { profile: "chrome_152_PSK" },
+            });
+            const page = yield* browser.navigate(`${url}/a`);
+            expect(page.url).toBe(`${url}/a`);
+            expect(page.status).toBe(200);
+            expect(page.body).toBe("local application");
+            expect(page.redirectCount).toBe(2);
+            const direct = yield* browser.navigate(`${url}/direct`);
+            expect(direct.redirectCount).toBe(0);
+            expect(direct.body).toBe("local application");
+            expect(paths).toEqual(["/a", "/b", "/a", "/direct"]);
+          }).pipe(Effect.provide(browserServices(url))),
+        );
+      }),
+  );
+
+  it.live(
     "cancels a pending classic SDK request without closing the Browser session",
     () =>
       Effect.gen(function* () {

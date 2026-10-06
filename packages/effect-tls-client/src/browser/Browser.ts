@@ -251,6 +251,8 @@ export interface BrowserHandlers {
 
 /** A page returned by navigation after redirects and HTML redirects settle. */
 export interface BrowserPage {
+  /** Location and HTML redirect hops across the entire navigation, including retries. */
+  readonly redirectCount: number;
   readonly status: number;
   readonly url: string;
   readonly headers: ReadonlyArray<Pair>;
@@ -614,7 +616,9 @@ const pageFrom = (
   response: TlsResponse,
   body: string,
   challenge: BrowserChallenge | undefined,
+  redirectCount: number,
 ): BrowserPage => ({
+  redirectCount,
   status: response.status,
   url: response.url,
   headers: response.headers,
@@ -1549,7 +1553,7 @@ const makeBrowserSession = (
           }
         }
 
-        return pageFrom(response, body, challenge);
+        return pageFrom(response, body, challenge, input.hop);
       });
 
     return yield* step({

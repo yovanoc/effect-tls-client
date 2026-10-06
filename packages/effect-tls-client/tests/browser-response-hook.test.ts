@@ -176,6 +176,7 @@ describe("final navigation response hook", () => {
       ).navigate(URL);
       expect(page.response).toBe(original);
       expect(page.body).toBe(HTML);
+      expect(page.redirectCount).toBe(0);
       expect(page.challenge).toBeUndefined();
       expect(requests).toEqual([URL]);
     }),
@@ -213,6 +214,7 @@ describe("final navigation response hook", () => {
       ).navigate(URL);
       expect(page.response).toBe(original);
       expect(page.status).toBe(403);
+      expect(page.redirectCount).toBe(2);
       expect(seen).toEqual([finalUrl]);
       expect(requests).toEqual([URL, `${URL}meta`, finalUrl]);
     }),
@@ -248,8 +250,46 @@ describe("final navigation response hook", () => {
         expect(requests).toEqual([URL, URL]);
         expect(page.response).toBe(retried);
         expect(page.body).toBe("cleared");
+        expect(page.redirectCount).toBe(0);
       }),
   );
+
+  for (const hook of ["challengeHandler", "responseHandler"] as const) {
+    for (const redirects of [false, true]) {
+      it.effect(
+        `${hook} preserves cumulative redirect count across retry (${redirects})`,
+        () =>
+          Effect.gen(function* () {
+            const requests: Array<string> = [];
+            const retryUrl = `${URL}retry`;
+            const browser = Browser.fromSession(
+              session(requests, (url) => {
+                if (redirects && requests.length === 1)
+                  return response(url, 302, [["location", "/initial"]]);
+                if (redirects && url === retryUrl)
+                  return response(url, 302, [["location", "/final"]]);
+                return response(
+                  url,
+                  403,
+                  hook === "challengeHandler"
+                    ? [["cf-mitigated", "challenge"]]
+                    : [],
+                );
+              }),
+              Browser.Chrome152Identity,
+              { [hook]: () => Effect.succeedSome({ url: retryUrl }) },
+            );
+            const page = yield* browser.navigate(URL);
+            expect(requests).toEqual(
+              redirects
+                ? [URL, `${URL}initial`, retryUrl, `${URL}final`]
+                : [URL, retryUrl],
+            );
+            expect(page.redirectCount).toBe(redirects ? 2 : 0);
+          }),
+      );
+    }
+  }
 
   it.effect(
     "recognized CF and AWS challenges retain precedence even without a challenge handler",
