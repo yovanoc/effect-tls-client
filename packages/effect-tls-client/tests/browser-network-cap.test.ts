@@ -23,6 +23,17 @@ const fixture = Effect.fnUntraced(function* () {
     if (route === "/page") {
       response.writeHead(202, { "x-amzn-waf-action": "challenge" });
       response.end("local budget fixture");
+    } else if (route.startsWith("/redirect/")) {
+      const [, , chain, rawHop] = route.split("/");
+      const hop = Number(rawHop);
+      if (hop < (chain === "long" ? 3 : 1)) {
+        response.writeHead(302, {
+          location: `/redirect/${chain}/${hop + 1}`,
+        });
+        response.end();
+      } else {
+        response.end("ok");
+      }
     } else if (route.endsWith(".js")) {
       response.setHeader("content-type", "text/javascript");
       response.end(asset);
@@ -63,6 +74,13 @@ const sequence = (count: number) => `
     catch (error) { failure = error.message; break; }
   }
   return completed + "|" + failure;
+`;
+
+const redirectSource = (chain: "short" | "long") => `
+  let failure = "";
+  try { await fetch("/redirect/${chain}/0"); }
+  catch (error) { failure = error.message; }
+  return failure || "complete";
 `;
 
 const platform = Layer.mergeAll(
@@ -183,6 +201,57 @@ describe("network budget configuration", () => {
 });
 
 describeIntegration("per-evaluation network caps", () => {
+  for (const maxNetworkRequests of [0, 17, 1.5]) {
+    it.live(
+      `rejects custom scriptRuntime maxNetworkRequests=${maxNetworkRequests}`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const { url } = yield* fixture();
+            const result = yield* navigate(
+              url,
+              "return 'unused';",
+              maxNetworkRequests,
+            ).pipe(Effect.provide(services(url)), Effect.result);
+            expect(result._tag).toBe("Failure");
+            if (result._tag === "Failure") {
+              expect(result.failure._tag).toBe("BrowserScriptError");
+              if (result.failure._tag === "BrowserScriptError") {
+                expect(result.failure.reason).toBe(
+                  "invalid script maxNetworkRequests",
+                );
+              }
+            }
+          }),
+        ),
+    );
+  }
+
+  it.live("counts redirect hops toward the request cap", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { url, paths } = yield* fixture();
+        const shorter = yield* navigate(url, redirectSource("short"), 3).pipe(
+          Effect.provide(services(url, 16)),
+        );
+        expect(shorter).toBe("complete");
+
+        const longer = yield* navigate(url, redirectSource("long"), 3).pipe(
+          Effect.provide(services(url, 16)),
+        );
+        expect(longer).toContain(
+          "script network request budget exceeds 3 requests",
+        );
+        expect(
+          paths.filter((path) => path.startsWith("/redirect/short/")),
+        ).toEqual(["/redirect/short/0", "/redirect/short/1"]);
+        expect(
+          paths.filter((path) => path.startsWith("/redirect/long/")),
+        ).toEqual(["/redirect/long/0", "/redirect/long/1", "/redirect/long/2"]);
+      }),
+    ),
+  );
+
   for (const [cap, requests, expected] of [
     [undefined, 9, 8],
     [16, 12, 12],

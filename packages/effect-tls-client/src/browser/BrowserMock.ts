@@ -315,7 +315,10 @@ const exceedsCookieLimit = (cookie: string): boolean =>
 
 const makeEvaluate = (
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
-  options: BrowserMockOptions,
+  options: BrowserMockOptions & {
+    allowedOrigins: ReadonlyArray<string>;
+    maxNetworkRequests: number;
+  },
   hostRequestSemaphore: Semaphore.Semaphore,
   mode: "async" | "classic" = "async",
 ): BrowserScriptRuntime["evaluate"] =>
@@ -482,7 +485,7 @@ const makeEvaluate = (
               [
                 "--permission",
                 "-e",
-                makeRunnerSource(options.maxNetworkRequests ?? 8),
+                makeRunnerSource(options.maxNetworkRequests),
               ],
               {
                 detached: true,
@@ -623,12 +626,12 @@ const makeEvaluate = (
             }
             const requestBytes = lineBytes(JSON.stringify(event));
             networkRequests += 1;
-            if (networkRequests > (options.maxNetworkRequests ?? 8)) {
+            if (networkRequests > options.maxNetworkRequests) {
               yield* writeInput({
                 type: "reply",
                 id: event.id,
                 ok: false,
-                error: `script request budget exceeds ${options.maxNetworkRequests ?? 8} requests`,
+                error: `script request budget exceeds ${options.maxNetworkRequests} requests`,
               });
               return;
             }
@@ -807,7 +810,7 @@ const makeEvaluate = (
                   return yield* new BrowserScriptError({
                     reason: "frame budget exceeded (4 frames)",
                   });
-                if (++networkRequests > (options.maxNetworkRequests ?? 8))
+                if (++networkRequests > options.maxNetworkRequests)
                   return yield* new BrowserScriptError({
                     reason: "script network request budget exceeded",
                   });
@@ -1135,25 +1138,27 @@ export class BrowserMock extends Context.Service<
               cause,
             }),
         });
+        const maxNetworkRequests = options.maxNetworkRequests ?? 8;
+        const runtimeOptions = {
+          ...options,
+          allowedOrigins,
+          maxNetworkRequests,
+        };
         const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
         // Cookie snapshots have no host revision; serialize requests through reply delivery.
         // ponytail: host revisions can restore script-request concurrency.
         const hostRequestSemaphore = yield* Semaphore.make(1);
         return BrowserMock.of({
           allowedOrigins,
-          maxNetworkRequests: options.maxNetworkRequests ?? 8,
+          maxNetworkRequests,
           timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           evaluateClassic: makeEvaluate(
             spawner,
-            { ...options, allowedOrigins },
+            runtimeOptions,
             hostRequestSemaphore,
             "classic",
           ),
-          evaluate: makeEvaluate(
-            spawner,
-            { ...options, allowedOrigins },
-            hostRequestSemaphore,
-          ),
+          evaluate: makeEvaluate(spawner, runtimeOptions, hostRequestSemaphore),
         });
       }),
     );

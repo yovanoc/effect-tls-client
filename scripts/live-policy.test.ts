@@ -5,7 +5,10 @@ import {
   type BrowserScriptHost,
 } from "../packages/effect-tls-client/src/browser/BrowserScript.js";
 import { restrictHost } from "./live-policy.js";
-import { inlineClassicPrograms } from "./live-challenge.js";
+import {
+  inlineClassicPrograms,
+  staticHtmlObservations,
+} from "./live-challenge.js";
 
 const effectIt = <A, E>(name: string, run: () => Effect.Effect<A, E>) =>
   it(name, () => Effect.runPromise(run()));
@@ -99,6 +102,29 @@ describe("live script network policy", () => {
       expect(policy.counters).toEqual({ allowed: 0, denied: 1 });
     }),
   );
+});
+
+describe("static HTML observations", () => {
+  it("counts provider, same-origin, other, and unparsable scripts plus iframes", () => {
+    expect(
+      staticHtmlObservations(
+        `<script src="/app.js"></script>
+        <script src="https://js.datadome.co/tags.js"></script>
+        <script src="https://api-js.datadome.co/tags.js"></script>
+        <script src="https://captcha-delivery.com/a.js"></script>
+        <script src="https://geo.captcha-delivery.com/a.js"></script>
+        <script src="https://challenges.cloudflare.com/a.js"></script>
+        <script src="/cdn-cgi/challenge-platform/a.js"></script>
+        <script src="https://other.test/a.js"></script>
+        <script src="http://[::1"></script>
+        <iframe></iframe><IFRAME src="frame.html"></IFRAME>`,
+        "https://page.test/path",
+      ),
+    ).toEqual({
+      staticScripts: { sameOrigin: 1, provider: 6, other: 1, unparsable: 1 },
+      iframes: 2,
+    });
+  });
 });
 
 describe("unchanged inline classic selection", () => {

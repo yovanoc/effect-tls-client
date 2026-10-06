@@ -819,7 +819,7 @@ existing custom `challengeHandler` rather than a separate callback API.
 
 The bridge defaults to 8 network requests per evaluation, including redirect hops.
 Set `BrowserMock.layer({ maxNetworkRequests })` (or the custom runtime property)
-to an integer from 1 through 16; invalid values fail configuration validation.
+to an integer from 1 through 16; invalid values fail with `BrowserScriptError` (invalid options).
 Host-side network requests are serialized to preserve authoritative cookie
 snapshots. Other
 limits are 128 request headers and 64 KiB of header-name/value bytes per

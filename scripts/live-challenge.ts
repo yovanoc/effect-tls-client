@@ -1,4 +1,4 @@
-import { Effect, Exit, Layer, Option, Schema } from "effect";
+import { Clock, Effect, Exit, Layer, Option, Schema } from "effect";
 import { TlsClient } from "../packages/effect-tls-client/src/TlsClient.js";
 import * as Browser from "../packages/effect-tls-client/src/browser/index.js";
 import { CookiesJson } from "../packages/effect-tls-client/src/internal/Protocol.js";
@@ -14,6 +14,16 @@ const Receipt = Schema.Struct({
   initialRecognizedChallenge: Schema.Boolean,
   hookInvoked: Schema.Boolean,
   inlinePrograms: Count,
+  evaluationTimings: Schema.Array(
+    Schema.Struct({ ms: Count, reachedBound: Schema.Boolean }),
+  ).check(Schema.isMaxLength(16)),
+  staticScripts: Schema.Struct({
+    sameOrigin: Count,
+    provider: Count,
+    other: Count,
+    unparsable: Count,
+  }),
+  iframes: Count,
   evaluations: Schema.Struct({ success: Count, failure: Count }),
   network: Schema.Struct({ allowed: Count, denied: Count }),
   providerCookieBefore: Schema.Boolean,
@@ -45,8 +55,10 @@ const print = (receipt: typeof Output.Type) => {
 };
 
 /** Conservative HTML token selection, not repair or JavaScript rewriting. */
-export const inlineClassicPrograms = (body: string): ReadonlyArray<string> => {
+const tokenizeHtml = (body: string) => {
   const programs: Array<string> = [];
+  const scriptSources: Array<string> = [];
+  let iframes = 0;
   let scanned = 0;
   const tokens =
     /<!--[\s\S]*?-->|<!(?!--)[^>]*>|<\/?[A-Za-z][^>"']*(?:(?:"[^"]*"|'[^']*')[^>"']*)*>/g;
@@ -81,6 +93,7 @@ export const inlineClassicPrograms = (body: string): ReadonlyArray<string> => {
       ].includes(name ?? "")
     )
       continue;
+    if (name === "iframe") iframes++;
     const closing = new RegExp(`</${name}[\\t\\n\\f\\r ]*>`, "ig");
     closing.lastIndex = tokens.lastIndex;
     const end = closing.exec(body);
@@ -114,6 +127,7 @@ export const inlineClassicPrograms = (body: string): ReadonlyArray<string> => {
         });
       attributes.set(key, part[2] ?? part[3] ?? part[4] ?? "");
     }
+    if (attributes.has("src")) scriptSources.push(attributes.get("src") ?? "");
     const type = (attributes.get("type") ?? "").trim().toLowerCase();
     if (
       !attributes.has("src") &&
@@ -127,7 +141,52 @@ export const inlineClassicPrograms = (body: string): ReadonlyArray<string> => {
     throw new Browser.BrowserScriptError({
       reason: "ambiguous inline selection markup",
     });
-  return programs;
+  return { programs, scriptSources, iframes };
+};
+
+const classifyStaticScripts = (
+  sources: ReadonlyArray<string>,
+  pageUrl: string,
+) => {
+  const counts = { sameOrigin: 0, provider: 0, other: 0, unparsable: 0 };
+  let page: URL;
+  try {
+    page = new URL(pageUrl);
+  } catch {
+    return { ...counts, unparsable: sources.length };
+  }
+  for (const source of sources) {
+    try {
+      const url = new URL(source, page);
+      const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+      if (
+        hostname === "js.datadome.co" ||
+        hostname === "api-js.datadome.co" ||
+        hostname === "captcha-delivery.com" ||
+        hostname.endsWith(".captcha-delivery.com") ||
+        hostname === "challenges.cloudflare.com" ||
+        (url.origin === page.origin &&
+          url.pathname.startsWith("/cdn-cgi/challenge-platform/"))
+      )
+        counts.provider++;
+      else if (url.origin === page.origin) counts.sameOrigin++;
+      else counts.other++;
+    } catch {
+      counts.unparsable++;
+    }
+  }
+  return counts;
+};
+
+export const inlineClassicPrograms = (body: string): ReadonlyArray<string> =>
+  tokenizeHtml(body).programs;
+
+export const staticHtmlObservations = (body: string, pageUrl: string) => {
+  const { scriptSources, iframes } = tokenizeHtml(body);
+  return {
+    staticScripts: classifyStaticScripts(scriptSources, pageUrl),
+    iframes,
+  };
 };
 
 export const measure = Effect.fnUntraced(function* (target: Target) {
@@ -154,6 +213,9 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     initialRecognizedChallenge: false,
     hookInvoked: false,
     inlinePrograms: 0,
+    evaluationTimings: [] as Array<{ ms: number; reachedBound: boolean }>,
+    staticScripts: { sameOrigin: 0, provider: 0, other: 0, unparsable: 0 },
+    iframes: 0,
     evaluations: { success: 0, failure: 0 },
     network: { allowed: 0, denied: 0 },
     providerCookieBefore: false,
@@ -208,19 +270,36 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
       Browser.recognizeChallenge(context.response) !== undefined;
     const before = yield* cookieSnapshot(context.transport);
     state.providerCookieBefore = before.names.has(providerName);
-    const programs = yield* Effect.try({
-      try: () => inlineClassicPrograms(context.body),
+    const parsed = yield* Effect.try({
+      try: () => tokenizeHtml(context.body),
       catch: () =>
         new Browser.BrowserScriptError({ reason: "inline selection failed" }),
     });
-    state.inlinePrograms = programs.length;
-    for (const source of programs) {
+    state.inlinePrograms = parsed.programs.length;
+    state.staticScripts = classifyStaticScripts(
+      parsed.scriptSources,
+      context.response.url,
+    );
+    state.iframes = parsed.iframes;
+    for (const source of parsed.programs) {
+      const started = yield* Clock.monotonicTimeNanos;
       const success = yield* context
         .evaluateClassic(source, { document: "response" })
         .pipe(
           Effect.as(true),
           Effect.catchTag("BrowserScriptError", () => Effect.succeed(false)),
         );
+      const ended = yield* Clock.monotonicTimeNanos;
+      if (state.evaluationTimings.length < 16) {
+        const ms = Math.max(
+          0,
+          Math.round(Number(ended - started) / 100_000_000) * 100,
+        );
+        state.evaluationTimings.push({
+          ms,
+          reachedBound: ms >= 5_000 - 250,
+        });
+      }
       if (success) state.evaluations.success++;
       else state.evaluations.failure++;
     }
