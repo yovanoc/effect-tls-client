@@ -208,7 +208,16 @@ describe("natural timer retention", () => {
             mode === "failure"
               ? 'setInterval(() => {}, 100); throw new Error("root failed");'
               : mode === "interval"
-                ? 'setInterval(() => { document.cookie = "timer=done"; }, 100); "done";'
+                ? `new Promise((resolve) => {
+                    let written = false;
+                    // Await one write, but leave the interval pending for retention.
+                    setInterval(() => {
+                      if (written) return;
+                      document.cookie = "timer=done";
+                      written = true;
+                      resolve("done");
+                    }, 100);
+                  });`
                 : mode === "cleared"
                   ? 'const timer = setTimeout(() => { document.cookie = "unexpected=yes"; }, 1000); clearTimeout(timer); "done";'
                   : 'setTimeout(() => { setTimeout(() => { document.cookie = "timer=done"; }, 10); }, 10); "done";',
@@ -231,7 +240,11 @@ describe("natural timer retention", () => {
           if (result._tag === "Success") {
             expect(result.success.value).toBe("done");
             expect(result.success.setCookies).toEqual(
-              mode === "cleared" ? [] : expect.arrayContaining(["timer=done"]),
+              mode === "cleared"
+                ? []
+                : mode === "interval"
+                  ? ["timer=done"]
+                  : expect.arrayContaining(["timer=done"]),
             );
           }
           if (mode === "interval")
