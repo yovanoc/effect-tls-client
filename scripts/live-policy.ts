@@ -89,6 +89,6 @@ export const restrictHost = (
       countHostCall(hostCalls, "setCookie");
       return host.setCookie.call(host, value);
     });
-  // No iframe grant: this measurement selects root inline classic programs only.
+  // Opt-in document mode grants no frame loading.
   return { host: { request, setCookie }, counters, hostCalls };
 };

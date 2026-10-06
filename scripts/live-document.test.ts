@@ -14,7 +14,7 @@ const dynamic = `${inline} var asset = document.createElement("script"); asset.s
 const page = (script: string, extra = "", doctype = "<!doctype html>") =>
   `${doctype}\n<!-- authored fixture --><HTML lang=en><HEAD><meta charset=utf-8><STYLE>body { color: red; } /* < & */</STYLE><TITLE>Local fixture</TITLE><script>${script}</script></HEAD><BODY onload="throw new Error('must stay inert')"><div id=notice>Local only</div>${extra}</BODY></HTML>`;
 
-const run = (body: string, classic: boolean) =>
+const run = (body: string, classic: boolean, assetStatus = 200) =>
   Effect.scoped(
     Effect.gen(function* () {
       const paths: string[] = [];
@@ -24,11 +24,13 @@ const run = (body: string, classic: boolean) =>
             new Promise<ReturnType<typeof createServer>>((resolve, reject) => {
               const server = createServer((request, response) => {
                 paths.push(request.url ?? "/");
-                if (request.url === "/asset.js")
-                  response.end(
-                    'if (fixtureConfig.value !== "authored") throw new Error("config missing"); document.cookie = "fixture=done; Path=/";',
-                  );
-                else
+                if (request.url === "/asset.js") {
+                  if (assetStatus === 200)
+                    response.end(
+                      'if (fixtureConfig.value !== "authored") throw new Error("config missing"); document.cookie = "fixture=done; Path=/";',
+                    );
+                  else response.writeHead(assetStatus).end("resource failed");
+                } else
                   response
                     .writeHead(403, { "content-type": "text/html" })
                     .end(body);
@@ -136,6 +138,20 @@ describe.skipIf(!integration)("local harness document path", () => {
       expect(result.cookies).toContain("fixture=done");
     });
   }
+  it("fails document evaluation when a static script resource returns 404", async () => {
+    const result = await Effect.runPromise(
+      run(page(inline + "</script><script src=/asset.js>"), false, 404),
+    );
+    expect(result.status).toBe(403);
+    expect(result.network).toEqual({ allowed: 1, denied: 0 });
+    expect(result.paths).toEqual(["/page", "/asset.js"]);
+    expect(Option.isSome(result.evaluation)).toBe(true);
+    if (Option.isSome(result.evaluation))
+      expect(result.evaluation.value).toMatchObject({
+        reason: "document script resource load failed",
+      });
+  });
+
   for (const [name, body, reason, rule] of [
     [
       "head noscript",

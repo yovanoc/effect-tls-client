@@ -13,8 +13,11 @@ import {
 } from "./live-policy.js";
 import {
   classifyEvaluation,
+  didProviderCookieChange,
   encodeReceipt,
   FailureReason,
+  inspectProtectedBody,
+  isProven,
   HostCallCountersSchema,
   inlineClassicPrograms,
   readExportedCookies,
@@ -365,6 +368,8 @@ describe("evaluation receipt failure metadata", () => {
       "script evaluation timed out and the process was terminated",
       "PROCESS_TIMEOUT",
     ],
+    ["script evaluation timed out; process terminated", "TIMEOUT"],
+    ["document script resource load failed", "RESOURCE_FAILURE"],
     [
       "BrowserMock requires Node 25+ network permission denial support",
       "NODE_UNSUPPORTED",
@@ -398,5 +403,149 @@ describe("evaluation receipt failure metadata", () => {
     expect(() =>
       Schema.decodeUnknownSync(FailureReason)("private guest data"),
     ).toThrow();
+  });
+});
+
+describe("conservative live proof gate", () => {
+  const valid = (overrides: Partial<Parameters<typeof isProven>[0]> = {}) => ({
+    initialEnforcementObserved: true,
+    evaluations: { success: 1, failure: 0 },
+    failureClass: "NONE" as const,
+    failureReason: "NONE" as const,
+    networkDenied: 0,
+    staticScriptsNotAllowed: 0,
+    providerCookieChanged: true,
+    retried: true,
+    finalUrlMatches: true,
+    finalStatus: 200,
+    bodyGate: "VERIFIED" as const,
+    protectedContentVerified: true,
+    finalChallengeRecognized: false,
+    finalMarkersPresent: false,
+    ...overrides,
+  });
+
+  const protectedBody = (input: {
+    finalBody: string;
+    finalStatus?: number;
+    initialBody?: string;
+    expectedContent?: string;
+  }) =>
+    inspectProtectedBody({
+      target: "cloudflare",
+      initialBody:
+        input.initialBody ?? "<html><body>Just a moment</body></html>",
+      finalBody: input.finalBody,
+      finalStatus: input.finalStatus ?? 200,
+      headers: [["content-type", "text/html; charset=utf-8"]],
+      finalChallengeRecognized: false,
+      ...(input.expectedContent === undefined
+        ? {}
+        : { expectedContent: input.expectedContent }),
+    });
+
+  it("accepts only an authored synthetic expected-content verifier", () => {
+    const evidence = protectedBody({
+      finalBody:
+        "<html><body><main>Protected workspace: synthetic-record-42</main></body></html>",
+      expectedContent: "Protected workspace: synthetic-record-42",
+    });
+    expect(evidence).toEqual({
+      bodyGate: "VERIFIED",
+      protectedContentVerified: true,
+    });
+    // This verifier is specific to this authored fixture; measure() supplies none.
+    expect(isProven({ ...valid(), ...evidence })).toBe(true);
+  });
+
+  it("does not prove a changed provider cookie after failed document evaluation", () => {
+    expect(
+      isProven(
+        valid({
+          evaluations: { success: 0, failure: 1 },
+          failureClass: "SCRIPT",
+          failureReason: "RESOURCE_FAILURE",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("requires observed enforcement and zero denied or non-allowed work", () => {
+    expect(isProven(valid({ initialEnforcementObserved: false }))).toBe(false);
+    expect(isProven(valid({ networkDenied: 1 }))).toBe(false);
+    expect(isProven(valid({ staticScriptsNotAllowed: 1 }))).toBe(false);
+  });
+
+  it("rejects external denial, non-success status, and URL changes", () => {
+    expect(isProven(valid({ networkDenied: 1 }))).toBe(false);
+    expect(isProven(valid({ finalStatus: 404 }))).toBe(false);
+    expect(isProven(valid({ finalUrlMatches: false }))).toBe(false);
+  });
+
+  it("rejects no-body, unchanged, noscript-only, error, and interstitial content", () => {
+    const blocked = [
+      protectedBody({
+        finalBody: "<html><body>Protected marker</body></html>",
+        finalStatus: 204,
+        expectedContent: "Protected marker",
+      }),
+      protectedBody({ finalBody: "", expectedContent: "Protected marker" }),
+      protectedBody({
+        finalBody:
+          "<html><body><noscript>Please enable scripting</noscript></body></html>",
+        expectedContent: "Please enable scripting",
+      }),
+      protectedBody({
+        finalBody:
+          "<html><body><main>Internal server error</main></body></html>",
+        expectedContent: "Internal server error",
+      }),
+      protectedBody({
+        finalBody:
+          "<html><body><main>Access denied interstitial</main></body></html>",
+        expectedContent: "Access denied interstitial",
+      }),
+      protectedBody({
+        finalBody: "<html><body>Just a moment</body></html>",
+        initialBody: "<html><body>Just a moment</body></html>",
+        expectedContent: "Just a moment",
+      }),
+    ];
+    expect(blocked.map((evidence) => evidence.bodyGate)).toEqual([
+      "NO_BODY",
+      "NO_BODY",
+      "NOSCRIPT_ONLY",
+      "BLOCKED_CONTENT",
+      "BLOCKED_CONTENT",
+      "UNCHANGED",
+    ]);
+    for (const evidence of blocked)
+      expect(isProven({ ...valid(), ...evidence })).toBe(false);
+  });
+
+  it("does not treat arbitrary nonempty app-looking content as protected evidence", () => {
+    const evidence = protectedBody({
+      finalBody: "<html><body><main>Protected dashboard</main></body></html>",
+    });
+    expect(evidence).toEqual({
+      bodyGate: "NO_SUPPORTED_VERIFIER",
+      protectedContentVerified: false,
+    });
+    expect(isProven({ ...valid(), ...evidence })).toBe(false);
+  });
+
+  it("compares authoritative cookie snapshots taken after the initial response", () => {
+    const beforeEvaluation = new Map([
+      ["datadome\n/\n", "initial-response-cookie"],
+    ]);
+    expect(
+      didProviderCookieChange(beforeEvaluation, new Map(beforeEvaluation)),
+    ).toBe(false);
+    expect(
+      didProviderCookieChange(
+        beforeEvaluation,
+        new Map([["datadome\n/\n", "guest-evaluation-cookie"]]),
+      ),
+    ).toBe(true);
   });
 });

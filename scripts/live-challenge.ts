@@ -49,6 +49,7 @@ export const FailureReason = Schema.Literals([
   "INVALID_ORIGIN_POLICY",
   "HOST_UNAVAILABLE",
   "NETWORK_FAILED",
+  "RESOURCE_FAILURE",
   "NETWORK_BYTE_LIMIT",
   "SPAWN_FAILED",
   "START_FAILED",
@@ -66,6 +67,7 @@ export const FailureReason = Schema.Literals([
 // return guest-provided error text (including strings similar to these constants).
 const failureReasons = new Map<string, typeof FailureReason.Type>([
   ["script evaluation timed out", "TIMEOUT"],
+  ["script evaluation timed out; process terminated", "TIMEOUT"],
   [
     "script evaluation timed out and the process was terminated",
     "PROCESS_TIMEOUT",
@@ -93,6 +95,7 @@ const failureReasons = new Map<string, typeof FailureReason.Type>([
   ["invalid script network origin policy", "INVALID_ORIGIN_POLICY"],
   ["script network host is unavailable", "HOST_UNAVAILABLE"],
   ["script network request failed", "NETWORK_FAILED"],
+  ["document script resource load failed", "RESOURCE_FAILURE"],
   ["script network byte budget exceeded", "NETWORK_BYTE_LIMIT"],
   ["failed to spawn browser script process", "SPAWN_FAILED"],
   ["failed to start browser script process", "START_FAILED"],
@@ -113,6 +116,17 @@ const EvaluationReceipt = Schema.Struct({
   failureClass: FailureClass,
   failureReason: FailureReason,
 });
+
+export const BodyGate = Schema.Literals([
+  "NO_BODY",
+  "UNCHANGED",
+  "CHALLENGE_MARKER",
+  "NOSCRIPT_ONLY",
+  "BLOCKED_CONTENT",
+  "UNSUPPORTED_CONTENT_TYPE",
+  "NO_SUPPORTED_VERIFIER",
+  "VERIFIED",
+]);
 
 /** Only exact authored reasons enter metadata; every other payload stays private. */
 export const classifyEvaluation = Effect.fnUntraced(function* (
@@ -163,6 +177,7 @@ export const Receipt = Schema.Struct({
   target: Target,
   initialStatus: Schema.Number,
   initialRecognizedChallenge: Schema.Boolean,
+  initialMarkersPresent: Schema.Boolean,
   hookInvoked: Schema.Boolean,
   inlinePrograms: Count,
   evaluationTimings: Schema.Array(
@@ -192,6 +207,8 @@ export const Receipt = Schema.Struct({
   finalRedirected: Schema.Boolean,
   finalChallengeRecognized: Schema.Boolean,
   finalMarkersPresent: Schema.Boolean,
+  bodyGate: BodyGate,
+  protectedContentVerified: Schema.Boolean,
   proven: Schema.Boolean,
 });
 const UnknownReceipt = Schema.Struct({
@@ -384,6 +401,128 @@ export const staticHtmlObservations = (
   };
 };
 
+const hasKnownChallengeMarkers = (
+  target: Target,
+  headers: ReadonlyArray<readonly [string, string]>,
+  body: string,
+) =>
+  target === "datadome"
+    ? /captcha-delivery\.com|geo\.captcha-delivery/i.test(body)
+    : headers.some(([name]) => name.toLowerCase() === "cf-mitigated") ||
+      /challenge-platform|Just a moment/i.test(body);
+
+const visibleBodyText = (body: string, omitNoscript: boolean) =>
+  body
+    .replaceAll(/<!--[\s\S]*?-->/gu, " ")
+    .replaceAll(
+      /<(script|style|head|template|iframe)\b[^>]*>[\s\S]*?<\/\1\s*>/giu,
+      " ",
+    )
+    .replaceAll(
+      omitNoscript ? /<noscript\b[^>]*>[\s\S]*?<\/noscript\s*>/giu : /$^/gu,
+      " ",
+    )
+    .replaceAll(/<[^>]*>/gu, " ")
+    .replaceAll(/&(?:nbsp|#160|#xA0);/giu, " ")
+    .replaceAll(/&(?:#x?[0-9a-f]+|[a-z][a-z0-9]+);/giu, " ")
+    .replaceAll(/\s+/gu, " ")
+    .trim();
+
+export const inspectProtectedBody = (input: {
+  readonly target: Target;
+  readonly initialBody: string;
+  readonly finalBody: string;
+  readonly finalStatus: number;
+  readonly headers: ReadonlyArray<readonly [string, string]>;
+  readonly finalChallengeRecognized: boolean;
+  readonly expectedContent?: string;
+}): {
+  readonly bodyGate: typeof BodyGate.Type;
+  readonly protectedContentVerified: boolean;
+} => {
+  const fail = (bodyGate: Exclude<typeof BodyGate.Type, "VERIFIED">) => ({
+    bodyGate,
+    protectedContentVerified: false,
+  });
+  if (input.finalStatus === 204 || input.finalBody.trim() === "")
+    return fail("NO_BODY");
+  if (input.finalBody === input.initialBody) return fail("UNCHANGED");
+  if (
+    input.finalChallengeRecognized ||
+    hasKnownChallengeMarkers(input.target, input.headers, input.finalBody)
+  )
+    return fail("CHALLENGE_MARKER");
+  const text = visibleBodyText(input.finalBody, true);
+  if (text === "" && visibleBodyText(input.finalBody, false) !== "")
+    return fail("NOSCRIPT_ONLY");
+  if (
+    /\b(?:challenge|error|interstitial|access denied|forbidden)\b/iu.test(text)
+  )
+    return fail("BLOCKED_CONTENT");
+  if (text === "") return fail("NO_BODY");
+  const contentType =
+    input.headers
+      .find(([name]) => name.toLowerCase() === "content-type")?.[1]
+      ?.split(";", 1)[0]
+      ?.trim()
+      .toLowerCase() ?? "";
+  if (
+    contentType !== "text/html" &&
+    contentType !== "application/json" &&
+    !/^application\/[a-z0-9.+-]+\+json$/u.test(contentType)
+  )
+    return fail("UNSUPPORTED_CONTENT_TYPE");
+  // Live targets deliberately have no expected protected-content marker yet.
+  const expected = input.expectedContent?.trim();
+  if (expected === undefined || expected === "" || !text.includes(expected))
+    return fail("NO_SUPPORTED_VERIFIER");
+  return {
+    bodyGate: BodyGate.make("VERIFIED"),
+    protectedContentVerified: true,
+  };
+};
+
+export const didProviderCookieChange = (
+  before: ReadonlyMap<string, string>,
+  after: ReadonlyMap<string, string>,
+) =>
+  [...after].some(([key, value]) => value !== "" && before.get(key) !== value);
+
+export const isProven = (input: {
+  readonly initialEnforcementObserved: boolean;
+  readonly evaluations: { readonly success: number; readonly failure: number };
+  readonly failureClass: typeof FailureClass.Type;
+  readonly failureReason: typeof FailureReason.Type;
+  readonly networkDenied: number;
+  readonly staticScriptsNotAllowed: number;
+  readonly providerCookieChanged: boolean;
+  readonly retried: boolean;
+  readonly finalUrlMatches: boolean;
+  readonly finalStatus: number | null;
+  readonly bodyGate: typeof BodyGate.Type;
+  readonly protectedContentVerified: boolean;
+  readonly finalChallengeRecognized: boolean;
+  readonly finalMarkersPresent: boolean;
+}) =>
+  input.initialEnforcementObserved &&
+  input.evaluations.success === 1 &&
+  input.evaluations.failure === 0 &&
+  input.failureClass === "NONE" &&
+  input.failureReason === "NONE" &&
+  input.networkDenied === 0 &&
+  input.staticScriptsNotAllowed === 0 &&
+  input.providerCookieChanged &&
+  input.retried &&
+  input.finalUrlMatches &&
+  input.finalStatus !== null &&
+  input.finalStatus >= 200 &&
+  input.finalStatus < 300 &&
+  input.finalStatus !== 204 &&
+  input.bodyGate === "VERIFIED" &&
+  input.protectedContentVerified &&
+  !input.finalChallengeRecognized &&
+  !input.finalMarkersPresent;
+
 /** Shared by the live measurement and local document-path regression fixtures. */
 export const restrictRuntime = (
   runtime: Browser.BrowserScriptRuntime,
@@ -448,9 +587,16 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
       : [{ origin, pathPrefix: "/cdn-cgi/challenge-platform/" }];
   const allowedOrigins = rules.map((rule) => rule.origin);
   const providerName = target === "datadome" ? "datadome" : "cf_clearance";
+  let initialBody = "";
+  const allowedPathPrefixes = Object.fromEntries(
+    rules.flatMap((rule) =>
+      rule.pathPrefix === undefined ? [] : [[rule.origin, [rule.pathPrefix]]],
+    ),
+  );
   const state = {
     initialStatus: 0,
     initialRecognizedChallenge: false,
+    initialMarkersPresent: false,
     hookInvoked: false,
     inlinePrograms: 0,
     evaluationTimings: [] as Array<{ ms: number; reachedBound: boolean }>,
@@ -520,6 +666,12 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     state.initialStatus = context.response.status;
     state.initialRecognizedChallenge =
       Browser.recognizeChallenge(context.response) !== undefined;
+    initialBody = context.body;
+    state.initialMarkersPresent = hasKnownChallengeMarkers(
+      target,
+      context.response.headers,
+      context.body,
+    );
     const before = yield* cookieSnapshot(context.transport);
     state.providerCookieBefore = before.names.has(providerName);
     const parsed = yield* Effect.try({
@@ -553,8 +705,9 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     else state.evaluations.failure = 1;
     const after = yield* cookieSnapshot(context.transport);
     state.providerCookieAfter = after.names.has(providerName);
-    state.providerCookieChanged = [...after.provider].some(
-      ([key, value]) => value !== "" && before.provider.get(key) !== value,
+    state.providerCookieChanged = didProviderCookieChange(
+      before.provider,
+      after.provider,
     );
     state.retried = state.providerCookieChanged;
     return state.retried ? Option.some({}) : Option.none();
@@ -584,14 +737,22 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
         return yield* new Browser.BrowserScriptError({
           reason: "initial response unobserved",
         });
-      const finalRedirected = page.url !== pageUrl;
+      const finalUrlMatches = page.url === pageUrl;
+      const finalRedirected = !finalUrlMatches;
       const finalChallengeRecognized = page.challenge !== undefined;
-      const finalMarkersPresent =
-        target === "datadome"
-          ? /captcha-delivery\.com|geo\.captcha-delivery/i.test(page.body)
-          : page.headers.some(
-              ([name]) => name.toLowerCase() === "cf-mitigated",
-            ) || /challenge-platform|Just a moment/i.test(page.body);
+      const finalMarkersPresent = hasKnownChallengeMarkers(
+        target,
+        page.headers,
+        page.body,
+      );
+      const bodyEvidence = inspectProtectedBody({
+        target,
+        initialBody,
+        finalBody: page.body,
+        finalStatus: page.status,
+        headers: page.headers,
+        finalChallengeRecognized,
+      });
       return Receipt.make({
         kind: "LIVE_CHALLENGE",
         target,
@@ -600,16 +761,23 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
         finalRedirected,
         finalChallengeRecognized,
         finalMarkersPresent,
-        proven:
-          state.initialStatus < 200 || state.initialStatus >= 300
-            ? state.providerCookieChanged &&
-              state.retried &&
-              page.status >= 200 &&
-              page.status < 300 &&
-              !finalRedirected &&
-              !finalChallengeRecognized &&
-              !finalMarkersPresent
-            : false,
+        ...bodyEvidence,
+        proven: isProven({
+          initialEnforcementObserved:
+            state.initialRecognizedChallenge || state.initialMarkersPresent,
+          evaluations: state.evaluations,
+          failureClass: state.failureClass,
+          failureReason: state.failureReason,
+          networkDenied: state.network.denied,
+          staticScriptsNotAllowed: state.staticScriptsNotAllowed,
+          providerCookieChanged: state.providerCookieChanged,
+          retried: state.retried,
+          finalUrlMatches,
+          finalStatus: page.status,
+          ...bodyEvidence,
+          finalChallengeRecognized,
+          finalMarkersPresent,
+        }),
       });
     }),
   );
@@ -623,6 +791,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     TlsClient.layer.pipe(Layer.provide(services)),
     Browser.BrowserMock.layer({
       allowedOrigins,
+      allowedPathPrefixes,
       maxNetworkRequests: 16,
       timeoutMs: EVALUATION_TIMEOUT_MS,
     }).pipe(Layer.provide(services)),
