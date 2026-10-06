@@ -30,7 +30,8 @@ TLS_CLIENT_INTEGRATION=1 TLS_CLIENT_LIVE_TARGET=cloudflare bun scripts/live-chal
 
 Otherwise it prints `{"kind":"LIVE_OFF"}` without requests. This reviewed-source
 measurement runs original inline classic programs sequentially with the complete
-response snapshot, no source changes or shims, a 5-second runtime deadline, and
+response snapshot, no source changes or shims, a 25-second runtime deadline,
+a 30-second handler deadline, and
 16 network requests per evaluation. DataDome permits only the page, `js.datadome.co`,
 and `api-js.datadome.co` origins; Cloudflare guest requests additionally require
 `/cdn-cgi/challenge-platform/`. Host-call counters exclude internal redirect hops;
@@ -151,7 +152,12 @@ generic status/body or `cf-ray` alone is not evidence. Without a handler, or
 when a handler returns `None`, the original response and body are preserved;
 recognition alone neither evaluates scripts nor retries. An optional
 `challengeHandler` may explicitly inspect the response and request a bounded
-retry. A CloudFront `403` is exposed separately through
+retry. `Browser.open({ transport, challengeHandlerTimeoutMs: 8_000 }, handlers)`
+sets the cooperative whole-handler deadline for both `challengeHandler` and
+`responseHandler`. The option is Schema-validated as an integer from 1,000 to
+60,000 milliseconds and defaults to 5,000; `Browser.fromSession` keeps that
+default. It cannot preempt synchronous handlers and does not change the separate
+`BrowserMock` evaluation deadline. A CloudFront `403` is exposed separately through
 `page.cloudFrontForbidden`, not reported as a solved challenge.
 
 The [Cloudflare research notes](research/cloudflare-integration.md) cover
@@ -192,7 +198,7 @@ response HTML never executes automatically.
 
 Return `Effect.succeedNone` to preserve the response, or `Effect.succeedSome({})`
 to retry the same URL (optional `url` and `headers` override the retry). Both hooks
-share `maxChallengeRetries` and the 5-second handler deadline; exhausted retries
+share `maxChallengeRetries` and `challengeHandlerTimeoutMs` (5 seconds by default); exhausted retries
 return the response without invoking either hook. Evaluation resources and cookie
 writes use the same lifetime as the challenge path. Omitting `responseHandler`
 adds no script execution or cookie reads.
@@ -223,7 +229,7 @@ invocation. `None` falls through; the first `Some` retry decision is returned
 unchanged and skips later handlers. Empty or all-declining compositions return
 `None`. Typed failures and interruption propagate immediately: a failed handler
 is not a decline, so errors do not trigger fallback. Navigation's existing
-5-second whole-handler deadline and `maxChallengeRetries` cover the entire
+whole-handler deadline (5 seconds by default) and `maxChallengeRetries` cover the entire
 composition; this helper adds no deadlines or retries. A retry decision is not
 proof of clearance—inspect the follow-up page.
 
@@ -647,8 +653,8 @@ evaluation limits are four frames, 32 combined script/frame nodes, 16 KiB of
 attribute data (8,192 characters per value), at most eight selected scripts per
 frame, and 64 KiB of aggregate source including the parent script. Frame loads
 share the existing eight-request and 1 MiB network-data budgets, the default
-2-second `BrowserMock` process deadline, and the 5-second whole challenge-handler
-deadline.
+2-second `BrowserMock` process deadline, and the whole challenge-handler
+deadline (5 seconds by default).
 
 By default the reviewed frame cookie is `null`, so child `document.cookie` is
 empty. Only an explicit `cookiePolicy: "same-origin"` grant for a frame whose
@@ -812,7 +818,7 @@ globals when using default async evaluation: that source runs inside an async
 wrapper, so local declarations are not shared globals. Bounded retention of
 unawaited natural work is not a guarantee of acquisition completion. The
 runtime defaults to a 2-second hard deadline; navigation also caps the whole
-handler at 5 seconds. Origin review/allowlisting does not provide an exact-byte
+handler at `challengeHandlerTimeoutMs` (5 seconds by default). Origin review/allowlisting does not provide an exact-byte
 asset integrity pin. Existing source, input, body, origin, credential, and
 network quotas still apply. For advanced per-response configuration, use the
 existing custom `challengeHandler` rather than a separate callback API.

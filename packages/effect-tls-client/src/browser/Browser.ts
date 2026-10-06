@@ -65,7 +65,7 @@ const SCRIPT_METHODS = new Set([
   "PUT",
 ]);
 /** Cooperative interruption deadline; it cannot preempt synchronous handlers. */
-const CHALLENGE_HANDLER_TIMEOUT = "5 seconds";
+const CHALLENGE_HANDLER_TIMEOUT_MS = 5_000;
 const LOCATION_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 const RedirectCount = NonNegativeInt.check(
@@ -105,6 +105,9 @@ export const BrowserSessionConfig = Schema.Struct({
   identity: Schema.optionalKey(BrowserIdentity),
   maxRedirects: Schema.optionalKey(RedirectCount),
   maxChallengeRetries: Schema.optionalKey(ChallengeCount),
+  challengeHandlerTimeoutMs: Schema.optionalKey(
+    Schema.Int.check(Schema.isBetween({ minimum: 1_000, maximum: 60_000 })),
+  ),
 });
 export interface BrowserSessionConfig extends Schema.Schema.Type<
   typeof BrowserSessionConfig
@@ -1198,13 +1201,18 @@ export interface BrowserSession {
 const makeBrowserSession = (
   transport: TlsSession,
   identity: BrowserIdentity,
-  limits: Pick<BrowserSessionConfig, "maxRedirects" | "maxChallengeRetries">,
+  limits: Pick<
+    BrowserSessionConfig,
+    "maxRedirects" | "maxChallengeRetries" | "challengeHandlerTimeoutMs"
+  >,
   handlers: BrowserHandlers,
   identityAlreadyConfigured = false,
 ): BrowserSession => {
   const maxRedirects = limits.maxRedirects ?? MAX_REDIRECTS;
   const maxChallengeRetries =
     limits.maxChallengeRetries ?? MAX_CHALLENGE_RETRIES;
+  const challengeHandlerTimeoutMs =
+    limits.challengeHandlerTimeoutMs ?? CHALLENGE_HANDLER_TIMEOUT_MS;
   const requestIdentityHeaders: ReadonlyArray<Pair> = identityAlreadyConfigured
     ? []
     : identity.headers;
@@ -1476,7 +1484,7 @@ const makeBrowserSession = (
             challenge === undefined ? "response handler" : "challenge handler";
           const resolution = yield* handler(context).pipe(
             Effect.timeoutOrElse({
-              duration: CHALLENGE_HANDLER_TIMEOUT,
+              duration: challengeHandlerTimeoutMs,
               orElse: () =>
                 Effect.fail(
                   new BrowserSessionError({

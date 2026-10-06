@@ -4,6 +4,7 @@ import * as Browser from "../packages/effect-tls-client/src/browser/index.js";
 import { CookiesJson } from "../packages/effect-tls-client/src/internal/Protocol.js";
 import { restrictHost, type LiveRule } from "./live-policy.js";
 
+const EVALUATION_TIMEOUT_MS = 25_000;
 const Target = Schema.Literals(["datadome", "cloudflare"]);
 type Target = typeof Target.Type;
 const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
@@ -297,7 +298,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
         );
         state.evaluationTimings.push({
           ms,
-          reachedBound: ms >= 5_000 - 250,
+          reachedBound: ms >= EVALUATION_TIMEOUT_MS - 250,
         });
       }
       if (success) state.evaluations.success++;
@@ -335,7 +336,11 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
             );
         });
       const browser = yield* Browser.open(
-        { transport: { profile: "chrome_152_PSK" }, maxChallengeRetries: 1 },
+        {
+          transport: { profile: "chrome_152_PSK" },
+          maxChallengeRetries: 1,
+          challengeHandlerTimeoutMs: 30_000,
+        },
         {
           scriptRuntime: {
             ...runtime,
@@ -393,7 +398,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     Browser.BrowserMock.layer({
       allowedOrigins,
       maxNetworkRequests: 16,
-      timeoutMs: 5_000,
+      timeoutMs: EVALUATION_TIMEOUT_MS,
     }).pipe(Layer.provide(services)),
   );
   return yield* program.pipe(Effect.provide(layers));

@@ -3,7 +3,9 @@ import { NodeServices } from "@effect/platform-node";
 import { createServer } from "node:http";
 import {
   ConfigProvider,
+  Deferred,
   Effect,
+  Fiber,
   Layer,
   Option,
   Predicate,
@@ -11,6 +13,7 @@ import {
   Stream,
 } from "effect";
 import * as Cookies from "effect/unstable/http/Cookies";
+import { TestClock } from "effect/testing";
 import type { TlsResponse, TlsSession } from "../src/TlsClient.js";
 import { TlsClient } from "../src/index.js";
 import * as Browser from "../src/browser/index.js";
@@ -63,6 +66,97 @@ const session = (
   bandwidth: Effect.succeed({ read: 0, written: 0 }),
   resetBandwidth: Effect.void,
   setProxy: () => Effect.void,
+});
+
+describe("handler deadline", () => {
+  for (const challengeHandlerTimeoutMs of [999, 60_001, 1.5]) {
+    it.effect(`rejects timeout ${challengeHandlerTimeoutMs} at open`, () =>
+      Effect.gen(function* () {
+        const error = yield* Browser.open({
+          transport: { profile: "chrome_152_PSK" },
+          challengeHandlerTimeoutMs,
+        }).pipe(
+          Effect.provide(
+            Layer.mock(TlsClient, {
+              session: () => Effect.die("unexpected transport acquisition"),
+            }),
+          ),
+          Effect.flip,
+        );
+        expect(error).toBeInstanceOf(Browser.BrowserSessionError);
+        expect(error).toHaveProperty("kind", "Config");
+      }),
+    );
+  }
+
+  for (const hook of ["challengeHandler", "responseHandler"] as const) {
+    for (const extended of [false, true]) {
+      it.effect(
+        `${hook} uses ${extended ? "configured" : "default"} deadline`,
+        () =>
+          Effect.gen(function* () {
+            const requests: Array<string> = [];
+            let closed = false;
+            const original = response(
+              URL,
+              403,
+              hook === "challengeHandler"
+                ? [["cf-mitigated", "challenge"]]
+                : [],
+              HTML,
+              Effect.sync(() => {
+                closed = true;
+              }),
+            );
+            const started = yield* Deferred.make<void>();
+            const handler = () =>
+              Deferred.succeed(started, undefined).pipe(
+                Effect.andThen(Effect.sleep("6 seconds")),
+                Effect.andThen(Effect.succeedNone),
+              );
+            const browser = yield* Browser.open(
+              extended
+                ? {
+                    transport: { profile: "chrome_152_PSK" },
+                    challengeHandlerTimeoutMs: 8_000,
+                  }
+                : { transport: { profile: "chrome_152_PSK" } },
+              { [hook]: handler },
+            ).pipe(
+              Effect.provide(
+                Layer.mock(TlsClient, {
+                  session: () =>
+                    Effect.succeed(session(requests, () => original)),
+                }),
+              ),
+            );
+            if (extended) {
+              const fiber = yield* browser.navigate(URL).pipe(Effect.forkChild);
+              yield* Deferred.await(started);
+              yield* TestClock.adjust("6 seconds");
+              const page = yield* Fiber.join(fiber);
+              expect(page.response).toBe(original);
+              expect(closed).toBe(false);
+            } else {
+              const fiber = yield* browser
+                .navigate(URL)
+                .pipe(Effect.flip, Effect.forkChild);
+              yield* Deferred.await(started);
+              yield* TestClock.adjust("5 seconds");
+              const error = yield* Fiber.join(fiber);
+              expect(error).toBeInstanceOf(Browser.BrowserSessionError);
+              expect(error).toHaveProperty("kind", "ChallengeLimit");
+              expect(error).toHaveProperty(
+                "message",
+                `${hook === "challengeHandler" ? "challenge" : "response"} handler timed out`,
+              );
+              expect(closed).toBe(true);
+            }
+            expect(requests).toEqual([URL]);
+          }),
+      );
+    }
+  }
 });
 
 describe("final navigation response hook", () => {
