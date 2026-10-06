@@ -18,8 +18,19 @@ const Cookies = Schema.fromJsonString(
 );
 
 describeLocal("bounded natural script work", () => {
-  for (const mode of ["cookie", "nested", "fetch", "xhr", "expiry"] as const) {
-    it.live(`retains unawaited script work: ${mode}`, () =>
+  for (const mode of [
+    "cookie",
+    "nested",
+    "fetch",
+    "xhr",
+    "expiry",
+    "document-failure",
+  ] as const) {
+    const title =
+      mode === "document-failure"
+        ? "flushes later document writes after resource failure"
+        : `retains unawaited script work: ${mode}`;
+    it.live(title, () =>
       Effect.scoped(
         Effect.gen(function* () {
           const paths: Array<string> = [];
@@ -29,7 +40,11 @@ describeLocal("bounded natural script work", () => {
             paths.push(route);
             if (route === "/page") {
               response.writeHead(202, { "x-amzn-waf-action": "challenge" });
-              response.end("local retention fixture");
+              response.end(
+                mode === "document-failure"
+                  ? '<!doctype html><html><head></head><body><script src="/missing.js"></script><script>document.cookie = "late=done; Path=/";</script></body></html>'
+                  : "local retention fixture",
+              );
             } else if (route === "/late.js") {
               if (mode === "expiry") return; // Hold until evaluation closes the request.
               response.setHeader("content-type", "text/javascript");
@@ -104,6 +119,21 @@ describeLocal("bounded natural script work", () => {
                 scriptRuntime: runtime,
                 challengeHandler: (_, context) =>
                   Effect.gen(function* () {
+                    if (mode === "document-failure") {
+                      const result = yield* Effect.result(
+                        context.evaluateDocument(),
+                      );
+                      expect(result._tag).toBe("Failure");
+                      if (result._tag === "Failure") {
+                        expect(result.failure._tag).toBe("BrowserScriptError");
+                        if (result.failure._tag === "BrowserScriptError")
+                          expect(result.failure.reason).toBe(
+                            "document script resource load failed",
+                          );
+                      }
+                      completion = "resource failure";
+                      return Option.none();
+                    }
                     completion = yield* context.evaluateClassic(`
                       if ("__waitForIdle" in globalThis || "__naturalWork" in globalThis) throw new Error("idle hook leaked");
                       const script = document.createElement("script");
@@ -118,7 +148,11 @@ describeLocal("bounded natural script work", () => {
             );
             const started = performance.now();
             const page = yield* browser.navigate(`${url}/page`);
-            expect(completion).toBe("root finished");
+            expect(completion).toBe(
+              mode === "document-failure"
+                ? "resource failure"
+                : "root finished",
+            );
             expect(page.status).toBe(202);
             const cookies = yield* Schema.decodeEffect(Cookies)(
               yield* browser.transport.exportCookies,
@@ -133,8 +167,13 @@ describeLocal("bounded natural script work", () => {
             } else {
               expect(cookies).toContainEqual({ name: "late", value: "done" });
               expect(followCookie).toContain("late=done");
+              if (mode === "document-failure")
+                expect(paths).toEqual(["/page", "/missing.js", "/follow"]);
               if (mode === "cookie") {
-                expect(cookies).toContainEqual({ name: "root", value: "done" });
+                expect(cookies).toContainEqual({
+                  name: "root",
+                  value: "done",
+                });
                 expect(followCookie).toContain("root=done");
               }
               if (mode === "nested") {

@@ -63,15 +63,18 @@ const run = (
   scripts: string,
   assets: Readonly<Record<string, string>> = {},
   classic = false,
+  allowedPathPrefixes?: ReadonlyArray<string>,
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
       const server = yield* fixture(assets, "/blocking.js");
       const writes: string[] = [];
+      const requests: string[] = [];
       const host: BrowserScriptHost = {
         request: (request) =>
           Effect.tryPromise({
             try: async () => {
+              requests.push(request.url);
               const url = new URL(request.url);
               if (url.origin !== server.url)
                 throw new Error("fixture origin is not allowed");
@@ -116,13 +119,17 @@ const run = (
           });
         return yield* runtime.evaluateDocument(context, host);
       }).pipe(
+        Effect.result,
         Effect.provide(
-          BrowserMock.layer({ allowedOrigins: [server.url] }).pipe(
-            Layer.provide(NodeServices.layer),
-          ),
+          BrowserMock.layer({
+            allowedOrigins: [server.url],
+            ...(allowedPathPrefixes === undefined
+              ? {}
+              : { allowedPathPrefixes: { [server.url]: allowedPathPrefixes } }),
+          }).pipe(Layer.provide(NodeServices.layer)),
         ),
       );
-      return { result, writes, paths: server.paths };
+      return { result, writes, paths: server.paths, requests };
     }),
   );
 
@@ -208,6 +215,7 @@ describe("explicit document script evaluation", () => {
             "/throw.js": 'throw new Error("external boom");',
           },
         );
+        expect(output.result._tag).toBe("Success");
         expect(output.writes).toHaveLength(3);
         expect(output.writes[0]).toMatch(/^error=true:/);
         expect(output.writes.slice(1)).toEqual([
@@ -231,9 +239,118 @@ describe("explicit document script evaluation", () => {
         );
         expect(output.writes).toEqual(["trace=A,B,C"]);
         expect(output.paths).toEqual(["/blocking.js"]);
-        expect(output.result.value).toBe("");
+        expect(output.result._tag).toBe("Success");
+        if (output.result._tag === "Success")
+          expect(output.result.success.value).toBe("");
       }),
   );
+
+  for (const src of [
+    "trusted/../trusted/asset.js",
+    "/trusted/%2e/asset.js",
+    "/trusted/%2e%2e/trusted/asset.js",
+    "/trusted/%252fasset.js",
+  ] as const) {
+    it.live(`denies raw ambiguous static src before the host: ${src}`, () =>
+      Effect.gen(function* () {
+        const output = yield* run(
+          `<script src="${src}"></script><script>document.cookie = "later=done";</script>`,
+          { "/trusted/asset.js": 'document.cookie = "unexpected=loaded";' },
+          false,
+          ["/trusted/"],
+        );
+        expect(output.requests).toEqual([]);
+        expect(output.paths).toEqual([]);
+        expect(output.writes).toEqual(["later=done"]);
+        expect(output.result._tag).toBe("Failure");
+        if (output.result._tag === "Failure")
+          expect(output.result.failure.reason).toBe(
+            "document script resource load failed",
+          );
+      }),
+    );
+  }
+
+  it.live("allows canonical relative static src under the path policy", () =>
+    Effect.gen(function* () {
+      const output = yield* run(
+        '<script src="trusted/asset.js"></script><script>document.cookie = "later=done";</script>',
+        { "/trusted/asset.js": 'document.cookie = "external=done";' },
+        false,
+        ["/trusted/"],
+      );
+      expect(output.result._tag).toBe("Success");
+      expect(output.requests).toHaveLength(1);
+      expect(output.paths).toEqual(["/trusted/asset.js"]);
+      expect(output.writes).toEqual(["external=done", "later=done"]);
+    }),
+  );
+
+  it.live(
+    "uses the validated script reply URL for relative error filenames",
+    () =>
+      Effect.gen(function* () {
+        const output = yield* run(
+          `<script>window.addEventListener("error", event => {
+          document.cookie = "filename=" + (event.filename === location.origin + "/trusted/asset.js");
+        });</script><script src="trusted/asset.js"></script>`,
+          { "/trusted/asset.js": 'throw "authored fixture";' },
+          false,
+          ["/trusted/"],
+        );
+        expect(output.result._tag).toBe("Success");
+        expect(output.writes).toEqual(["filename=true"]);
+      }),
+  );
+
+  for (const src of [
+    "/trusted/../trusted/frame",
+    "/trusted/%2e/frame",
+  ] as const) {
+    it.live(
+      `preserves raw frame src for denial before the frame host: ${src}`,
+      () =>
+        Effect.gen(function* () {
+          const runtime = yield* BrowserMock;
+          let frameCalls = 0;
+          const host: BrowserScriptHost = {
+            request: () =>
+              Effect.fail(
+                new BrowserScriptError({ reason: "unexpected request" }),
+              ),
+            setCookie: () => Effect.succeed(""),
+            loadFrame: () => {
+              frameCalls++;
+              return Effect.fail(
+                new BrowserScriptError({ reason: "no frame grant" }),
+              );
+            },
+          };
+          const result = yield* runtime.evaluate(
+            `const frame = document.createElement("iframe");
+           frame.src = ${JSON.stringify(src)};
+           const denied = new Promise(resolve => { frame.onerror = () => resolve("denied"); });
+           document.body.appendChild(frame);
+           return await denied;`,
+            {
+              url: "https://allowed.test/page",
+              cookie: "",
+              userAgent: "fixture",
+            },
+            host,
+          );
+          expect(result.value).toBe("denied");
+          expect(frameCalls).toBe(0);
+        }).pipe(
+          Effect.provide(
+            BrowserMock.layer({
+              allowedOrigins: ["https://allowed.test"],
+              allowedPathPrefixes: { "https://allowed.test": ["/trusted/"] },
+            }).pipe(Layer.provide(NodeServices.layer)),
+          ),
+        ),
+    );
+  }
 
   it.live("runs defer after inline, async on load, and awaits both", () =>
     Effect.gen(function* () {
@@ -256,6 +373,7 @@ describe("explicit document script evaluation", () => {
         "trace=A,C,async,blocking,defer",
       ]);
       expect(output.paths).toEqual(["/async.js", "/blocking.js", "/defer.js"]);
+      expect(output.result._tag).toBe("Success");
     }),
   );
 
@@ -277,6 +395,61 @@ describe("explicit document script evaluation", () => {
           "later=done",
         ]);
         expect(output.paths).toEqual(["/missing.js"]);
+        expect(output.result._tag).toBe("Failure");
+        if (output.result._tag === "Failure") {
+          expect(output.result.failure._tag).toBe("BrowserScriptError");
+          expect(output.result.failure.reason).toBe(
+            "document script resource load failed",
+          );
+        }
+      }),
+  );
+
+  for (const scheduling of ["", "defer", "async"] as const) {
+    for (const src of [
+      "https://denied.test/asset.js",
+      "/missing.js",
+    ] as const) {
+      it.live(
+        `fails after later scripts finish: ${scheduling || "blocking"} ${src}`,
+        () =>
+          Effect.gen(function* () {
+            const output = yield* run(
+              `<script ${scheduling} src="${src}"></script>
+             <script>document.cookie = "later=inline";</script>
+             <script defer src="/later.js"></script>`,
+              { "/later.js": 'document.cookie = "later=external";' },
+            );
+            expect(output.writes).toEqual(["later=inline", "later=external"]);
+            expect(output.paths).toEqual(
+              src === "/missing.js"
+                ? ["/missing.js", "/later.js"]
+                : ["/later.js"],
+            );
+            expect(output.result._tag).toBe("Failure");
+            if (output.result._tag === "Failure") {
+              expect(output.result.failure._tag).toBe("BrowserScriptError");
+              expect(output.result.failure.reason).toBe(
+                "document script resource load failed",
+              );
+            }
+          }),
+      );
+    }
+  }
+
+  it.live(
+    "reports inline throws without treating them as resource failures",
+    () =>
+      Effect.gen(function* () {
+        const output = yield* run(
+          `<script>window.addEventListener("error", () => { document.cookie = "reported=inline"; });</script>
+         <script>throw new Error("authored inline failure");</script>
+         <script>document.cookie = "later=done";</script>`,
+        );
+        expect(output.result._tag).toBe("Success");
+        expect(output.writes).toEqual(["reported=inline", "later=done"]);
+        expect(output.paths).toEqual([]);
       }),
   );
 
@@ -289,7 +462,9 @@ describe("explicit document script evaluation", () => {
             'document.cookie = "external=done"; setTimeout(() => { document.cookie = "timer=done"; }, 0);',
         });
         expect(output.writes).toEqual(["external=done", "timer=done"]);
-        expect(output.result.setCookies).toEqual([]);
+        expect(output.result._tag).toBe("Success");
+        if (output.result._tag === "Success")
+          expect(output.result.success.setCookies).toEqual([]);
       }),
   );
 
@@ -303,6 +478,7 @@ describe("explicit document script evaluation", () => {
          <script type=" Application/JavaScript ">document.cookie = "classic=two";</script>
          <script type="">document.cookie = "classic=three";</script>`,
       );
+      expect(output.result._tag).toBe("Success");
       expect(output.paths).toEqual([]);
       expect(output.writes).toEqual([
         "classic=one",
@@ -321,6 +497,7 @@ describe("explicit document script evaluation", () => {
       );
       expect(output.paths).toEqual([]);
       expect(output.writes).toEqual(["classic=done"]);
+      expect(output.result._tag).toBe("Success");
     }),
   );
 
@@ -336,6 +513,7 @@ describe("explicit document script evaluation", () => {
         },
       );
       expect(output.writes).toEqual(["trusted=done"]);
+      expect(output.result._tag).toBe("Success");
     }),
   );
 });

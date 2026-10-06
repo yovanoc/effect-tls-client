@@ -1864,7 +1864,7 @@ export const makeBrowserScriptRunnerSource = (
     const id = ++nextRequestId;
     const task = new NativePromise((resolve, reject) => {
       pending.set(id, { resolve, reject, kind: "frame" });
-      if (!postLine(jsonStringify({ type: "frame.load", id, url: state.src }))) {
+      if (!postLine(jsonStringify({ type: "frame.load", id, url: state.attributes.get("src") }))) {
         pending.delete(id); reject(new NativeTypeError("frame IPC budget exceeded"));
       }
     });
@@ -2411,15 +2411,16 @@ const runReportedClassic = (source, filename, muted = false) => {
   }
 };
 const runDocument = async (input) => {
-  const deferred = [], asynchronous = [], resourceFailures = [];
+  const deferred = [], asynchronous = [];
+  let resourceFailed = false;
   const load = async (attributes) => {
     try {
       if (attributes.get("integrity") || attributes.has("crossorigin")) throw new Error("script integrity/crossorigin is unsupported");
-      const url = new URL(attributes.get("src"), input.url).href;
-      await invokeInRealm(context, documentScriptLoaders.get(context), url);
-    } catch (cause) {
+      // Preserve raw spelling for the parent's before-send path policy.
+      await invokeInRealm(context, documentScriptLoaders.get(context), attributes.get("src"));
+    } catch {
       // Snapshot nodes are readonly: record resource failures, but do not dispatch element error events.
-      resourceFailures.push(safeMessage(cause));
+      resourceFailed = true;
     }
   };
   for (const node of input.documentRoot.nodes) {
@@ -2435,6 +2436,7 @@ const runDocument = async (input) => {
   }
   for (const attributes of deferred) await load(attributes);
   await Promise.all(asynchronous);
+  if (resourceFailed) throw "document script resource load failed";
 };
 const createRealm = (input, childRealm) => {
   // Local handles never name another realm's native keys; the eight-key cap stays global.
