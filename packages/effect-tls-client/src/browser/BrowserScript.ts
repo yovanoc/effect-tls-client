@@ -1,9 +1,15 @@
-import { Duration, Effect, Schema, type Option } from "effect";
+import { Clock, Context, Duration, Effect, Schema, type Option } from "effect";
 
 import { DOCUMENT_INPUT_RULES } from "./HtmlSnapshot.js";
 
 const MAX_SOURCE_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
+
+/** Internal, host-clock deadline shared with the native runtime; never sent to the guest. */
+export const ScriptEvaluationDeadline = Context.Reference<bigint | undefined>(
+  "effect-tls-client/browser/ScriptEvaluationDeadline",
+  { defaultValue: () => undefined },
+);
 
 /** Errors returned by a caller-supplied browser script runtime. */
 export class BrowserScriptError extends Schema.TaggedError<BrowserScriptError>()(
@@ -242,6 +248,9 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
       });
     }
 
+    const timeoutMs = runtime.timeoutMs ?? 2_000;
+    const deadline =
+      (yield* Clock.monotonicTimeNanos) + BigInt(timeoutMs) * 1_000_000n;
     const result = yield* Effect.try({
       try: () => evaluate.call(runtime, source, context, host),
       catch: (cause) =>
@@ -251,8 +260,9 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
         }),
     }).pipe(
       Effect.flatMap((effect) => effect),
+      Effect.provideService(ScriptEvaluationDeadline, deadline),
       Effect.timeoutOrElse({
-        duration: Duration.millis(runtime.timeoutMs ?? 2_000),
+        duration: Duration.millis(timeoutMs),
         orElse: () =>
           Effect.fail(
             new BrowserScriptError({ reason: "script evaluation timed out" }),

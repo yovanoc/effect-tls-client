@@ -15,7 +15,10 @@ interface RunnerLimits {
   readonly maxTimerDelayMs: number;
 }
 
-export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
+export const makeBrowserScriptRunnerSource = (
+  limits: RunnerLimits,
+  deadlineNanos?: bigint,
+): string => {
   const bootstrap = String.raw`
 (() => {
   const post = __post;
@@ -2519,7 +2522,12 @@ const start = (input) => {
     }
     if (!consumeBudget("node", snapshot.nodes.length) || !consumeBudget("attribute", bytes)) throw new Error("document snapshot budget exceeded");
   }
-  rootInput = input; deadline = hostMonotonicNow() + input.timeoutMs;
+  // Translate the parent's OS monotonic deadline into this process's performance
+  // clock. Standalone runners have no host deadline; BrowserMock always supplies it.
+  const nativeDeadline = ${deadlineNanos === undefined ? "undefined" : `${deadlineNanos}n`};
+  const remainingMs = nativeDeadline === undefined ? input.timeoutMs : Math.min(input.timeoutMs, Number(nativeDeadline - process.hrtime.bigint()) / 1e6);
+  if (remainingMs <= 0) throw new Error("script evaluation timed out");
+  rootInput = input; deadline = hostMonotonicNow() + remainingMs;
   setTimeout(() => writeFinal({ ok: false, reason: "script evaluation timed out" }), Math.max(1, Math.ceil(deadline - hostMonotonicNow())));
   context = createRealm(input, false);
   // Capture trusted helpers before guest evaluation, without enclosing guest source.

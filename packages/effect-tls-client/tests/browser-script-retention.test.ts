@@ -1,6 +1,9 @@
 import { describe, expect, it } from "@effect/vitest";
 import { NodeServices } from "@effect/platform-node";
 import { createServer } from "node:http";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ConfigProvider, Effect, Layer, Option, Schema } from "effect";
 import * as Browser from "../src/browser/index.js";
 import { TlsClient } from "../src/index.js";
@@ -198,6 +201,93 @@ describe("natural timer retention", () => {
             expect(performance.now() - started).toBeLessThan(350);
         }
       }).pipe(Effect.provide(services)),
+    );
+  }
+});
+
+describe("shared evaluation deadline", () => {
+  for (const mode of ["classic", "async", "document"] as const) {
+    it.live(
+      `expires retained work after delayed startup: ${mode}`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const directory = yield* Effect.acquireRelease(
+              Effect.promise(() =>
+                mkdtemp(join(tmpdir(), "browser-deadline-")),
+              ),
+              (directory) =>
+                Effect.promise(() =>
+                  rm(directory, { recursive: true, force: true }),
+                ),
+            );
+            const executable = join(directory, "delayed-node");
+            yield* Effect.promise(() =>
+              writeFile(executable, '#!/bin/sh\nsleep 0.25\nexec node "$@"\n'),
+            );
+            yield* Effect.promise(() => chmod(executable, 0o700));
+            yield* Effect.gen(function* () {
+              const runtime = yield* Browser.BrowserMock;
+              const source = 'setInterval(() => {}, 100); "done";';
+              const started = performance.now();
+              const result = yield* Browser.runBoundedScript(
+                runtime,
+                mode === "async"
+                  ? 'setInterval(() => {}, 100); return "done";'
+                  : mode === "document"
+                    ? ""
+                    : source,
+                {
+                  url: "https://allowed.test/page",
+                  cookie: "",
+                  userAgent: "fixture",
+                  ...(mode === "document"
+                    ? {
+                        document: `<!doctype html><html><head><script>${source}</script></head><body></body></html>`,
+                      }
+                    : {}),
+                },
+                undefined,
+                mode,
+              );
+              expect(result.value).toBe(mode === "document" ? "" : "done");
+              expect(performance.now() - started).toBeGreaterThan(2500);
+              expect(performance.now() - started).toBeLessThan(3000);
+            }).pipe(
+              Effect.provide(
+                Browser.BrowserMock.layer({ executable, timeoutMs: 3000 }).pipe(
+                  Layer.provide(NodeServices.layer),
+                ),
+              ),
+            );
+          }),
+        ),
+      { timeout: 5000 },
+    );
+  }
+  for (const source of ["new Promise(() => {});", "while (true) {}"] as const) {
+    it.live(`still fails unfinished execution: ${source}`, () =>
+      Effect.gen(function* () {
+        const runtime = yield* Browser.BrowserMock;
+        const result = yield* Effect.result(
+          Browser.runBoundedScript(
+            runtime,
+            source,
+            undefined,
+            undefined,
+            "classic",
+          ),
+        );
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure.reason).toMatch(/timed out/);
+      }).pipe(
+        Effect.provide(
+          Browser.BrowserMock.layer({ timeoutMs: 500 }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
     );
   }
 });

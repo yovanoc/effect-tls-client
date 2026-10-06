@@ -1,4 +1,5 @@
 import {
+  Clock,
   Context,
   Duration,
   Effect,
@@ -11,6 +12,7 @@ import {
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import {
+  ScriptEvaluationDeadline,
   FrameLoadResult,
   BrowserScriptContext,
   BrowserScriptMode,
@@ -281,23 +283,26 @@ const RunnerInputMessage = Schema.Union([
 const RunnerStartJson = Schema.fromJsonString(RunnerStart);
 const RunnerMessageJson = Schema.fromJsonString(RunnerMessage);
 
-const makeRunnerSource = (maxNetworkRequests: number) =>
-  makeBrowserScriptRunnerSource({
-    maxTimeoutMs: MAX_TIMEOUT_MS,
-    maxInputLineBytes: MAX_INPUT_LINE_BYTES,
-    maxControlInputLineBytes: MAX_CONTROL_INPUT_LINE_BYTES,
-    maxOutputLineBytes: MAX_OUTPUT_LINE_BYTES,
-    maxOutputBytes: MAX_OUTPUT_BYTES,
-    maxCookieBytes: MAX_COOKIE_BYTES,
-    maxNetworkRequests,
-    maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES,
-    maxTotalNetworkBytes: MAX_TOTAL_NETWORK_BYTES,
-    maxHeaders: MAX_SCRIPT_HEADERS,
-    maxHeaderBytes: MAX_SCRIPT_HEADER_BYTES,
-    maxCookieWrites: MAX_COOKIE_WRITES,
-    maxTimers: MAX_TIMERS,
-    maxTimerDelayMs: MAX_TIMER_DELAY_MS,
-  });
+const makeRunnerSource = (maxNetworkRequests: number, deadlineNanos: bigint) =>
+  makeBrowserScriptRunnerSource(
+    {
+      maxTimeoutMs: MAX_TIMEOUT_MS,
+      maxInputLineBytes: MAX_INPUT_LINE_BYTES,
+      maxControlInputLineBytes: MAX_CONTROL_INPUT_LINE_BYTES,
+      maxOutputLineBytes: MAX_OUTPUT_LINE_BYTES,
+      maxOutputBytes: MAX_OUTPUT_BYTES,
+      maxCookieBytes: MAX_COOKIE_BYTES,
+      maxNetworkRequests,
+      maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES,
+      maxTotalNetworkBytes: MAX_TOTAL_NETWORK_BYTES,
+      maxHeaders: MAX_SCRIPT_HEADERS,
+      maxHeaderBytes: MAX_SCRIPT_HEADER_BYTES,
+      maxCookieWrites: MAX_COOKIE_WRITES,
+      maxTimers: MAX_TIMERS,
+      maxTimerDelayMs: MAX_TIMER_DELAY_MS,
+    },
+    deadlineNanos,
+  );
 
 interface Output {
   readonly result?: Schema.Schema.Type<typeof RunnerOutput>;
@@ -331,6 +336,14 @@ const makeEvaluate = (
     },
     host?: BrowserScriptHost,
   ): Effect.fn.Return<BrowserScriptResult, BrowserScriptError> {
+    const now = yield* Clock.monotonicTimeNanos;
+    const ownDeadline =
+      now + BigInt(options.timeoutMs ?? DEFAULT_TIMEOUT_MS) * 1_000_000n;
+    const outerDeadline = yield* ScriptEvaluationDeadline;
+    const deadline =
+      outerDeadline === undefined || ownDeadline < outerDeadline
+        ? ownDeadline
+        : outerDeadline;
     context = yield* Schema.decodeEffect(BrowserScriptContext)(context).pipe(
       Effect.mapError(
         (cause) =>
@@ -483,6 +496,11 @@ const makeEvaluate = (
     }
     const output = yield* Effect.scoped(
       Effect.gen(function* () {
+        // hrtime uses the OS monotonic clock in Node and Bun, shared by parent
+        // and child. Translate the Effect clock's remaining duration, not its origin.
+        const remainingNanos = deadline - (yield* Clock.monotonicTimeNanos);
+        const nativeDeadline =
+          globalThis.process.hrtime.bigint() + remainingNanos;
         const handle = yield* spawner
           .spawn(
             ChildProcess.make(
@@ -490,7 +508,7 @@ const makeEvaluate = (
               [
                 "--permission",
                 "-e",
-                makeRunnerSource(options.maxNetworkRequests),
+                makeRunnerSource(options.maxNetworkRequests, nativeDeadline),
               ],
               {
                 detached: true,
@@ -1065,7 +1083,11 @@ const makeEvaluate = (
           }
           if (!collected.result.ok) {
             return yield* new BrowserScriptError({
-              reason: collected.result.reason,
+              reason: collected.result.reason.startsWith(
+                "Script execution timed out after ",
+              )
+                ? collected.result.reason + "; process terminated"
+                : collected.result.reason,
               hostBoundary: "ChildReportedFailure",
             });
           }
@@ -1094,7 +1116,7 @@ const makeEvaluate = (
         return yield* Effect.raceFirst(
           wait,
           Effect.sleep(
-            Duration.millis(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+            Duration.nanos(ownDeadline - (yield* Clock.monotonicTimeNanos)),
           ).pipe(Effect.andThen(terminate(timeoutError()))),
         );
       }),
