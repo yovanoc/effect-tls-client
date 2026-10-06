@@ -1,3 +1,5 @@
+import { Schema } from "effect";
+
 const MAX_ALLOWED_ORIGINS = 32;
 
 const parseUrl = (input: string, base?: string): URL => {
@@ -43,12 +45,48 @@ export const normalizeAllowedOrigins = (
   ];
 };
 
+// Reject rather than normalize path spelling that intermediaries may interpret differently.
+const isUnambiguousPath = (path: string): boolean =>
+  !/[\\%\s\u0000-\u001f\u007f?#]/u.test(path) &&
+  !path.includes("//") &&
+  !path.split("/").some((segment) => segment === "." || segment === "..");
+
+export const AllowedPathPrefixes = Schema.Record(
+  Schema.String,
+  Schema.Array(
+    Schema.String.check(
+      Schema.makeFilter(
+        (prefix) =>
+          prefix.startsWith("/") &&
+          isUnambiguousPath(prefix) &&
+          new URL(prefix, "https://path-policy.invalid").pathname === prefix,
+      ),
+    ),
+  ),
+).check(
+  Schema.makeFilter((mapping) =>
+    Object.keys(mapping).every((origin) => {
+      try {
+        return normalizeAllowedOrigins([origin])[0] === origin;
+      } catch {
+        return false;
+      }
+    }),
+  ),
+);
+
+export const ScriptPolicy = Schema.Struct({
+  allowedPathPrefixes: Schema.optionalKey(AllowedPathPrefixes),
+});
+export interface ScriptPolicy extends Schema.Schema.Type<typeof ScriptPolicy> {}
+
 export const scriptOrigin = (input: string): string => parseUrl(input).origin;
 
 export const resolveAllowedUrl = (
   input: string,
   base: string,
   allowedOrigins: ReadonlyArray<string>,
+  allowedPathPrefixes?: Readonly<Record<string, ReadonlyArray<string>>>,
 ): URL => {
   const url = parseUrl(input, base);
   if (
@@ -58,6 +96,33 @@ export const resolveAllowedUrl = (
     !allowedOrigins.includes(url.origin)
   ) {
     throw new TypeError(`script network origin is not allowed: ${url.origin}`);
+  }
+  const prefixes =
+    allowedPathPrefixes !== undefined &&
+    Object.hasOwn(allowedPathPrefixes, url.origin)
+      ? allowedPathPrefixes[url.origin]
+      : undefined;
+  if (prefixes !== undefined) {
+    // Check raw spelling: WHATWG URL erases dot segments and backslashes.
+    const reference = input.split(/[?#]/u)[0] ?? "";
+    const path = reference.replace(/^(?:https?:)?\/\/[^/]*/iu, "");
+    if (
+      /[\\\s\u0000-\u001f\u007f]/u.test(reference) ||
+      !isUnambiguousPath(path) ||
+      !isUnambiguousPath(url.pathname)
+    ) {
+      throw new TypeError("ambiguous script network path");
+    }
+  }
+  if (
+    prefixes !== undefined &&
+    !prefixes.some(
+      (prefix) =>
+        url.pathname === prefix ||
+        url.pathname.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`),
+    )
+  ) {
+    throw new TypeError(`script network path is not allowed: ${url.pathname}`);
   }
   url.hash = "";
   return url;

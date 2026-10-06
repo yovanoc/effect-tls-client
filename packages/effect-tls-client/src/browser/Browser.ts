@@ -27,6 +27,7 @@ import {
 } from "./BrowserScript.js";
 import {
   normalizeAllowedOrigins,
+  ScriptPolicy,
   resolveAllowedUrl,
   scriptOrigin,
 } from "./ScriptPolicy.js";
@@ -688,6 +689,7 @@ const makeScriptHost = (
   identityHeaders: ReadonlyArray<Pair>,
   headerOrder: ReadonlyArray<string> | undefined,
   allowedOrigins: ReadonlyArray<string>,
+  allowedPathPrefixes: ScriptPolicy["allowedPathPrefixes"],
   maxNetworkRequests: number,
   frameReviewer: BrowserFrameReviewer | undefined,
   rootSourceBytes: number,
@@ -785,7 +787,12 @@ const makeScriptHost = (
         });
         let target = yield* Effect.try({
           try: () => {
-            const url = resolveAllowedUrl(input.url, pageUrl, allowedOrigins);
+            const url = resolveAllowedUrl(
+              input.url,
+              pageUrl,
+              allowedOrigins,
+              allowedPathPrefixes,
+            );
             if (
               input.kind === "frame" &&
               scriptOrigin(pageUrl).startsWith("https://") &&
@@ -913,6 +920,7 @@ const makeScriptHost = (
                   response.url,
                   target.toString(),
                   allowedOrigins,
+                  allowedPathPrefixes,
                 );
                 if (
                   final.origin !== target.origin ||
@@ -946,6 +954,7 @@ const makeScriptHost = (
                     location,
                     target.toString(),
                     allowedOrigins,
+                    allowedPathPrefixes,
                   ),
                 catch: (cause) =>
                   new BrowserScriptError({
@@ -1258,6 +1267,17 @@ const makeBrowserSession = (
             cause,
           }),
       });
+      const policy = yield* Schema.decodeUnknownEffect(ScriptPolicy)(
+        runtime,
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new BrowserScriptError({
+              reason: "invalid script network path policy",
+              cause,
+            }),
+        ),
+      );
       const maxNetworkRequests = yield* Schema.decodeEffect(
         Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })),
       )(runtime.maxNetworkRequests ?? 8).pipe(
@@ -1287,6 +1307,7 @@ const makeBrowserSession = (
         requestIdentityHeaders,
         requestHeaderOrder,
         allowedOrigins,
+        policy.allowedPathPrefixes,
         maxNetworkRequests,
         handlers.frameReviewer,
         new TextEncoder().encode(rootSource).byteLength,

@@ -178,6 +178,10 @@ export interface BrowserScriptRuntime {
     host?: BrowserScriptHost,
   ) => Effect.Effect<BrowserScriptResult, BrowserScriptError>;
   readonly allowedOrigins?: ReadonlyArray<string>;
+  /** Optional per-origin pathname restrictions, checked before each script network hop. */
+  readonly allowedPathPrefixes?: Readonly<
+    Record<string, ReadonlyArray<string>>
+  >;
   /** Per-evaluation request cap, including redirects: integer 1–16, default 8. */
   readonly maxNetworkRequests?: number;
   readonly timeoutMs?: number;

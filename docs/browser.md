@@ -35,8 +35,10 @@ no source changes or shims, a 25-second runtime deadline,
 a 30-second handler deadline, and
 16 network requests per evaluation. DataDome permits only the page, `js.datadome.co`,
 and `api-js.datadome.co` origins; Cloudflare guest requests additionally require
-`/cdn-cgi/challenge-platform/`. Host-call counters exclude internal redirect hops;
-the library checks their origins, but the host wrapper cannot check their paths.
+`/cdn-cgi/challenge-platform/`, enforced by the runtime's `allowedPathPrefixes`
+on initial requests and every redirect hop before sending. Host-call counters
+exclude internal redirect hops; these still undergo the library's origin and
+configured path checks.
 It prints one schema-encoded, bounded receipt with counts, booleans, one rounded
 evaluation timing, and `failureClass` (`NONE`, `TIMEOUT`, `SCRIPT`, or `OTHER`).
 Classification uses only known error tags and Exit/Cause variants, never error
@@ -732,6 +734,37 @@ const runtimeLayer = Browser.BrowserMock.layer({
   allowedOrigins: ["https://challenge.example.test"],
 });
 ```
+
+Optional `allowedPathPrefixes?: Readonly<Record<string, ReadonlyArray<string>>>`
+restricts paths independently of the origin allowlist:
+
+```ts
+const runtimeLayer = Browser.BrowserMock.layer({
+  allowedOrigins: ["https://challenge.example.test"],
+  allowedPathPrefixes: {
+    "https://challenge.example.test": ["/trusted-challenge/"],
+  },
+});
+```
+
+Keys must be exact canonical allowed HTTP(S) origins (no trailing slash,
+credentials, path, query, or fragment; HTTP remains loopback-only). This field
+never grants an origin. Missing field or missing origin entry preserves the
+existing origin-only policy; an empty prefix list denies every path on that
+origin. Prefixes are absolute canonical pathnames: `/trusted` matches exactly
+`/trusted` and descendants under `/trusted/`, never `/trusted-other`;
+`/trusted/` matches that directory and descendants, not `/trusted`. `/` permits
+all unambiguous paths. Queries and fragments do not participate in matching.
+Configuration is Schema-validated; noncanonical origin keys and path prefixes
+reject instead of being silently rewritten. Restricted requests reject dot
+segments, repeated slashes, backslashes, whitespace/control characters,
+percent-encoded paths (including encoded separators and double encoding), and
+noncanonical URL-encoded path spellings. Use literal canonical paths; query
+encoding remains allowed. The shared host validator checks the initial URL and
+every redirect **before sending**, for fetch, XHR, scripts, and reviewed frames.
+Script requests disable Go's automatic redirects and follow validated hops
+through the same scoped TlsSession, preserving Go-owned cookies/TLS/Profile.
+Navigation and raw transport policy are unchanged.
 
 ### `BrowserScriptError.hostBoundary`
 

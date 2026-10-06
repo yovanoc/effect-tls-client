@@ -25,6 +25,7 @@ import { makeBrowserScriptRunnerSource } from "./BrowserScriptRunner.js";
 import { parseHtmlDocument, parseHtmlSnapshot } from "./HtmlSnapshot.js";
 import {
   normalizeAllowedOrigins,
+  AllowedPathPrefixes,
   resolveAllowedUrl,
   scriptOrigin,
 } from "./ScriptPolicy.js";
@@ -685,6 +686,7 @@ const makeEvaluate = (
                     event.url,
                     context.url,
                     options.allowedOrigins ?? [],
+                    options.allowedPathPrefixes,
                   ).toString(),
                 catch: (cause) =>
                   new BrowserScriptError({
@@ -855,6 +857,7 @@ const makeEvaluate = (
                       event.url,
                       context.url,
                       options.allowedOrigins ?? [],
+                      options.allowedPathPrefixes,
                     ).href,
                   catch: (cause) =>
                     new BrowserScriptError({
@@ -892,6 +895,7 @@ const makeEvaluate = (
                       frame.url,
                       context.url,
                       options.allowedOrigins ?? [],
+                      options.allowedPathPrefixes,
                     );
                     if (
                       frame.parentUrl !== context.url ||
@@ -1130,6 +1134,7 @@ const makeEvaluate = (
 export const BrowserMockOptions = Schema.Struct({
   executable: Schema.optionalKey(Schema.String),
   allowedOrigins: Schema.optionalKey(Schema.Array(Schema.String)),
+  allowedPathPrefixes: Schema.optionalKey(AllowedPathPrefixes),
   timeoutMs: Schema.optionalKey(TimeoutMs),
   maxNetworkRequests: Schema.optionalKey(
     Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })),
@@ -1180,6 +1185,9 @@ export class BrowserMock extends Context.Service<
         return BrowserMock.of({
           allowedOrigins,
           maxNetworkRequests,
+          ...(options.allowedPathPrefixes === undefined
+            ? {}
+            : { allowedPathPrefixes: options.allowedPathPrefixes }),
           timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           evaluateDocument: (context, host) =>
             makeEvaluate(
