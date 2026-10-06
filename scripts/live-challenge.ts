@@ -1,6 +1,7 @@
 import { Cause, Clock, Effect, Exit, Layer, Option, Schema } from "effect";
 import { TlsClient } from "../packages/effect-tls-client/src/TlsClient.js";
 import * as Browser from "../packages/effect-tls-client/src/browser/index.js";
+import { parseHtmlDocument } from "../packages/effect-tls-client/src/browser/HtmlSnapshot.js";
 import { CookiesJson } from "../packages/effect-tls-client/src/internal/Protocol.js";
 import {
   countHostCall,
@@ -165,20 +166,22 @@ export const classifyEvaluation = Effect.fnUntraced(function* (
   );
 });
 /**
- * Effect execution attempts observed by the harness. `request` includes policy
- * denials; `scriptLoad` is its `kind: "script"` subset. `setCookie` counts the
- * callback's Effect execution, and `exportCookies` counts evaluation of the
- * transport's Effect-valued property. Counts saturate at 256. None indicates
- * delivery, Jar acceptance, script execution, or operation success; internal
- * redirects and library-internal cookie reads are outside this wrapper.
+ * Host operations observed at the wrapped callback boundary. `request` includes
+ * denials made by `restrictHost`; `scriptLoad` is its `kind: "script"` subset.
+ * Earlier BrowserMock policy denials and library-internal redirect hops do not
+ * reach this wrapper. `setCookie` counts callback Effect execution, and
+ * `exportCookies` counts evaluation of the transport's Effect-valued property.
+ * Counts saturate at 256; none indicates delivery, Jar acceptance, script
+ * execution, or operation success.
  */
 export const Receipt = Schema.Struct({
   kind: Schema.Literal("LIVE_CHALLENGE"),
   target: Target,
   initialStatus: Schema.Number,
+  initialChallengeUrlMatches: Schema.Boolean,
   initialRecognizedChallenge: Schema.Boolean,
   initialMarkersPresent: Schema.Boolean,
-  hookInvoked: Schema.Boolean,
+  hookInvocations: HostCallCount,
   inlinePrograms: Count,
   evaluationTimings: Schema.Array(
     Schema.Struct({ ms: Count, reachedBound: Schema.Boolean }),
@@ -194,7 +197,11 @@ export const Receipt = Schema.Struct({
   }),
   staticScriptsNotAllowed: Count,
   iframes: Count,
-  evaluations: Schema.Struct({ success: Count, failure: Count }),
+  evaluations: Schema.Struct({
+    attempts: HostCallCount,
+    success: HostCallCount,
+    failure: HostCallCount,
+  }),
   failureClass: FailureClass,
   failureReason: FailureReason,
   network: Schema.Struct({ allowed: Count, denied: Count }),
@@ -204,6 +211,7 @@ export const Receipt = Schema.Struct({
   providerCookieChanged: Schema.Boolean,
   retried: Schema.Boolean,
   finalStatus: Schema.NullOr(Schema.Number),
+  redirectCount: Schema.NullOr(Count),
   finalRedirected: Schema.Boolean,
   finalChallengeRecognized: Schema.Boolean,
   finalMarkersPresent: Schema.Boolean,
@@ -211,6 +219,8 @@ export const Receipt = Schema.Struct({
   protectedContentVerified: Schema.Boolean,
   proven: Schema.Boolean,
 });
+export const incrementCount = (count: number) =>
+  Math.min(count + 1, MAX_HOST_CALL_COUNT);
 const UnknownReceipt = Schema.Struct({
   kind: Schema.Literal("LIVE_CHALLENGE"),
   target: Target,
@@ -411,22 +421,71 @@ const hasKnownChallengeMarkers = (
     : headers.some(([name]) => name.toLowerCase() === "cf-mitigated") ||
       /challenge-platform|Just a moment/i.test(body);
 
-const visibleBodyText = (body: string, omitNoscript: boolean) =>
-  body
-    .replaceAll(/<!--[\s\S]*?-->/gu, " ")
-    .replaceAll(
-      /<(script|style|head|template|iframe)\b[^>]*>[\s\S]*?<\/\1\s*>/giu,
-      " ",
+const normalizeBodyText = (text: string) => text.replace(/\s+/gu, " ").trim();
+
+/**
+ * Extracts only text from supported leaf elements in a strict complete document.
+ * This bounded AST check is not a CSS/layout or rendered-visibility model.
+ */
+const visibleBodyText = (body: string) => {
+  const parsed = parseHtmlDocument(body);
+  if (parsed._tag !== "Success") return undefined;
+
+  const { nodes } = parsed.snapshot;
+  const bodyIndex = nodes.findIndex((node) => node.tag === "body");
+  if (bodyIndex < 0) return undefined;
+  if (
+    nodes.some(
+      (node) =>
+        node.tag === "style" ||
+        node.tag === "link" ||
+        node.attributes.some(
+          ([name, value]) =>
+            name === "hidden" ||
+            name === "inert" ||
+            name === "style" ||
+            (name === "aria-hidden" && value.trim().toLowerCase() === "true"),
+        ),
     )
-    .replaceAll(
-      omitNoscript ? /<noscript\b[^>]*>[\s\S]*?<\/noscript\s*>/giu : /$^/gu,
-      " ",
-    )
-    .replaceAll(/<[^>]*>/gu, " ")
-    .replaceAll(/&(?:nbsp|#160|#xA0);/giu, " ")
-    .replaceAll(/&(?:#x?[0-9a-f]+|[a-z][a-z0-9]+);/giu, " ")
-    .replaceAll(/\s+/gu, " ")
-    .trim();
+  )
+    return undefined;
+
+  const isInBody = (index: number) => {
+    let parent = nodes[index]?.parent ?? -1;
+    while (parent >= 0) {
+      if (parent === bodyIndex) return true;
+      parent = nodes[parent]?.parent ?? -1;
+    }
+    return false;
+  };
+  const bodyNode = nodes[bodyIndex];
+  if (bodyNode === undefined) return undefined;
+  const text: Array<string> = [];
+  const noscriptText: Array<string> = [];
+  for (let index = bodyIndex; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (node === undefined || (index !== bodyIndex && !isInBody(index)))
+      continue;
+    if (node.tag === "noscript") {
+      noscriptText.push(node.textContent);
+      continue;
+    }
+    if (node.tag === "script") continue;
+    const hasElementChildren = nodes.some((child) => child.parent === index);
+    if (hasElementChildren) continue;
+    text.push(node.textContent);
+  }
+
+  const supportedText = normalizeBodyText(text.join(" "));
+  const rawBodyText = normalizeBodyText(bodyNode.textContent);
+  return {
+    text: supportedText,
+    noscriptOnly:
+      supportedText === "" &&
+      rawBodyText !== "" &&
+      normalizeBodyText(noscriptText.join(" ")) === rawBodyText,
+  };
+};
 
 export const inspectProtectedBody = (input: {
   readonly target: Target;
@@ -447,34 +506,39 @@ export const inspectProtectedBody = (input: {
   if (input.finalStatus === 204 || input.finalBody.trim() === "")
     return fail("NO_BODY");
   if (input.finalBody === input.initialBody) return fail("UNCHANGED");
+  const contentTypes = input.headers.flatMap(([name, value]) =>
+    name.toLowerCase() === "content-type"
+      ? [value.split(";", 1)[0]?.trim().toLowerCase() ?? ""]
+      : [],
+  );
+  if (contentTypes.length !== 1 || contentTypes[0] !== "text/html")
+    return fail("UNSUPPORTED_CONTENT_TYPE");
   if (
     input.finalChallengeRecognized ||
     hasKnownChallengeMarkers(input.target, input.headers, input.finalBody)
   )
     return fail("CHALLENGE_MARKER");
-  const text = visibleBodyText(input.finalBody, true);
-  if (text === "" && visibleBodyText(input.finalBody, false) !== "")
-    return fail("NOSCRIPT_ONLY");
+
+  const initial = visibleBodyText(input.initialBody);
+  const final = visibleBodyText(input.finalBody);
+  if (initial === undefined || final === undefined)
+    return fail("NO_SUPPORTED_VERIFIER");
+  if (final.text === "" && final.noscriptOnly) return fail("NOSCRIPT_ONLY");
+  if (final.text === "") return fail("NO_BODY");
   if (
-    /\b(?:challenge|error|interstitial|access denied|forbidden)\b/iu.test(text)
+    /\b(?:challenge|error|interstitial|access denied|forbidden)\b/iu.test(
+      final.text,
+    )
   )
     return fail("BLOCKED_CONTENT");
-  if (text === "") return fail("NO_BODY");
-  const contentType =
-    input.headers
-      .find(([name]) => name.toLowerCase() === "content-type")?.[1]
-      ?.split(";", 1)[0]
-      ?.trim()
-      .toLowerCase() ?? "";
-  if (
-    contentType !== "text/html" &&
-    contentType !== "application/json" &&
-    !/^application\/[a-z0-9.+-]+\+json$/u.test(contentType)
-  )
-    return fail("UNSUPPORTED_CONTENT_TYPE");
+
   // Live targets deliberately have no expected protected-content marker yet.
-  const expected = input.expectedContent?.trim();
-  if (expected === undefined || expected === "" || !text.includes(expected))
+  const expected = normalizeBodyText(input.expectedContent ?? "");
+  if (
+    expected === "" ||
+    initial.text.includes(expected) ||
+    !final.text.includes(expected)
+  )
     return fail("NO_SUPPORTED_VERIFIER");
   return {
     bodyGate: BodyGate.make("VERIFIED"),
@@ -490,7 +554,14 @@ export const didProviderCookieChange = (
 
 export const isProven = (input: {
   readonly initialEnforcementObserved: boolean;
-  readonly evaluations: { readonly success: number; readonly failure: number };
+  readonly initialChallengeUrlMatches: boolean;
+  readonly initialStatus: number;
+  readonly hookInvocations: number;
+  readonly evaluations: {
+    readonly attempts: number;
+    readonly success: number;
+    readonly failure: number;
+  };
   readonly failureClass: typeof FailureClass.Type;
   readonly failureReason: typeof FailureReason.Type;
   readonly networkDenied: number;
@@ -498,6 +569,7 @@ export const isProven = (input: {
   readonly providerCookieChanged: boolean;
   readonly retried: boolean;
   readonly finalUrlMatches: boolean;
+  readonly redirectCount: number | null;
   readonly finalStatus: number | null;
   readonly bodyGate: typeof BodyGate.Type;
   readonly protectedContentVerified: boolean;
@@ -505,8 +577,13 @@ export const isProven = (input: {
   readonly finalMarkersPresent: boolean;
 }) =>
   input.initialEnforcementObserved &&
+  input.initialChallengeUrlMatches &&
+  (input.initialStatus < 200 || input.initialStatus >= 300) &&
+  input.hookInvocations === 1 &&
+  input.evaluations.attempts === 1 &&
   input.evaluations.success === 1 &&
   input.evaluations.failure === 0 &&
+  input.redirectCount === 0 &&
   input.failureClass === "NONE" &&
   input.failureReason === "NONE" &&
   input.networkDenied === 0 &&
@@ -595,9 +672,10 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
   );
   const state = {
     initialStatus: 0,
+    initialChallengeUrlMatches: false,
     initialRecognizedChallenge: false,
     initialMarkersPresent: false,
-    hookInvoked: false,
+    hookInvocations: 0,
     inlinePrograms: 0,
     evaluationTimings: [] as Array<{ ms: number; reachedBound: boolean }>,
     staticScripts: {
@@ -611,7 +689,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     },
     staticScriptsNotAllowed: 0,
     iframes: 0,
-    evaluations: { success: 0, failure: 0 },
+    evaluations: { attempts: 0, success: 0, failure: 0 },
     failureClass: FailureClass.make("NONE"),
     failureReason: FailureReason.make("NONE"),
     network: { allowed: 0, denied: 0 },
@@ -662,55 +740,62 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
       | Browser.BrowserChallengeContext["response"],
     context: Browser.BrowserChallengeContext,
   ) {
-    state.hookInvoked = true;
-    state.initialStatus = context.response.status;
-    state.initialRecognizedChallenge =
-      Browser.recognizeChallenge(context.response) !== undefined;
-    initialBody = context.body;
-    state.initialMarkersPresent = hasKnownChallengeMarkers(
-      target,
-      context.response.headers,
-      context.body,
-    );
+    const firstHook = state.hookInvocations === 0;
+    state.hookInvocations = incrementCount(state.hookInvocations);
+    if (firstHook) {
+      state.initialStatus = context.response.status;
+      state.initialChallengeUrlMatches = context.response.url === pageUrl;
+      state.initialRecognizedChallenge =
+        Browser.recognizeChallenge(context.response) !== undefined;
+      initialBody = context.body;
+      state.initialMarkersPresent = hasKnownChallengeMarkers(
+        target,
+        context.response.headers,
+        context.body,
+      );
+      const parsed = yield* Effect.try({
+        try: () => tokenizeHtml(context.body),
+        catch: () =>
+          new Browser.BrowserScriptError({ reason: "inline selection failed" }),
+      });
+      state.inlinePrograms = parsed.programs.length;
+      const staticScripts = classifyStaticScripts(
+        parsed.scriptSources,
+        context.response.url,
+        allowedOrigins,
+      );
+      state.staticScripts = staticScripts.staticScripts;
+      state.staticScriptsNotAllowed = staticScripts.staticScriptsNotAllowed;
+      state.iframes = parsed.iframes;
+    }
     const before = yield* cookieSnapshot(context.transport);
-    state.providerCookieBefore = before.names.has(providerName);
-    const parsed = yield* Effect.try({
-      try: () => tokenizeHtml(context.body),
-      catch: () =>
-        new Browser.BrowserScriptError({ reason: "inline selection failed" }),
-    });
-    state.inlinePrograms = parsed.programs.length;
-    const staticScripts = classifyStaticScripts(
-      parsed.scriptSources,
-      context.response.url,
-      allowedOrigins,
-    );
-    state.staticScripts = staticScripts.staticScripts;
-    state.staticScriptsNotAllowed = staticScripts.staticScriptsNotAllowed;
-    state.iframes = parsed.iframes;
+    if (firstHook) state.providerCookieBefore = before.names.has(providerName);
+    state.evaluations.attempts = incrementCount(state.evaluations.attempts);
     const started = yield* Clock.monotonicTimeNanos;
     const evaluation = yield* classifyEvaluation(context.evaluateDocument());
     state.failureClass = evaluation.failureClass;
     state.failureReason = evaluation.failureReason;
+    if (evaluation.failureClass === "NONE")
+      state.evaluations.success = incrementCount(state.evaluations.success);
+    else state.evaluations.failure = incrementCount(state.evaluations.failure);
     const ended = yield* Clock.monotonicTimeNanos;
     const ms = Math.max(
       0,
       Math.round(Number(ended - started) / 100_000_000) * 100,
     );
-    state.evaluationTimings.push({
-      ms,
-      reachedBound: ms >= EVALUATION_TIMEOUT_MS - 250,
-    });
-    if (state.failureClass === "NONE") state.evaluations.success = 1;
-    else state.evaluations.failure = 1;
+    if (state.evaluationTimings.length < 16)
+      state.evaluationTimings.push({
+        ms,
+        reachedBound: ms >= EVALUATION_TIMEOUT_MS - 250,
+      });
     const after = yield* cookieSnapshot(context.transport);
-    state.providerCookieAfter = after.names.has(providerName);
-    state.providerCookieChanged = didProviderCookieChange(
-      before.provider,
-      after.provider,
-    );
-    state.retried = state.providerCookieChanged;
-    return state.retried ? Option.some({}) : Option.none();
+    const changed = didProviderCookieChange(before.provider, after.provider);
+    if (firstHook) {
+      state.providerCookieAfter = after.names.has(providerName);
+      state.providerCookieChanged = changed;
+    }
+    if (changed) state.retried = true;
+    return changed ? Option.some({}) : Option.none();
   });
   const program = Effect.scoped(
     Effect.gen(function* () {
@@ -733,12 +818,17 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
         },
       );
       const page = yield* browser.navigate(pageUrl);
-      if (!state.hookInvoked)
+      if (state.hookInvocations === 0)
         return yield* new Browser.BrowserScriptError({
           reason: "initial response unobserved",
         });
       const finalUrlMatches = page.url === pageUrl;
-      const finalRedirected = !finalUrlMatches;
+      const redirectCount =
+        Number.isSafeInteger(page.redirectCount) && page.redirectCount >= 0
+          ? page.redirectCount
+          : null;
+      const finalRedirected =
+        (redirectCount !== null && redirectCount > 0) || !finalUrlMatches;
       const finalChallengeRecognized = page.challenge !== undefined;
       const finalMarkersPresent = hasKnownChallengeMarkers(
         target,
@@ -758,6 +848,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
         target,
         ...state,
         finalStatus: page.status,
+        redirectCount,
         finalRedirected,
         finalChallengeRecognized,
         finalMarkersPresent,
@@ -765,6 +856,9 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
         proven: isProven({
           initialEnforcementObserved:
             state.initialRecognizedChallenge || state.initialMarkersPresent,
+          initialChallengeUrlMatches: state.initialChallengeUrlMatches,
+          initialStatus: state.initialStatus,
+          hookInvocations: state.hookInvocations,
           evaluations: state.evaluations,
           failureClass: state.failureClass,
           failureReason: state.failureReason,
@@ -773,6 +867,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
           providerCookieChanged: state.providerCookieChanged,
           retried: state.retried,
           finalUrlMatches,
+          redirectCount,
           finalStatus: page.status,
           ...bodyEvidence,
           finalChallengeRecognized,

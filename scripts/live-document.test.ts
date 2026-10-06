@@ -100,6 +100,7 @@ const run = (body: string, classic: boolean, assetStatus = 200) =>
           network,
           paths,
           status: response.status,
+          redirectCount: response.redirectCount,
           cookies,
         };
       }).pipe(
@@ -131,6 +132,7 @@ describe.skipIf(!integration)("local harness document path", () => {
     it(name, async () => {
       const result = await Effect.runPromise(run(body, false));
       expect(result.status).toBe(403);
+      expect(result.redirectCount).toBe(0);
       expect(result.documentPassed).toBe(true);
       expect(result.evaluation).toEqual(Option.none());
       expect(result.network).toEqual({ allowed: 1, denied: 0 });
@@ -143,6 +145,7 @@ describe.skipIf(!integration)("local harness document path", () => {
       run(page(inline + "</script><script src=/asset.js>"), false, 404),
     );
     expect(result.status).toBe(403);
+    expect(result.redirectCount).toBe(0);
     expect(result.network).toEqual({ allowed: 1, denied: 0 });
     expect(result.paths).toEqual(["/page", "/asset.js"]);
     expect(Option.isSome(result.evaluation)).toBe(true);

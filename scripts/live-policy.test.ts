@@ -20,6 +20,7 @@ import {
   isProven,
   HostCallCountersSchema,
   inlineClassicPrograms,
+  incrementCount,
   readExportedCookies,
   restrictRuntime,
   staticHtmlObservations,
@@ -214,9 +215,13 @@ describe("finite host-call counters", () => {
 
   it("saturates each counter at its schema maximum and rejects extra receipt fields", () => {
     const counters = makeHostCallCounters();
-    for (let index = 0; index < MAX_HOST_CALL_COUNT + 3; index++)
+    let attempts = 0;
+    for (let index = 0; index < MAX_HOST_CALL_COUNT + 3; index++) {
       countHostCall(counters, "request");
+      attempts = incrementCount(attempts);
+    }
     expect(counters.request).toBe(MAX_HOST_CALL_COUNT);
+    expect(attempts).toBe(MAX_HOST_CALL_COUNT);
     expect(Schema.decodeUnknownSync(HostCallCountersSchema)(counters)).toEqual(
       counters,
     );
@@ -409,7 +414,10 @@ describe("evaluation receipt failure metadata", () => {
 describe("conservative live proof gate", () => {
   const valid = (overrides: Partial<Parameters<typeof isProven>[0]> = {}) => ({
     initialEnforcementObserved: true,
-    evaluations: { success: 1, failure: 0 },
+    initialChallengeUrlMatches: true,
+    initialStatus: 403,
+    hookInvocations: 1,
+    evaluations: { attempts: 1, success: 1, failure: 0 },
     failureClass: "NONE" as const,
     failureReason: "NONE" as const,
     networkDenied: 0,
@@ -417,6 +425,7 @@ describe("conservative live proof gate", () => {
     providerCookieChanged: true,
     retried: true,
     finalUrlMatches: true,
+    redirectCount: 0,
     finalStatus: 200,
     bodyGate: "VERIFIED" as const,
     protectedContentVerified: true,
@@ -425,19 +434,24 @@ describe("conservative live proof gate", () => {
     ...overrides,
   });
 
+  const completeDocument = (body: string, head = "") =>
+    `<!doctype html><html><head>${head}</head><body>${body}</body></html>`;
   const protectedBody = (input: {
     finalBody: string;
     finalStatus?: number;
     initialBody?: string;
+    contentType?: string;
     expectedContent?: string;
   }) =>
     inspectProtectedBody({
       target: "cloudflare",
       initialBody:
-        input.initialBody ?? "<html><body>Just a moment</body></html>",
+        input.initialBody ?? completeDocument("<main>Just a moment</main>"),
       finalBody: input.finalBody,
       finalStatus: input.finalStatus ?? 200,
-      headers: [["content-type", "text/html; charset=utf-8"]],
+      headers: [
+        ["content-type", input.contentType ?? "text/html; charset=utf-8"],
+      ],
       finalChallengeRecognized: false,
       ...(input.expectedContent === undefined
         ? {}
@@ -445,10 +459,10 @@ describe("conservative live proof gate", () => {
     });
 
   it("accepts only an authored synthetic expected-content verifier", () => {
+    const marker = "Protected workspace: synthetic-record-42";
     const evidence = protectedBody({
-      finalBody:
-        "<html><body><main>Protected workspace: synthetic-record-42</main></body></html>",
-      expectedContent: "Protected workspace: synthetic-record-42",
+      finalBody: completeDocument(`<main>${marker}</main>`),
+      expectedContent: marker,
     });
     expect(evidence).toEqual({
       bodyGate: "VERIFIED",
@@ -458,11 +472,25 @@ describe("conservative live proof gate", () => {
     expect(isProven({ ...valid(), ...evidence })).toBe(true);
   });
 
+  it("rejects a marker already present in the initial supported body text", () => {
+    const marker = "Protected workspace: synthetic-record-42";
+    const evidence = protectedBody({
+      initialBody: completeDocument(`<main>${marker}</main>`),
+      finalBody: completeDocument(`<main>Updated: ${marker}</main>`),
+      expectedContent: marker,
+    });
+    expect(evidence).toEqual({
+      bodyGate: "NO_SUPPORTED_VERIFIER",
+      protectedContentVerified: false,
+    });
+    expect(isProven({ ...valid(), ...evidence })).toBe(false);
+  });
+
   it("does not prove a changed provider cookie after failed document evaluation", () => {
     expect(
       isProven(
         valid({
-          evaluations: { success: 0, failure: 1 },
+          evaluations: { attempts: 1, success: 0, failure: 1 },
           failureClass: "SCRIPT",
           failureReason: "RESOURCE_FAILURE",
         }),
@@ -476,6 +504,21 @@ describe("conservative live proof gate", () => {
     expect(isProven(valid({ staticScriptsNotAllowed: 1 }))).toBe(false);
   });
 
+  it("requires one hook and one evaluation against the fixed URL with no redirects", () => {
+    expect(isProven(valid({ hookInvocations: 0 }))).toBe(false);
+    expect(isProven(valid({ hookInvocations: 2 }))).toBe(false);
+    expect(
+      isProven(valid({ evaluations: { attempts: 2, success: 2, failure: 0 } })),
+    ).toBe(false);
+    expect(
+      isProven(valid({ evaluations: { attempts: 2, success: 1, failure: 1 } })),
+    ).toBe(false);
+    expect(isProven(valid({ initialChallengeUrlMatches: false }))).toBe(false);
+    expect(isProven(valid({ initialStatus: 200 }))).toBe(false);
+    expect(isProven(valid({ redirectCount: 1 }))).toBe(false);
+    expect(isProven(valid({ redirectCount: null }))).toBe(false);
+  });
+
   it("rejects external denial, non-success status, and URL changes", () => {
     expect(isProven(valid({ networkDenied: 1 }))).toBe(false);
     expect(isProven(valid({ finalStatus: 404 }))).toBe(false);
@@ -485,29 +528,28 @@ describe("conservative live proof gate", () => {
   it("rejects no-body, unchanged, noscript-only, error, and interstitial content", () => {
     const blocked = [
       protectedBody({
-        finalBody: "<html><body>Protected marker</body></html>",
+        finalBody: completeDocument("<main>Protected marker</main>"),
         finalStatus: 204,
         expectedContent: "Protected marker",
       }),
       protectedBody({ finalBody: "", expectedContent: "Protected marker" }),
       protectedBody({
-        finalBody:
-          "<html><body><noscript>Please enable scripting</noscript></body></html>",
+        finalBody: completeDocument(
+          "<noscript>Please enable scripting</noscript>",
+        ),
         expectedContent: "Please enable scripting",
       }),
       protectedBody({
-        finalBody:
-          "<html><body><main>Internal server error</main></body></html>",
+        finalBody: completeDocument("<main>Internal server error</main>"),
         expectedContent: "Internal server error",
       }),
       protectedBody({
-        finalBody:
-          "<html><body><main>Access denied interstitial</main></body></html>",
+        finalBody: completeDocument("<main>Access denied interstitial</main>"),
         expectedContent: "Access denied interstitial",
       }),
       protectedBody({
-        finalBody: "<html><body>Just a moment</body></html>",
-        initialBody: "<html><body>Just a moment</body></html>",
+        finalBody: completeDocument("Just a moment"),
+        initialBody: completeDocument("Just a moment"),
         expectedContent: "Just a moment",
       }),
     ];
@@ -523,9 +565,73 @@ describe("conservative live proof gate", () => {
       expect(isProven({ ...valid(), ...evidence })).toBe(false);
   });
 
+  it("fails closed for unsupported, malformed, and error-page bodies", () => {
+    const marker = "Protected workspace: synthetic-record-42";
+    const blocked = [
+      protectedBody({
+        finalBody: completeDocument(`<script>${marker}`),
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: completeDocument(`<!-- ${marker}`),
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: completeDocument(`<main hidden>${marker}</main>`),
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: completeDocument(
+          `<main style="display:none">${marker}</main>`,
+        ),
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: completeDocument(
+          `<main>${marker}</main>`,
+          "<style>main { display: none }</style>",
+        ),
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: completeDocument(
+          "<main>Public summary</main>",
+          `<title>${marker}</title>`,
+        ),
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: completeDocument(`<textarea>${marker}</textarea>`),
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: completeDocument(`<main>${marker}</body>`),
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: `{"error":"${marker}"}`,
+        finalStatus: 500,
+        contentType: "application/json; charset=utf-8",
+        expectedContent: marker,
+      }),
+      protectedBody({
+        finalBody: '{"error":',
+        finalStatus: 500,
+        contentType: "application/problem+json",
+        expectedContent: marker,
+      }),
+    ];
+    expect(
+      blocked.every((evidence) => !evidence.protectedContentVerified),
+    ).toBe(true);
+    expect(blocked.every((evidence) => evidence.bodyGate !== "VERIFIED")).toBe(
+      true,
+    );
+  });
+
   it("does not treat arbitrary nonempty app-looking content as protected evidence", () => {
     const evidence = protectedBody({
-      finalBody: "<html><body><main>Protected dashboard</main></body></html>",
+      finalBody: completeDocument("<main>Protected dashboard</main>"),
     });
     expect(evidence).toEqual({
       bodyGate: "NO_SUPPORTED_VERIFIER",

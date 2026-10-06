@@ -29,23 +29,46 @@ TLS_CLIENT_INTEGRATION=1 TLS_CLIENT_LIVE_TARGET=cloudflare bun scripts/live-chal
 ```
 
 Otherwise it prints `{"kind":"LIVE_OFF"}` without requests. This reviewed-source
-measurement calls `context.evaluateDocument()` once for the complete response,
-running supported inline and static external classic scripts in one realm with
-no source changes or shims, a 25-second runtime deadline,
-a 30-second handler deadline, and
-16 network requests per evaluation. DataDome permits only the page, `js.datadome.co`,
-and `api-js.datadome.co` origins; Cloudflare guest requests additionally require
+measurement calls `context.evaluateDocument()` once per hook invocation for the
+complete response, running supported inline and static external classic scripts
+in one realm with no source changes or shims, a 25-second runtime deadline, a
+30-second handler deadline, and 16 network requests per evaluation. DataDome
+permits only the page, `js.datadome.co`, and `api-js.datadome.co` origins;
+Cloudflare guest requests additionally require
 `/cdn-cgi/challenge-platform/`, enforced by the runtime's `allowedPathPrefixes`
-on initial requests and every redirect hop before sending. Host-call counters
-exclude internal redirect hops; these still undergo the library's origin and
-configured path checks.
-It prints one schema-encoded, bounded receipt with counts, booleans, one rounded
-evaluation timing, and `failureClass` (`NONE`, `TIMEOUT`, `SCRIPT`, or `OTHER`).
-Classification uses only known error tags and Exit/Cause variants, never error
-payloads: a `BrowserScriptError` is `SCRIPT`, even when its underlying cause was
-a runtime deadline. Unexpected failures outside evaluation print `UNKNOWN` and exit 2. `proven` requires initial non-2xx
-enforcement, a fresh provider cookie, one same-URL retry, and a nonredirected 2xx
-without recognized challenges or provider markers. Cookie changes alone are not
+on initial requests and every redirect hop before sending. `network` and
+`hostCalls` observe operations that reach the harness-wrapped host, including
+policy denials made there. BrowserMock denials made before that callback and
+library-managed redirect hops are not counted; the library still applies its
+origin/path policy before sending each hop. Thus zero observed denials is not
+evidence that no request was rejected by an earlier policy layer.
+
+The schema-encoded receipt includes bounded counters, booleans, up to 16 rounded
+evaluation timings, and `failureClass` (`NONE`, `TIMEOUT`, `SCRIPT`, or `OTHER`).
+Hook and evaluation attempt/success/failure counts saturate at 256. Classification
+uses only known error tags and Exit/Cause variants, never error payloads: a
+`BrowserScriptError` is `SCRIPT`, even when its underlying cause was a runtime
+deadline. Unexpected failures outside evaluation print `UNKNOWN` and exit 2.
+`proven` requires an enforced non-2xx response at the exact fixed initial URL,
+one hook invocation, one successful document-evaluation attempt and no failed
+evaluation, a changed provider cookie and a requested same-URL retry, zero
+wrapper-observed denials or non-allowlisted static scripts, and a final 2xx
+without recognized challenges or provider markers. The final URL must also equal
+the fixed URL and the cumulative `redirectCount` must be exactly zero; unknown
+counts are `null` and cannot prove success. `finalRedirected` is true when that
+count is positive or the final URL differs, so URL equality alone cannot hide a
+redirect-and-return round trip.
+
+The body gate accepts only `text/html` that parses as the existing strict
+complete-document subset. It extracts supported leaf-element body text, excludes
+script/noscript content and head metadata such as `<title>`, and refuses markup
+with `hidden`, `inert`, inline styles, or `<style>`/`<link>` elements; unsupported
+or malformed documents fail closed. This is not CSS/layout, rendered-visibility,
+or general browser evidence, and JSON bodies are unsupported. A positive body
+proof additionally needs an explicitly authored marker present in final supported
+body text and absent from the initial supported body text. No marker is guessed
+or configured for the live targets, so their body gate remains
+`NO_SUPPORTED_VERIFIER` and `proven` stays false. Cookie changes alone are not
 clearance; unsupported document/VM features can prevent measurement. Nothing runs
 against live targets during local tests (`bun test scripts/live-policy.test.ts`);
 the test lives beside the scripts because the package's TypeScript `rootDir`
