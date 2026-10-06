@@ -320,7 +320,7 @@ const makeEvaluate = (
     maxNetworkRequests: number;
   },
   hostRequestSemaphore: Semaphore.Semaphore,
-  mode: "async" | "classic" = "async",
+  mode: "async" | "classic" | "document" = "async",
 ): BrowserScriptRuntime["evaluate"] =>
   Effect.fn("BrowserMock.evaluate")(function* (
     source: string,
@@ -345,6 +345,11 @@ const makeEvaluate = (
       return yield* new BrowserScriptError({
         reason: "unsupported HTML document",
         documentInputFailure: "ConflictingInputs",
+      });
+    }
+    if (mode === "document" && context.document === undefined) {
+      return yield* new BrowserScriptError({
+        reason: "document evaluation requires a complete document",
       });
     }
     let documentRoot: Schema.Schema.Type<typeof DocumentRoot> | undefined;
@@ -1152,6 +1157,13 @@ export class BrowserMock extends Context.Service<
           allowedOrigins,
           maxNetworkRequests,
           timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          evaluateDocument: (context, host) =>
+            makeEvaluate(
+              spawner,
+              runtimeOptions,
+              hostRequestSemaphore,
+              "document",
+            )("", context, host),
           evaluateClassic: makeEvaluate(
             spawner,
             runtimeOptions,

@@ -158,10 +158,19 @@ export interface BrowserScriptHost {
   ) => Effect.Effect<string, BrowserScriptError>;
 }
 
-export const BrowserScriptMode = Schema.Literals(["async", "classic"]);
+export const BrowserScriptMode = Schema.Literals([
+  "async",
+  "classic",
+  "document",
+]);
 
 export interface BrowserScriptRuntime {
   readonly evaluateClassic?: BrowserScriptRuntime["evaluate"];
+  /** Explicitly execute classic scripts from a complete response document in one realm. */
+  readonly evaluateDocument?: (
+    context: BrowserScriptContext,
+    host?: BrowserScriptHost,
+  ) => Effect.Effect<BrowserScriptResult, BrowserScriptError>;
   readonly allowedOrigins?: ReadonlyArray<string>;
   /** Per-evaluation request cap, including redirects: integer 1–16, default 8. */
   readonly maxNetworkRequests?: number;
@@ -183,7 +192,7 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
     input: unknown,
     context?: BrowserScriptContext,
     host?: BrowserScriptHost,
-    mode: "async" | "classic" = "async",
+    mode: "async" | "classic" | "document" = "async",
   ) {
     const executionMode = yield* Schema.decodeEffect(BrowserScriptMode)(
       mode,
@@ -196,11 +205,26 @@ export const runBoundedScript = Effect.fn("BrowserScript.runBounded")(
           }),
       ),
     );
-    const evaluate =
-      executionMode === "classic" ? runtime.evaluateClassic : runtime.evaluate;
+    const documentEvaluator = runtime.evaluateDocument;
+    const evaluate: BrowserScriptRuntime["evaluate"] | undefined =
+      executionMode === "document"
+        ? documentEvaluator === undefined
+          ? undefined
+          : (_source, context, host) =>
+              context?.document === undefined
+                ? Effect.fail(
+                    new BrowserScriptError({
+                      reason:
+                        "document evaluation requires a complete document",
+                    }),
+                  )
+                : documentEvaluator.call(runtime, context, host)
+        : executionMode === "classic"
+          ? runtime.evaluateClassic
+          : runtime.evaluate;
     if (evaluate === undefined) {
       return yield* new BrowserScriptError({
-        reason: "Runtime does not support classic script evaluation",
+        reason: `Runtime does not support ${executionMode} script evaluation`,
       });
     }
     const source = yield* Schema.decodeUnknownEffect(Schema.String)(input).pipe(

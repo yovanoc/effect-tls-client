@@ -1777,9 +1777,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     return element;
   };
   // Distinct internal pending kind; the host still sees the ordinary script request.
-  const loadExternalScript = (url) => request("script.element", NativeString(url), "GET", new Headers([["accept", "text/javascript, application/javascript, */*"]]), null).then((value) => {
+  const loadExternalScript = (url) => apply(promiseThen, request("script.element", NativeString(url), "GET", new Headers([["accept", "text/javascript, application/javascript, */*"]]), null), [(value) => {
     if (value.status < 200 || value.status >= 300) throw new NativeTypeError("script load failed with HTTP " + value.status);
-  });
+  }]);
   document.createElement = function(name, options) {
     if (arguments.length === 0) throw new NativeTypeError("createElement requires a tag name");
     const tag = asciiLower(domString(name));
@@ -2036,6 +2036,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
       };
     },
   });
+  Object.defineProperty(globalThis, "__loadDocumentScript", { value: loadExternalScript, configurable: true });
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
     configurable: true,
@@ -2210,6 +2211,7 @@ const pendingKinds = new Map();
 const frames = new Map();
 const receivers = new WeakMap();
 const scriptErrorReporters = new WeakMap();
+const documentScriptLoaders = new WeakMap();
 const realmGlobals = new WeakMap();
 const timerOwners = new Map();
 let nextOuterTimerId = 0;
@@ -2326,7 +2328,7 @@ const post = (line, owner = context) => {
 const bootstrap = ${JSON.stringify(bootstrap)};
 // Node 25 can retain VM-created globals after deletion through the host sandbox.
 // These fixed kernel sources run before any guest code and verify realm-local removal.
-const cleanupPrivateBindings = "{ for (const key of ['__scriptErrorReporter', '__receive', '__post', '__naturalWork', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupPrivateBindings = "{ for (const key of ['__loadDocumentScript', '__scriptErrorReporter', '__receive', '__post', '__naturalWork', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage', '__waitForIdle']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const handleParentLine = (line) => {
   try {
@@ -2369,26 +2371,8 @@ const handleParentLine = (line) => {
       if (message.ok && (kind === "script" || kind === "script.element")) {
         if (!message.response.error && message.response.status >= 200 && message.response.status < 300) {
           if (kind === "script.element") {
-            const response = message.response;
-            const muted = new URL(response.url).origin !== new URL(rootInput.url).origin;
-            const report = (cause, syntaxMessage = null) => {
-              const callback = invokeInRealm(context, scriptErrorReporters.get(context), JSON.stringify([response.url, muted, syntaxMessage]));
-              invokeInRealm(context, callback, cause);
-            };
-            let compiled;
-            try { compiled = new vm.Script(response.body, { filename: response.url }); }
-            catch (cause) {
-              if (!(cause instanceof SyntaxError)) throw cause;
-              report(undefined, safeMessage(cause));
-            }
-            if (compiled) {
-              try { compiled.runInContext(context, { timeout: Math.max(1, Math.ceil(deadline - hostMonotonicNow())) }); }
-              catch (cause) {
-                // VM timeout/host failures are not guest exceptions and must never enter the realm.
-                if (!types.isProxy(cause) && types.isNativeError(cause) && hostErrorPrototypes.has(Object.getPrototypeOf(cause))) throw cause;
-                report(cause);
-              }
-            }
+            runReportedClassic(message.response.body, message.response.url,
+              new URL(message.response.url).origin !== new URL(rootInput.url).origin);
           } else {
             try { run(message.response.body, context); }
             catch (cause) {
@@ -2401,6 +2385,53 @@ const handleParentLine = (line) => {
     }
     deliverTo(context, JSON.stringify(message));
   } catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
+};
+// Compile unchanged classic source and report guest failures in the root realm.
+const runReportedClassic = (source, filename, muted = false) => {
+  const report = (cause, syntaxMessage = null) => {
+    const callback = invokeInRealm(context, scriptErrorReporters.get(context), JSON.stringify([filename, muted, syntaxMessage]));
+    invokeInRealm(context, callback, cause);
+  };
+  let compiled;
+  try { compiled = new vm.Script(source, { filename }); }
+  catch (cause) {
+    if (!(cause instanceof SyntaxError)) throw cause;
+    report(undefined, safeMessage(cause));
+  }
+  if (compiled) {
+    try { compiled.runInContext(context, { timeout: Math.max(1, Math.ceil(deadline - hostMonotonicNow())) }); }
+    catch (cause) {
+      // VM timeout/host failures are not guest exceptions and must never enter the realm.
+      if (!types.isProxy(cause) && types.isNativeError(cause) && hostErrorPrototypes.has(Object.getPrototypeOf(cause))) throw cause;
+      report(cause);
+    }
+  }
+};
+const runDocument = async (input) => {
+  const deferred = [], asynchronous = [], resourceFailures = [];
+  const load = async (attributes) => {
+    try {
+      if (attributes.get("integrity") || attributes.has("crossorigin")) throw new Error("script integrity/crossorigin is unsupported");
+      const url = new URL(attributes.get("src"), input.url).href;
+      await invokeInRealm(context, documentScriptLoaders.get(context), url);
+    } catch (cause) {
+      // Snapshot nodes are readonly: record resource failures, but do not dispatch element error events.
+      resourceFailures.push(safeMessage(cause));
+    }
+  };
+  for (const node of input.documentRoot.nodes) {
+    if (finished) return;
+    if (node.tag !== "script") continue;
+    const attributes = new Map(node.attributes);
+    const type = (attributes.get("type") ?? "").trim().toLowerCase();
+    if (attributes.has("nomodule") || !["", "text/javascript", "application/javascript"].includes(type)) continue;
+    if (!attributes.has("src")) runReportedClassic(node.textContent, input.url);
+    else if (attributes.has("async")) asynchronous.push(load(attributes));
+    else if (attributes.has("defer")) deferred.push(attributes);
+    else await load(attributes);
+  }
+  for (const attributes of deferred) await load(attributes);
+  await Promise.all(asynchronous);
 };
 const createRealm = (input, childRealm) => {
   // Local handles never name another realm's native keys; the eight-key cap stays global.
@@ -2453,6 +2484,7 @@ const createRealm = (input, childRealm) => {
   run(bootstrap, realm);
   receivers.set(realm, run("__receive", realm));
   scriptErrorReporters.set(realm, run("__scriptErrorReporter", realm));
+  documentScriptLoaders.set(realm, run("__loadDocumentScript", realm));
   run(cleanupPrivateBindings, realm);
   if (childRealm) run(cleanupCookieBindings, realm);
   return realm;
@@ -2493,12 +2525,13 @@ const start = (input) => {
   // Capture trusted helpers before guest evaluation, without enclosing guest source.
   const complete = run(${JSON.stringify(completionPrelude)}, context);
   run(cleanupCookieBindings, context);
-  if (input.mode !== undefined && input.mode !== "async" && input.mode !== "classic") throw new Error("invalid script execution mode");
+  if (input.mode === "document" && input.documentRoot === undefined) throw new Error("document evaluation requires a complete document");
+  if (input.mode !== undefined && input.mode !== "async" && input.mode !== "classic" && input.mode !== "document") throw new Error("invalid script execution mode");
   const source = input.mode === "classic" ? input.source : "(async function () {\n" + input.source + "\n})()";
   let value, failed = false;
   try {
-    // Classic source is compiled as-is in the root realm; both modes keep the VM clamp.
-    value = new vm.Script(source).runInContext(context, { timeout: Math.max(1, Math.ceil(deadline - hostMonotonicNow())) });
+    // Classic source is compiled as-is in the root realm; all modes reuse the deadline and VM clamp.
+    value = input.mode === "document" ? runDocument(input) : new vm.Script(source).runInContext(context, { timeout: Math.max(1, Math.ceil(deadline - hostMonotonicNow())) });
   } catch (cause) { value = cause; failed = true; }
   try {
     Promise.resolve(invokeInRealm(context, complete[failed ? 1 : 0], value)).then((encoded) => {
