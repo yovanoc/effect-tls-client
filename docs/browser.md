@@ -29,15 +29,19 @@ TLS_CLIENT_INTEGRATION=1 TLS_CLIENT_LIVE_TARGET=cloudflare bun scripts/live-chal
 ```
 
 Otherwise it prints `{"kind":"LIVE_OFF"}` without requests. This reviewed-source
-measurement runs original inline classic programs sequentially with the complete
-response snapshot, no source changes or shims, a 25-second runtime deadline,
+measurement calls `context.evaluateDocument()` once for the complete response,
+running supported inline and static external classic scripts in one realm with
+no source changes or shims, a 25-second runtime deadline,
 a 30-second handler deadline, and
 16 network requests per evaluation. DataDome permits only the page, `js.datadome.co`,
 and `api-js.datadome.co` origins; Cloudflare guest requests additionally require
 `/cdn-cgi/challenge-platform/`. Host-call counters exclude internal redirect hops;
 the library checks their origins, but the host wrapper cannot check their paths.
-It prints one schema-encoded, bounded receipt containing counts and booleans only;
-unexpected failures print `UNKNOWN` and exit 2. `proven` requires initial non-2xx
+It prints one schema-encoded, bounded receipt with counts, booleans, one rounded
+evaluation timing, and `failureClass` (`NONE`, `TIMEOUT`, `SCRIPT`, or `OTHER`).
+Classification uses only known error tags and Exit/Cause variants, never error
+payloads: a `BrowserScriptError` is `SCRIPT`, even when its underlying cause was
+a runtime deadline. Unexpected failures outside evaluation print `UNKNOWN` and exit 2. `proven` requires initial non-2xx
 enforcement, a fresh provider cookie, one same-URL retry, and a nonredirected 2xx
 without recognized challenges or provider markers. Cookie changes alone are not
 clearance; unsupported document/VM features can prevent measurement. Nothing runs
@@ -192,7 +196,8 @@ Pass an optional `responseHandler(response, context)` to `Browser.open` or
 unrecognized DataDome `403` pages. It runs only after Location and HTML redirects
 settle; recognized AWS/Cloudflare challenges go exclusively to `challengeHandler`.
 The shared `BrowserChallengeContext` exposes `body`, `transport`, and explicit
-`evaluateClassic(source, { document: "response" })` for reviewed scripts with the
+`evaluateClassic(source, { document: "response" })` for separately reviewed source,
+or `evaluateDocument()` for explicit document-order classic execution, with the
 session's Go Jar and script network policy. Supply `scriptRuntime` for evaluation;
 response HTML never executes automatically.
 
@@ -348,7 +353,7 @@ WebSocket, or general DOM APIs. Network operations
 are serialized to the host and made through the same scoped `TlsSession`; Go
 remains authoritative for cookies.
 
-The only executable DOM-like script support is VM-local external asynchronous classic
+Dynamic executable DOM-like script support is limited to VM-local external asynchronous classic
 `<script>` elements: `document.createElement("script")`, plus
 `document.head.appendChild` and `document.body.appendChild`. Appending returns
 the same element and starts that element at most once. Resource failures (including
@@ -528,7 +533,9 @@ explicit caller-created script, frame, and ordinary-element authorization.
 Parsed LINK/META/SCRIPT/STYLE/NOSCRIPT never load resources, run code, or fire
 events. This body-only grammar choice adds no automatic selected scripts, resource
 loading, lifecycle, renderer, or original-document/full-browser faithfulness claim.
-Reviewed classic source remains separately and manually selected, unchanged.
+With `evaluate` or `evaluateClassic`, reviewed source remains separately and
+manually selected, unchanged. Explicit `evaluateDocument()` opts into execution
+of the supported document scripts described below.
 
 The limits are 32 elements including these three roots, 16 KiB cumulative attribute-name/value
 bytes (shared with later mutable ordinary text), and 8,192 characters per attribute value or
@@ -557,9 +564,53 @@ const evaluation = Effect.gen(function* () {
 Use `yield*`, not `await`: these methods return Effects. Async-body
 `context.evaluate(originalSource, { document: "response" })` takes the same strict
 option; omission supplies no document. No `context.html`, excerpts, repair,
-automatic HTML-script execution or lifecycle is added. Parsed records stay inert;
+implicit HTML-script execution or lifecycle is added. Parsed records stay inert
+in `evaluate` and `evaluateClassic`;
 resource/cookie grants and caps stay unchanged. No renderer, `classList`, native
 HTML-parser fidelity, provider fit, selector acquisition or clearance is promised.
+
+### Explicit response-document script evaluation
+
+Both handler contexts expose `evaluateDocument(): Effect<void, BrowserOperationError>`.
+Calling it deliberately executes the supported classic scripts from the entire
+unmodified response body in one root realm:
+
+```ts
+const responseHandler: Browser.BrowserHandlers["responseHandler"] = (
+  _response,
+  context,
+) =>
+  Effect.gen(function* () {
+    yield* context.evaluateDocument();
+    return Option.none(); // Or explicitly request a bounded retry after checking the Go Jar.
+  });
+```
+
+The strict complete-document parser and its existing input/element/attribute
+limits apply; there is no extraction, repair, or automatic execution merely
+because a hook is present. Inline classic programs share globals and lexical
+bindings. Static external classic scripts use the existing script host and exact
+origin allowlist: blocking scripts finish before later inline scripts; deferred
+external scripts run in order afterward; async external scripts run when loaded
+(`async` wins over `defer`). Module, `nomodule`, and non-JavaScript types are
+skipped; unsupported execution attributes reject rather than being ignored.
+Resource failures and script errors follow the modeled element/Window error
+semantics, so completion alone is not proof that every script succeeded.
+
+This uses the same scoped evaluation resources, Go-backed cookies, network and
+source budgets, hard deadline, and bounded post-success natural-work retention
+as classic evaluation. Pending cookie writes flush before it returns; inspect
+`context.transport.exportCookies` and the retry response for authoritative
+state and clearance evidence. There are no document lifecycle events, renderer,
+iframe SDK grants, or browser-fidelity/clearance claims.
+
+`BrowserScriptRuntime.evaluateDocument(context, host)` is optional. A runtime
+without it fails with `BrowserScriptError`, reason
+`Runtime does not support document script evaluation`; it never falls back to
+async or per-inline evaluation. Low-level callers use
+`runBoundedScript(runtime, "", context, host, "document")` with `context.document`.
+`evaluateClassic(source, { document: "response" })` still leaves parsed scripts
+inert and runs only the supplied source.
 
 ### Experimental modeled element lookup
 
@@ -800,8 +851,8 @@ deadline, reserving time to flush authoritative cookie writes and encode the
 result. Expiry discards remaining work without failing evaluation; recurring
 intervals keep it alive until this cutoff. Failure does not retain work. A final
 expression Promise can explicitly wait for acquisition; undefined completion
-returns an empty string, not clearance or a retry. This adds no HTML script
-discovery, source rewriting, automatic SDK
+returns an empty string, not clearance or a retry. Classic-source evaluation adds no HTML script
+discovery (explicit document evaluation is separate), source rewriting, automatic SDK
 configuration, vendor resolver, or claim of challenge clearance. All existing
 source/network/frame/crypto/timer/DOM quotas, origins, credentials, Node permission
 denials and the hard process cutoff remain unchanged. String-based `eval` and
@@ -996,7 +1047,9 @@ handler deadline are unchanged.
 This is not a complete HTML/JavaScript engine or browser. The AWS adapter's
 static HTML script discovery is bounded and recognizes only a subset of classic
 `<script>` elements; ambiguous markup and unsupported attributes/types (including
-`async`/`defer`) are not reproduced. This is separate from the limited dynamic
+`async`/`defer`) are not reproduced by that adapter. Explicit handler
+`evaluateDocument()` separately supports bounded static classic scheduling as
+described above; it does not change the AWS adapter. This is separate from the limited dynamic
 VM script-element support described above. Active `<base>` elements make
 static discovery unsupported rather than resolving relative URLs against the
 wrong base. Attribute separators use HTML

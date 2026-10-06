@@ -1,4 +1,4 @@
-import { Clock, Effect, Exit, Layer, Option, Schema } from "effect";
+import { Cause, Clock, Effect, Exit, Layer, Option, Schema } from "effect";
 import { TlsClient } from "../packages/effect-tls-client/src/TlsClient.js";
 import * as Browser from "../packages/effect-tls-client/src/browser/index.js";
 import { CookiesJson } from "../packages/effect-tls-client/src/internal/Protocol.js";
@@ -8,6 +8,30 @@ const EVALUATION_TIMEOUT_MS = 25_000;
 const Target = Schema.Literals(["datadome", "cloudflare"]);
 type Target = typeof Target.Type;
 const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+const FailureClass = Schema.Literals(["NONE", "TIMEOUT", "SCRIPT", "OTHER"]);
+
+/** Classify only typed tags and Exit/Cause variants; never inspect error payloads. */
+export const classifyEvaluation = Effect.fnUntraced(function* (
+  evaluation: Effect.Effect<
+    void,
+    Browser.BrowserOperationError | Cause.TimeoutError
+  >,
+) {
+  const exit = yield* evaluation.pipe(
+    Effect.as(FailureClass.make("NONE")),
+    Effect.catchTag("BrowserScriptError", () =>
+      Effect.succeed(FailureClass.make("SCRIPT")),
+    ),
+    Effect.catchTag("TimeoutError", () =>
+      Effect.succeed(FailureClass.make("TIMEOUT")),
+    ),
+    Effect.exit,
+  );
+  if (Exit.isSuccess(exit)) return exit.value;
+  return Cause.hasInterrupts(exit.cause)
+    ? FailureClass.make("TIMEOUT")
+    : FailureClass.make("OTHER");
+});
 const Receipt = Schema.Struct({
   kind: Schema.Literal("LIVE_CHALLENGE"),
   target: Target,
@@ -26,6 +50,7 @@ const Receipt = Schema.Struct({
   }),
   iframes: Count,
   evaluations: Schema.Struct({ success: Count, failure: Count }),
+  failureClass: FailureClass,
   network: Schema.Struct({ allowed: Count, denied: Count }),
   providerCookieBefore: Schema.Boolean,
   providerCookieAfter: Schema.Boolean,
@@ -218,6 +243,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     staticScripts: { sameOrigin: 0, provider: 0, other: 0, unparsable: 0 },
     iframes: 0,
     evaluations: { success: 0, failure: 0 },
+    failureClass: FailureClass.make("NONE"),
     network: { allowed: 0, denied: 0 },
     providerCookieBefore: false,
     providerCookieAfter: false,
@@ -282,28 +308,19 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
       context.response.url,
     );
     state.iframes = parsed.iframes;
-    for (const source of parsed.programs) {
-      const started = yield* Clock.monotonicTimeNanos;
-      const success = yield* context
-        .evaluateClassic(source, { document: "response" })
-        .pipe(
-          Effect.as(true),
-          Effect.catchTag("BrowserScriptError", () => Effect.succeed(false)),
-        );
-      const ended = yield* Clock.monotonicTimeNanos;
-      if (state.evaluationTimings.length < 16) {
-        const ms = Math.max(
-          0,
-          Math.round(Number(ended - started) / 100_000_000) * 100,
-        );
-        state.evaluationTimings.push({
-          ms,
-          reachedBound: ms >= EVALUATION_TIMEOUT_MS - 250,
-        });
-      }
-      if (success) state.evaluations.success++;
-      else state.evaluations.failure++;
-    }
+    const started = yield* Clock.monotonicTimeNanos;
+    state.failureClass = yield* classifyEvaluation(context.evaluateDocument());
+    const ended = yield* Clock.monotonicTimeNanos;
+    const ms = Math.max(
+      0,
+      Math.round(Number(ended - started) / 100_000_000) * 100,
+    );
+    state.evaluationTimings.push({
+      ms,
+      reachedBound: ms >= EVALUATION_TIMEOUT_MS - 250,
+    });
+    if (state.failureClass === "NONE") state.evaluations.success = 1;
+    else state.evaluations.failure = 1;
     const after = yield* cookieSnapshot(context.transport);
     state.providerCookieAfter = after.names.has(providerName);
     state.providerCookieChanged = [...after.provider].some(
@@ -335,6 +352,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
               ),
             );
         });
+      const evaluateDocument = runtime.evaluateDocument;
       const browser = yield* Browser.open(
         {
           transport: { profile: "chrome_152_PSK" },
@@ -348,6 +366,14 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
             ...(runtime.evaluateClassic === undefined
               ? {}
               : { evaluateClassic: wrap(runtime.evaluateClassic) }),
+            ...(evaluateDocument === undefined
+              ? {}
+              : {
+                  evaluateDocument: (context, host) =>
+                    wrap((_source, _context, restrictedHost) =>
+                      evaluateDocument.call(runtime, context, restrictedHost),
+                    )("", context, host),
+                }),
           },
           challengeHandler: handler,
           responseHandler: handler,

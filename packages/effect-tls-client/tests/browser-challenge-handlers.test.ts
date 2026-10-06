@@ -49,6 +49,7 @@ const context: BrowserChallengeContext = {
   },
   evaluate: () => Effect.die("unused"),
   evaluateClassic: () => Effect.die("unused"),
+  evaluateDocument: () => Effect.die("unused"),
 };
 
 describe("composeChallengeHandlers", () => {

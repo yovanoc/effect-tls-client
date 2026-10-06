@@ -414,4 +414,150 @@ describeIntegration("response hook Go cookie integration", () => {
         );
       }),
   );
+  for (const supported of [true, false]) {
+    it.effect(
+      supported
+        ? "evaluateDocument shares inline globals with external scripts and retries with Go cookies"
+        : "evaluateDocument rejects a runtime without the capability",
+      () =>
+        Effect.gen(function* () {
+          const requests: Array<{ path: string; cookie: string }> = [];
+          const body =
+            '<!doctype html><html><head></head><body><script>var fixtureValue = "ready";</script><script src="/asset.js"></script></body></html>';
+          const fixture = yield* Effect.acquireRelease(
+            Effect.promise(
+              () =>
+                new Promise<{
+                  readonly server: ReturnType<typeof createServer>;
+                  readonly url: string;
+                }>((resolve, reject) => {
+                  const server = createServer((request, reply) => {
+                    requests.push({
+                      path: request.url ?? "",
+                      cookie: request.headers.cookie ?? "",
+                    });
+                    if (request.url === "/asset.js") {
+                      reply.writeHead(200, {
+                        "content-type": "text/javascript",
+                      });
+                      reply.end(
+                        'document.cookie = "fixture=" + fixtureValue + "; Path=/";',
+                      );
+                    } else if (
+                      request.headers.cookie?.includes("fixture=ready")
+                    ) {
+                      reply.writeHead(200, { "content-type": "text/html" });
+                      reply.end("cleared");
+                    } else {
+                      reply.writeHead(403, { "content-type": "text/html" });
+                      reply.end(body);
+                    }
+                  });
+                  server.once("error", reject);
+                  server.listen(0, "127.0.0.1", () => {
+                    const address = server.address();
+                    if (address === null || Predicate.isString(address)) {
+                      reject(new Error("fixture address unavailable"));
+                      return;
+                    }
+                    resolve({
+                      server,
+                      url: `http://127.0.0.1:${address.port}`,
+                    });
+                  });
+                }),
+            ),
+            ({ server }) =>
+              Effect.promise(
+                () =>
+                  new Promise<void>((resolve) => {
+                    server.close(() => resolve());
+                    server.closeAllConnections();
+                  }),
+              ),
+          );
+          const platform = Layer.mergeAll(
+            NodeServices.layer,
+            ConfigProvider.layer(
+              ConfigProvider.fromUnknown({
+                TLS_CLIENT_BRIDGE_PATH: bridgePath,
+              }),
+            ),
+          );
+          yield* Effect.gen(function* () {
+            const runtime = yield* Browser.BrowserMock;
+            let calls = 0;
+            const browser = yield* Browser.open(
+              { transport: { profile: "chrome_152_PSK" } },
+              {
+                scriptRuntime: supported
+                  ? runtime
+                  : { evaluate: runtime.evaluate },
+                responseHandler: (_response, context) =>
+                  Effect.gen(function* () {
+                    calls++;
+                    expect(context.response.status).toBe(403);
+                    expect(context.body).toBe(body);
+                    if (!supported) {
+                      const result = yield* context
+                        .evaluateDocument()
+                        .pipe(Effect.result);
+                      expect(result._tag).toBe("Failure");
+                      if (result._tag === "Failure") {
+                        expect(result.failure).toBeInstanceOf(
+                          Browser.BrowserScriptError,
+                        );
+                        expect(result.failure).toHaveProperty(
+                          "reason",
+                          "Runtime does not support document script evaluation",
+                        );
+                      }
+                      return Option.none();
+                    }
+                    expect(yield* context.evaluateDocument()).toBeUndefined();
+                    const cookies = yield* context.transport.exportCookies.pipe(
+                      Effect.flatMap(
+                        Schema.decodeUnknownEffect(ExportedCookies),
+                      ),
+                      Effect.catchTag("SchemaError", () =>
+                        Effect.fail(
+                          new Browser.BrowserScriptError({
+                            reason: "invalid fixture cookie export",
+                          }),
+                        ),
+                      ),
+                    );
+                    expect(cookies).toContainEqual({
+                      name: "fixture",
+                      value: "ready",
+                    });
+                    return Option.some({});
+                  }),
+              },
+            );
+            const page = yield* browser.navigate(`${fixture.url}/`);
+            expect(calls).toBe(1);
+            expect(page.status).toBe(supported ? 200 : 403);
+            expect(requests).toEqual(
+              supported
+                ? [
+                    { path: "/", cookie: "" },
+                    { path: "/asset.js", cookie: "" },
+                    { path: "/", cookie: "fixture=ready" },
+                  ]
+                : [{ path: "/", cookie: "" }],
+            );
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                TlsClient.layer.pipe(Layer.provide(platform)),
+                Browser.BrowserMock.layer({
+                  allowedOrigins: [fixture.url],
+                }).pipe(Layer.provide(platform)),
+              ),
+            ),
+          );
+        }),
+    );
+  }
 });

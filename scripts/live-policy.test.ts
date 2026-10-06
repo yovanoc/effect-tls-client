@@ -1,11 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { Effect, Result } from "effect";
+import { Cause, Effect, Result } from "effect";
 import {
   BrowserScriptError,
   type BrowserScriptHost,
 } from "../packages/effect-tls-client/src/browser/BrowserScript.js";
 import { restrictHost } from "./live-policy.js";
 import {
+  classifyEvaluation,
   inlineClassicPrograms,
   staticHtmlObservations,
 } from "./live-challenge.js";
@@ -155,4 +156,30 @@ describe("unchanged inline classic selection", () => {
       inlineClassicPrograms("<!-- <script>comment()</script>"),
     ).toThrow(BrowserScriptError);
   });
+});
+
+describe("evaluation receipt failure classes", () => {
+  effectIt(
+    "classifies success, typed tags, interruption, and defects without payloads",
+    () =>
+      Effect.gen(function* () {
+        const scriptError = new BrowserScriptError({ reason: "not inspected" });
+        Object.defineProperty(scriptError, "reason", {
+          get: () => {
+            throw new Error("error payload read");
+          },
+        });
+        expect(yield* classifyEvaluation(Effect.void)).toBe("NONE");
+        expect(yield* classifyEvaluation(Effect.fail(scriptError))).toBe(
+          "SCRIPT",
+        );
+        expect(
+          yield* classifyEvaluation(Effect.fail(new Cause.TimeoutError())),
+        ).toBe("TIMEOUT");
+        expect(yield* classifyEvaluation(Effect.interrupt)).toBe("TIMEOUT");
+        expect(yield* classifyEvaluation(Effect.die("not inspected"))).toBe(
+          "OTHER",
+        );
+      }),
+  );
 });
