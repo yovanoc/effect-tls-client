@@ -10,15 +10,41 @@ export interface LiveRule {
   readonly pathPrefix?: string;
 }
 
+export const MAX_HOST_CALL_COUNT = 256;
+
+export interface LiveHostCallCounters {
+  request: number;
+  scriptLoad: number;
+  setCookie: number;
+  exportCookies: number;
+}
+
+export const makeHostCallCounters = (): LiveHostCallCounters => ({
+  request: 0,
+  scriptLoad: 0,
+  setCookie: 0,
+  exportCookies: 0,
+});
+
+export const countHostCall = (
+  counters: LiveHostCallCounters,
+  operation: keyof LiveHostCallCounters,
+) => {
+  counters[operation] = Math.min(counters[operation] + 1, MAX_HOST_CALL_COUNT);
+};
+
 /** Restricts guest host calls; the library still owns redirects and cookies. */
 export const restrictHost = (
   rules: ReadonlyArray<LiveRule>,
   host: BrowserScriptHost,
   pageUrl: string,
+  hostCalls = makeHostCallCounters(),
 ) => {
   const counters = { allowed: 0, denied: 0 };
   const request: BrowserScriptHost["request"] = Effect.fnUntraced(
     function* (input) {
+      countHostCall(hostCalls, "request");
+      if (input.kind === "script") countHostCall(hostCalls, "scriptLoad");
       const url = yield* Effect.try({
         try: () => {
           // Reject ambiguous spellings BEFORE URL's dot-segment normalization.
@@ -55,9 +81,14 @@ export const restrictHost = (
         },
       });
       counters.allowed++;
-      return yield* host.request({ ...input, url });
+      return yield* host.request.call(host, { ...input, url });
     },
   );
+  const setCookie: BrowserScriptHost["setCookie"] = (value) =>
+    Effect.suspend(() => {
+      countHostCall(hostCalls, "setCookie");
+      return host.setCookie.call(host, value);
+    });
   // No iframe grant: this measurement selects root inline classic programs only.
-  return { host: { request, setCookie: host.setCookie }, counters };
+  return { host: { request, setCookie }, counters, hostCalls };
 };

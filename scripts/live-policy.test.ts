@@ -3,12 +3,22 @@ import { Cause, Effect, Result, Schema } from "effect";
 import {
   BrowserScriptError,
   type BrowserScriptHost,
+  type BrowserScriptRuntime,
 } from "../packages/effect-tls-client/src/browser/BrowserScript.js";
-import { restrictHost } from "./live-policy.js";
+import {
+  countHostCall,
+  makeHostCallCounters,
+  MAX_HOST_CALL_COUNT,
+  restrictHost,
+} from "./live-policy.js";
 import {
   classifyEvaluation,
+  encodeReceipt,
   FailureReason,
+  HostCallCountersSchema,
   inlineClassicPrograms,
+  readExportedCookies,
+  restrictRuntime,
   staticHtmlObservations,
 } from "./live-challenge.js";
 
@@ -85,6 +95,7 @@ describe("live script network policy", () => {
           expect(result.failure).toBeInstanceOf(BrowserScriptError);
         expect(policy.seen).toEqual([]);
         expect(policy.counters).toEqual({ allowed: 0, denied: 1 });
+        expect(policy.hostCalls.request).toBe(1);
       }),
     );
   }
@@ -104,6 +115,137 @@ describe("live script network policy", () => {
       expect(policy.counters).toEqual({ allowed: 0, denied: 1 });
     }),
   );
+});
+
+describe("finite host-call counters", () => {
+  effectIt(
+    "counts lazy requests and cookie writes once with the original receiver",
+    () =>
+      Effect.gen(function* () {
+        const calls = {
+          requests: [] as Array<unknown>,
+          cookies: [] as Array<string>,
+          receivers: [] as Array<unknown>,
+        };
+        const host = {
+          request(
+            this: BrowserScriptHost,
+            input: Parameters<BrowserScriptHost["request"]>[0],
+          ) {
+            calls.receivers.push(this);
+            calls.requests.push(input);
+            return Effect.succeed({
+              status: 200,
+              url: input.url,
+              headers: [],
+              body: "",
+              cookie: "",
+            });
+          },
+          setCookie(this: BrowserScriptHost, value: string) {
+            calls.receivers.push(this);
+            calls.cookies.push(value);
+            return Effect.succeed("");
+          },
+        } satisfies BrowserScriptHost;
+        const policy = restrictHost(
+          [{ origin, pathPrefix: prefix }],
+          host,
+          `${origin}/page`,
+        );
+        const fetchInput = request(`${origin}${prefix}fetch`);
+        const scriptInput = {
+          ...request(`${origin}${prefix}asset.js`),
+          kind: "script" as const,
+        };
+        const fetch = policy.host.request(fetchInput);
+        const script = policy.host.request(scriptInput);
+        const cookieWrite = policy.host.setCookie("fixture=yes");
+
+        expect(calls.requests).toEqual([]);
+        expect(calls.cookies).toEqual([]);
+        expect(policy.hostCalls).toEqual({
+          request: 0,
+          scriptLoad: 0,
+          setCookie: 0,
+          exportCookies: 0,
+        });
+        yield* fetch;
+        yield* script;
+        yield* cookieWrite;
+
+        expect(calls.requests).toHaveLength(2);
+        expect(calls.requests).toEqual([fetchInput, scriptInput]);
+        expect(calls.cookies).toEqual(["fixture=yes"]);
+        expect(calls.receivers).toEqual([host, host, host]);
+        expect(policy.hostCalls).toEqual({
+          request: 2,
+          scriptLoad: 1,
+          setCookie: 1,
+          exportCookies: 0,
+        });
+        expect("loadFrame" in policy.host).toBe(false);
+      }),
+  );
+
+  effectIt("counts exportCookies as a lazy Effect property", () =>
+    Effect.gen(function* () {
+      let executions = 0;
+      const transport = {
+        exportCookies: Effect.sync(() => {
+          executions++;
+          return "[]";
+        }),
+      };
+      const hostCalls = makeHostCallCounters();
+      const exported = readExportedCookies(transport, hostCalls);
+
+      expect(typeof transport.exportCookies).not.toBe("function");
+      expect(executions).toBe(0);
+      expect(hostCalls.exportCookies).toBe(0);
+      expect(yield* exported).toBe("[]");
+      expect(executions).toBe(1);
+      expect(hostCalls.exportCookies).toBe(1);
+    }),
+  );
+
+  it("saturates each counter at its schema maximum and rejects extra receipt fields", () => {
+    const counters = makeHostCallCounters();
+    for (let index = 0; index < MAX_HOST_CALL_COUNT + 3; index++)
+      countHostCall(counters, "request");
+    expect(counters.request).toBe(MAX_HOST_CALL_COUNT);
+    expect(Schema.decodeUnknownSync(HostCallCountersSchema)(counters)).toEqual(
+      counters,
+    );
+    expect(() =>
+      Schema.decodeUnknownSync(HostCallCountersSchema)({
+        ...counters,
+        request: MAX_HOST_CALL_COUNT + 1,
+      }),
+    ).toThrow();
+
+    const unknownReceipt = {
+      kind: "LIVE_CHALLENGE" as const,
+      target: "datadome" as const,
+      result: "UNKNOWN" as const,
+    };
+    expect(JSON.parse(encodeReceipt(unknownReceipt))).toEqual(unknownReceipt);
+    const extraReceipt = { ...unknownReceipt, extra: "not allowed" };
+    expect(() => encodeReceipt(extraReceipt)).toThrow();
+  });
+
+  it("keeps omitted runtime capabilities and host callbacks omitted", () => {
+    const runtime: BrowserScriptRuntime = {
+      evaluate: () => Effect.succeed({ value: "", setCookies: [] }),
+    };
+    const wrapped = restrictRuntime(runtime, [{ origin }], {
+      allowed: 0,
+      denied: 0,
+    });
+    expect("evaluateClassic" in wrapped).toBe(false);
+    expect("evaluateDocument" in wrapped).toBe(false);
+    expect("loadFrame" in fixture().host).toBe(false);
+  });
 });
 
 describe("static HTML observations", () => {

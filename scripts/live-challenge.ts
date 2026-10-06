@@ -2,12 +2,28 @@ import { Cause, Clock, Effect, Exit, Layer, Option, Schema } from "effect";
 import { TlsClient } from "../packages/effect-tls-client/src/TlsClient.js";
 import * as Browser from "../packages/effect-tls-client/src/browser/index.js";
 import { CookiesJson } from "../packages/effect-tls-client/src/internal/Protocol.js";
-import { restrictHost, type LiveRule } from "./live-policy.js";
+import {
+  countHostCall,
+  makeHostCallCounters,
+  MAX_HOST_CALL_COUNT,
+  restrictHost,
+  type LiveHostCallCounters,
+  type LiveRule,
+} from "./live-policy.js";
 
 const EVALUATION_TIMEOUT_MS = 25_000;
 const Target = Schema.Literals(["datadome", "cloudflare"]);
 type Target = typeof Target.Type;
 const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+const HostCallCount = Count.check(
+  Schema.isLessThanOrEqualTo(MAX_HOST_CALL_COUNT),
+);
+export const HostCallCountersSchema = Schema.Struct({
+  request: HostCallCount,
+  scriptLoad: HostCallCount,
+  setCookie: HostCallCount,
+  exportCookies: HostCallCount,
+});
 const FailureClass = Schema.Literals(["NONE", "TIMEOUT", "SCRIPT", "OTHER"]);
 
 export const FailureReason = Schema.Literals([
@@ -134,7 +150,15 @@ export const classifyEvaluation = Effect.fnUntraced(function* (
       : { failureClass: "OTHER", failureReason: "OTHER" },
   );
 });
-const Receipt = Schema.Struct({
+/**
+ * Effect execution attempts observed by the harness. `request` includes policy
+ * denials; `scriptLoad` is its `kind: "script"` subset. `setCookie` counts the
+ * callback's Effect execution, and `exportCookies` counts evaluation of the
+ * transport's Effect-valued property. Counts saturate at 256. None indicates
+ * delivery, Jar acceptance, script execution, or operation success; internal
+ * redirects and library-internal cookie reads are outside this wrapper.
+ */
+export const Receipt = Schema.Struct({
   kind: Schema.Literal("LIVE_CHALLENGE"),
   target: Target,
   initialStatus: Schema.Number,
@@ -159,6 +183,7 @@ const Receipt = Schema.Struct({
   failureClass: FailureClass,
   failureReason: FailureReason,
   network: Schema.Struct({ allowed: Count, denied: Count }),
+  hostCalls: HostCallCountersSchema,
   providerCookieBefore: Schema.Boolean,
   providerCookieAfter: Schema.Boolean,
   providerCookieChanged: Schema.Boolean,
@@ -178,14 +203,29 @@ const OffReceipt = Schema.Struct({ kind: Schema.Literal("LIVE_OFF") });
 const Output = Schema.fromJsonString(
   Schema.Union([Receipt, UnknownReceipt, OffReceipt]),
 );
-const print = (receipt: typeof Output.Type) => {
+export const encodeReceipt = (receipt: typeof Output.Type) => {
   const json = Schema.encodeSync(Output, { onExcessProperty: "error" })(
     receipt,
   );
   if (Buffer.byteLength(json) > 64 * 1024)
     throw new RangeError("receipt limit");
-  process.stdout.write(`${json}\n`);
+  return json;
 };
+const print = (receipt: typeof Output.Type) =>
+  process.stdout.write(`${encodeReceipt(receipt)}\n`);
+
+/** `exportCookies` is an Effect property, so count and return it lazily. */
+export const readExportedCookies = (
+  transport: Pick<
+    Browser.BrowserChallengeContext["transport"],
+    "exportCookies"
+  >,
+  hostCalls: LiveHostCallCounters,
+) =>
+  Effect.suspend(() => {
+    countHostCall(hostCalls, "exportCookies");
+    return transport.exportCookies;
+  });
 
 /** Conservative HTML token selection, not repair or JavaScript rewriting. */
 const tokenizeHtml = (body: string) => {
@@ -349,6 +389,7 @@ export const restrictRuntime = (
   runtime: Browser.BrowserScriptRuntime,
   rules: ReadonlyArray<LiveRule>,
   network: { allowed: number; denied: number },
+  hostCalls = makeHostCallCounters(),
 ): Browser.BrowserScriptRuntime => {
   const wrap = (
     evaluate: Browser.BrowserScriptRuntime["evaluate"],
@@ -358,7 +399,7 @@ export const restrictRuntime = (
         return yield* new Browser.BrowserScriptError({
           reason: "live host missing",
         });
-      const restricted = restrictHost(rules, host, context.url);
+      const restricted = restrictHost(rules, host, context.url, hostCalls);
       return yield* evaluate
         .call(runtime, source, context, restricted.host)
         .pipe(
@@ -428,6 +469,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     failureClass: FailureClass.make("NONE"),
     failureReason: FailureReason.make("NONE"),
     network: { allowed: 0, denied: 0 },
+    hostCalls: makeHostCallCounters(),
     providerCookieBefore: false,
     providerCookieAfter: false,
     providerCookieChanged: false,
@@ -437,7 +479,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     transport: Browser.BrowserChallengeContext["transport"],
   ) {
     const cookies = yield* Schema.decodeUnknownEffect(CookiesJson)(
-      yield* transport.exportCookies,
+      yield* readExportedCookies(transport, state.hostCalls),
     ).pipe(
       Effect.mapError(
         () =>
@@ -527,7 +569,12 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
           challengeHandlerTimeoutMs: 30_000,
         },
         {
-          scriptRuntime: restrictRuntime(runtime, rules, state.network),
+          scriptRuntime: restrictRuntime(
+            runtime,
+            rules,
+            state.network,
+            state.hostCalls,
+          ),
           challengeHandler: handler,
           responseHandler: handler,
         },
