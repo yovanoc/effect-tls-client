@@ -193,6 +193,185 @@ describeLocal("bounded natural script work", () => {
   }
 });
 
+describe("isolated realm completion", () => {
+  for (const mode of ["classic", "async"] as const) {
+    for (const mutation of ["species", "constructor"] as const) {
+      it.live(
+        `keeps Promise ${mutation} capability executors guest-local: ${mode}`,
+        () =>
+          Effect.gen(function* () {
+            const runtime = yield* Browser.BrowserMock;
+            const result = yield* Browser.runBoundedScript(
+              runtime,
+              `
+          const NativePromise = Promise;
+          function Species(executor) {
+            const visibility = executor.constructor("return typeof process")();
+            if (visibility !== "undefined") document.cookie = "exposure=" + visibility;
+            return new NativePromise(executor);
+          }
+          ${mutation === "constructor" ? "Promise.prototype.constructor = { [Symbol.species]: Species };" : "Object.defineProperty(Promise, Symbol.species, { value: Species });"}
+          ${mode === "async" ? 'return "done";' : '"done";'}
+        `,
+              {
+                url: "https://allowed.test/page",
+                cookie: "",
+                userAgent: "fixture",
+              },
+              undefined,
+              mode,
+            );
+            expect(result.value).toBe("done");
+            expect(result.setCookies).toEqual([]);
+          }).pipe(
+            Effect.provide(
+              Browser.BrowserMock.layer().pipe(
+                Layer.provide(NodeServices.layer),
+              ),
+            ),
+          ),
+      );
+    }
+  }
+
+  for (const mode of ["classic", "async"] as const) {
+    it.live(`bounds infinite Promise reactions in ${mode} execution`, () =>
+      Effect.gen(function* () {
+        const runtime = yield* Browser.BrowserMock;
+        const started = performance.now();
+        const result = yield* Effect.result(
+          Browser.runBoundedScript(
+            runtime,
+            "function again() { Promise.resolve().then(again); } again();",
+            undefined,
+            undefined,
+            mode,
+          ),
+        );
+        expect(result._tag).toBe("Failure");
+        expect(performance.now() - started).toBeLessThan(2000);
+      }).pipe(
+        Effect.provide(
+          Browser.BrowserMock.layer({ timeoutMs: 500 }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+    );
+  }
+
+  for (const behavior of ["throw", "loop"] as const) {
+    for (const mode of ["classic", "async"] as const) {
+      it.live(`bounds ${behavior}ing guest species in ${mode} completion`, () =>
+        Effect.gen(function* () {
+          const runtime = yield* Browser.BrowserMock;
+          const started = performance.now();
+          const result = yield* Effect.result(
+            Browser.runBoundedScript(
+              runtime,
+              `
+            Object.defineProperty(Promise, Symbol.species, { get() {
+              ${behavior === "throw" ? 'throw "authored species failure";' : "while (true) {}"}
+            } });
+            ${mode === "async" ? 'return "done";' : '"done";'}
+          `,
+              {
+                url: "https://allowed.test/page",
+                cookie: "",
+                userAgent: "fixture",
+              },
+              undefined,
+              mode,
+            ),
+          );
+          expect(result._tag).toBe("Failure");
+          expect(performance.now() - started).toBeLessThan(2000);
+        }).pipe(
+          Effect.provide(
+            Browser.BrowserMock.layer({ timeoutMs: 500 }).pipe(
+              Layer.provide(NodeServices.layer),
+            ),
+          ),
+        ),
+      );
+    }
+  }
+
+  it.live("dispatches a native crypto rejection as a guest-local failure", () =>
+    Effect.gen(function* () {
+      const runtime = yield* Browser.BrowserMock;
+      const result = yield* runtime.evaluate(
+        `
+        const key = await crypto.subtle.importKey("raw", new Uint8Array(16), { name: "AES-GCM" }, false, ["encrypt"]);
+        try {
+          // A one-byte IV passes the modeled input boundary but fails native AES-GCM.
+          await crypto.subtle.encrypt({ name: "AES-GCM", iv: new Uint8Array(1) }, key, new Uint8Array());
+          return "unexpected success";
+        } catch (failure) { return failure instanceof Error ? "local rejection" : "foreign rejection"; }
+      `,
+        { url: "https://allowed.test/page", cookie: "", userAgent: "fixture" },
+      );
+      expect(result.value).toBe("local rejection");
+    }).pipe(
+      Effect.provide(
+        Browser.BrowserMock.layer().pipe(Layer.provide(NodeServices.layer)),
+      ),
+    ),
+  );
+
+  it.live(
+    "awaits a reviewed frame thenable that schedules Promise reactions",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* Browser.BrowserMock;
+        const result = yield* runtime.evaluate(
+          `const frame = document.createElement("iframe"); frame.src = "/frame";
+         return await new Promise(resolve => {
+           frame.onload = () => resolve("loaded");
+           frame.onerror = () => resolve("failed");
+           document.body.appendChild(frame);
+         });`,
+          {
+            url: "https://allowed.test/page",
+            cookie: "",
+            userAgent: "fixture",
+          },
+          {
+            request: () => Effect.die("unexpected request"),
+            setCookie: () => Effect.die("unexpected write"),
+            loadFrame: (url) =>
+              Effect.succeed({
+                parentUrl: "https://allowed.test/page",
+                url,
+                origin: "https://allowed.test",
+                status: 200,
+                headers: [],
+                cookie: null,
+                scripts: [
+                  `var speciesCalls = 0;
+                   const NativePromise = Promise;
+                   Object.defineProperty(Promise, Symbol.species, { value: function Species(executor) {
+                     if (executor.constructor("return typeof process")() !== "undefined") throw "foreign executor";
+                     speciesCalls++;
+                     return new NativePromise(executor);
+                   } });
+                   ({ then(resolve) { Promise.resolve().then(() => resolve()); } });`,
+                  'if (speciesCalls === 0) throw "species not exercised";',
+                ],
+              }),
+          },
+        );
+        expect(result.value).toBe("loaded");
+      }).pipe(
+        Effect.provide(
+          Browser.BrowserMock.layer({
+            allowedOrigins: ["https://allowed.test"],
+          }).pipe(Layer.provide(NodeServices.layer)),
+        ),
+      ),
+  );
+});
+
 describe("natural timer retention", () => {
   const services = Browser.BrowserMock.layer({ timeoutMs: 500 }).pipe(
     Layer.provide(NodeServices.layer),

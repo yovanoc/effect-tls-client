@@ -134,6 +134,119 @@ const run = (
   );
 
 describe("explicit document script evaluation", () => {
+  it.live(
+    "keeps external and completion Promise species executors guest-local",
+    () =>
+      Effect.gen(function* () {
+        const output = yield* run(
+          `<script>var speciesCalls = 0; const NativePromise = Promise;
+         Object.defineProperty(Promise, Symbol.species, { value: function Species(executor) {
+           if (executor.constructor("return typeof process")() !== "undefined") throw "foreign executor";
+           speciesCalls++;
+           return new NativePromise(executor);
+         } });</script>
+         <script src="/species.js"></script>
+         <script>document.cookie = "species=" + (speciesCalls > 0);</script>`,
+          {
+            "/species.js":
+              'Promise.resolve().then(() => { document.cookie = "external=done"; });',
+          },
+        );
+        expect(output.result._tag).toBe("Success");
+        expect(output.writes).toEqual(["external=done", "species=true"]);
+        expect(output.paths).toEqual(["/species.js"]);
+      }),
+  );
+
+  for (const nested of [false, true]) {
+    it.live(
+      `checkpoints ${nested ? "nested" : "single"} Promise reactions between inline scripts`,
+      () =>
+        Effect.gen(function* () {
+          const output = yield* run(
+            `<script>var trace = ["first"];
+           Promise.resolve().then(() => {
+             trace.push("microtask");
+             ${nested ? 'return Promise.resolve().then(() => trace.push("nested"));' : ""}
+           })${nested ? '.then(() => trace.push("last"))' : ""};</script>
+           <script>trace.push("second"); document.cookie = "trace=" + trace.join(",");</script>`,
+          );
+          expect(output.result._tag).toBe("Success");
+          expect(output.writes).toEqual([
+            nested
+              ? "trace=first,microtask,nested,last,second"
+              : "trace=first,microtask,second",
+          ]);
+        }),
+    );
+  }
+
+  it.live(
+    "checkpoints Promise reactions without interleaving timer tasks",
+    () =>
+      Effect.gen(function* () {
+        const output = yield* run(
+          `<script>var trace = ["first"];
+         setTimeout(() => { trace.push("timer"); document.cookie = "timer=" + trace.join(","); }, 0);
+         Promise.resolve().then(() => trace.push("microtask"));</script>
+         <script>trace.push("second"); document.cookie = "trace=" + trace.join(",");</script>`,
+        );
+        expect(output.result._tag).toBe("Success");
+        expect(output.writes).toEqual([
+          "trace=first,microtask,second",
+          "timer=first,microtask,second,timer",
+        ]);
+      }),
+  );
+
+  it.live(
+    "checkpoints external classic reactions before the next inline script",
+    () =>
+      Effect.gen(function* () {
+        const output = yield* run(
+          '<script src="/microtasks.js"></script><script>trace.push("inline"); document.cookie = "trace=" + trace.join(",");</script>',
+          {
+            "/microtasks.js":
+              'var trace = ["external"]; Promise.resolve().then(() => Promise.resolve().then(() => trace.push("nested")));',
+          },
+        );
+        expect(output.result._tag).toBe("Success");
+        expect(output.writes).toEqual(["trace=external,nested,inline"]);
+        expect(output.paths).toEqual(["/microtasks.js"]);
+      }),
+  );
+
+  it.live("bounds an infinite Promise checkpoint", () =>
+    Effect.gen(function* () {
+      const runtime = yield* BrowserMock;
+      const started = performance.now();
+      const result = yield* Effect.result(
+        runBoundedScript(
+          runtime,
+          "",
+          {
+            url: "https://allowed.test/page",
+            cookie: "",
+            userAgent: "fixture",
+            document: document(
+              '<script>function again() { Promise.resolve().then(again); } again();</script><script>document.cookie = "unexpected=second";</script>',
+            ),
+          },
+          undefined,
+          "document",
+        ),
+      );
+      expect(result._tag).toBe("Failure");
+      expect(performance.now() - started).toBeLessThan(2000);
+    }).pipe(
+      Effect.provide(
+        BrowserMock.layer({ timeoutMs: 500 }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.live("dispatches bounded document mode without an async fallback", () =>
     Effect.gen(function* () {
       const runtime = yield* BrowserMock;

@@ -66,6 +66,9 @@ export const makeBrowserScriptRunnerSource = (
   const objectCreate = Object.create;
   const numberIsInteger = Number.isInteger;
   const promiseThen = NativePromise.prototype.then;
+  const promiseResolve = NativePromise.resolve;
+  const settlePromise = __settlePromise;
+  delete globalThis.__settlePromise;
   const weakMapGet = WeakMap.prototype.get;
   const weakMapSet = WeakMap.prototype.set;
   const isView = NativeArrayBuffer.isView;
@@ -333,21 +336,15 @@ export const makeBrowserScriptRunnerSource = (
     return value;
   };
   const performCrypto = (request) => new NativePromise((resolve, reject) => {
-    let hostTask;
-    try { hostTask = hostCryptoOperation(request); }
-    catch { reject(new NativeError("Web Crypto operation failed")); return; }
     try {
-      apply(hostTask.then, hostTask, [
-        (encoded) => {
-          try {
-            if (typeof encoded !== "string" || encoded.length > 1200000) throw new NativeError("invalid Web Crypto response");
-            const result = jsonParse(encoded);
-            if (result === null || typeof result !== "object" || result.ok !== true) throw new NativeError("Web Crypto operation failed");
-            resolve(result);
-          } catch { reject(new NativeError("Web Crypto operation failed")); }
-        },
-        () => reject(new NativeError("Web Crypto operation failed")),
-      ]);
+      hostCryptoOperation(request, (encoded) => {
+        try {
+          if (typeof encoded !== "string" || encoded.length > 1200000) throw new NativeError("invalid Web Crypto response");
+          const result = jsonParse(encoded);
+          if (result === null || typeof result !== "object" || result.ok !== true) throw new NativeError("Web Crypto operation failed");
+          resolve(result);
+        } catch { reject(new NativeError("Web Crypto operation failed")); }
+      });
     } catch { reject(new NativeError("Web Crypto operation failed")); }
   });
   const cryptoKeyData = new WeakMap();
@@ -2039,6 +2036,29 @@ export const makeBrowserScriptRunnerSource = (
       };
     },
   });
+  // Only realm-local callbacks/executors reach guest species constructors.
+  // The host sink stays in this closure and receives primitives only.
+  Object.defineProperty(globalThis, "__bridgePromise", {
+    configurable: true,
+    value: (encoded) => {
+      const [id, stringResult] = jsonParse(encoded);
+      return (value) => {
+        const settle = (ok, text = "") => {
+          if (typeof text !== "string" || utf8Length(text) > MAX_OUTPUT_LINE_BYTES) {
+            settlePromise(id, false, ""); return;
+          }
+          settlePromise(id, ok, text);
+        };
+        try {
+          const promise = apply(promiseResolve, NativePromise, [value]);
+          apply(promiseThen, promise, [
+            (result) => settle(true, stringResult ? result : ""),
+            (cause) => settle(false, safeMessage(cause)),
+          ]);
+        } catch (cause) { settle(false, safeMessage(cause)); }
+      };
+    },
+  });
   Object.defineProperty(globalThis, "__loadDocumentScript", { value: loadExternalScript, configurable: true });
   Object.defineProperty(globalThis, "__receive", { value: receive, configurable: true });
   Object.defineProperty(globalThis, "__cookieSnapshot", {
@@ -2216,6 +2236,9 @@ const receivers = new WeakMap();
 const scriptErrorReporters = new WeakMap();
 const documentScriptLoaders = new WeakMap();
 const realmGlobals = new WeakMap();
+const realmPromiseBridges = new WeakMap();
+const promiseWaiters = new Map();
+let nextPromiseId = 0;
 const timerOwners = new Map();
 let nextOuterTimerId = 0;
 let nextFrameId = 0;
@@ -2228,6 +2251,19 @@ const consumeBudget = (kind, amount) => {
 let rootInput;
 let deadline;
 const run = (source, realm) => vm.runInContext(source, realm, { timeout: Math.max(1, Math.ceil(deadline - hostMonotonicNow())) });
+// No outer-realm Promise operation ever receives a guest Promise/thenable.
+// Resolve the host Promise only with a bounded encoded string, never a guest object.
+const outerPromise = (realm, value, stringResult = false) => new Promise((resolve, reject) => {
+  const id = ++nextPromiseId;
+  promiseWaiters.set(id, { realm, resolve, reject });
+  try {
+    const receive = invokeInRealm(realm, realmPromiseBridges.get(realm), JSON.stringify([id, stringResult]));
+    invokeInRealm(realm, receive, value);
+  } catch {
+    promiseWaiters.delete(id);
+    reject(new Error("realm Promise completion failed"));
+  }
+});
 const invokeInRealm = (realm, fn, value) => {
   // Inspect the actual realm global: Node 25 sandbox descriptors can miss uninitialized var.
   // Reject every own collision before installing a trusted function; never invoke guest setters.
@@ -2281,7 +2317,7 @@ const writeFinal = (output) => {
   if (finished) return;
   finished = true;
   clearTimeout(retentionTimer); clearImmediate(idleCheck);
-  frames.clear(); timerOwners.clear();
+  frames.clear(); timerOwners.clear(); promiseWaiters.clear();
   hostCryptoKeys.clear();
   hostCryptoKeyIds.clear();
   process.stdout.end(JSON.stringify({ type: "result", output }) + "\n", () => process.exit(0));
@@ -2331,7 +2367,7 @@ const post = (line, owner = context) => {
 const bootstrap = ${JSON.stringify(bootstrap)};
 // Node 25 can retain VM-created globals after deletion through the host sandbox.
 // These fixed kernel sources run before any guest code and verify realm-local removal.
-const cleanupPrivateBindings = "{ for (const key of ['__loadDocumentScript', '__scriptErrorReporter', '__receive', '__post', '__naturalWork', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupPrivateBindings = "{ for (const key of ['__bridgePromise', '__settlePromise', '__loadDocumentScript', '__scriptErrorReporter', '__receive', '__post', '__naturalWork', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage', '__waitForIdle']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const handleParentLine = (line) => {
   try {
@@ -2359,7 +2395,12 @@ const handleParentLine = (line) => {
       const referrer = parent.origin === frame.origin ? parent.href : parent.origin + "/";
       entry.child = createRealm({ ...rootInput, url: frame.url, cookie: frame.cookie ?? "", referrer, authoritativeCookies: true }, true);
       const child = entry.child;
-      const execute = async () => { for (const source of frame.scripts) await run(source, child); };
+      const execute = async () => {
+        for (const source of frame.scripts) {
+          // Assimilate arbitrary script completion thenables in their own realm.
+          await outerPromise(child, run(source, child));
+        }
+      };
       execute().then(() => {
         if (!finished) {
           try { deliverTo(context, JSON.stringify({ type: "frame.reply", id: message.id })); }
@@ -2417,7 +2458,7 @@ const runDocument = async (input) => {
     try {
       if (attributes.get("integrity") || attributes.has("crossorigin")) throw new Error("script integrity/crossorigin is unsupported");
       // Preserve raw spelling for the parent's before-send path policy.
-      await invokeInRealm(context, documentScriptLoaders.get(context), attributes.get("src"));
+      await outerPromise(context, invokeInRealm(context, documentScriptLoaders.get(context), attributes.get("src")));
     } catch {
       // Snapshot nodes are readonly: record resource failures, but do not dispatch element error events.
       resourceFailed = true;
@@ -2464,6 +2505,16 @@ const createRealm = (input, childRealm) => {
   const pageLocation = hostPageLocation(String(input.url));
   const sandbox = Object.assign(Object.create(null), {
     __post: (line) => post(line, realm),
+    __settlePromise: (id, ok, encoded) => {
+      const waiter = promiseWaiters.get(id);
+      if (!waiter || waiter.realm !== realm) return;
+      promiseWaiters.delete(id);
+      if (typeof ok !== "boolean" || typeof encoded !== "string" || Buffer.byteLength(encoded) > MAX_OUTPUT_LINE_BYTES) {
+        waiter.reject(new Error("realm Promise completion failed")); return;
+      }
+      if (ok) waiter.resolve(encoded);
+      else waiter.reject(new Error(encoded || "realm Promise completion failed"));
+    },
     __naturalWork: naturalWork,
     __childRealm: childRealm,
     __documentSnapshot: JSON.stringify(childRealm ? null : input.documentSnapshot ?? null),
@@ -2480,13 +2531,23 @@ const createRealm = (input, childRealm) => {
     __performanceNow: hostMonotonicNow,
     __performanceTimeOrigin: hostTimeOrigin,
     __randomBytes: hostRandomBytes,
-    __cryptoOperation: realmCryptoOperation,
+    __cryptoOperation: (request, receive) => {
+      const deliver = (encoded) => {
+        if (finished) return;
+        try { invokeInRealm(realm, receive, encoded); }
+        catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
+      };
+      realmCryptoOperation(request).then(deliver, () => deliver(CRYPTO_FAILURE));
+    },
     __encodeBlobText: hostEncodeBlobText,
     __decodeBlobText: hostDecodeBlobText,
   });
-  const realm = vm.createContext(sandbox, { codeGeneration: { strings: true, wasm: false } });
+  // Drain the entire realm microtask queue under each evaluation's timeout,
+  // without yielding a task between adjacent classic scripts.
+  const realm = vm.createContext(sandbox, { codeGeneration: { strings: true, wasm: false }, microtaskMode: "afterEvaluate" });
   realmGlobals.set(realm, run("this", realm));
   run(bootstrap, realm);
+  realmPromiseBridges.set(realm, run("__bridgePromise", realm));
   receivers.set(realm, run("__receive", realm));
   scriptErrorReporters.set(realm, run("__scriptErrorReporter", realm));
   documentScriptLoaders.set(realm, run("__loadDocumentScript", realm));
@@ -2544,12 +2605,18 @@ const start = (input) => {
     // Classic source is compiled as-is in the root realm; all modes reuse the deadline and VM clamp.
     value = input.mode === "document" ? runDocument(input) : new vm.Script(source).runInContext(context, { timeout: Math.max(1, Math.ceil(deadline - hostMonotonicNow())) });
   } catch (cause) { value = cause; failed = true; }
-  try {
-    Promise.resolve(invokeInRealm(context, complete[failed ? 1 : 0], value)).then((encoded) => {
-      try { writeFinal(JSON.parse(encoded)); }
-      catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
-    }, (cause) => writeFinal({ ok: false, reason: safeMessage(cause) }));
-  } catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
+  const finish = (value, failed) => {
+    try {
+      outerPromise(context, invokeInRealm(context, complete[failed ? 1 : 0], value), true).then((encoded) => {
+        try { writeFinal(JSON.parse(encoded)); }
+        catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
+      }, (cause) => writeFinal({ ok: false, reason: safeMessage(cause) }));
+    } catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
+  };
+  // Document scheduling belongs to the outer realm; never await its Promise
+  // inside the isolated guest queue. Async/classic values stay guest-local.
+  if (input.mode === "document" && !failed) value.then(() => finish(undefined, false), (cause) => finish(cause, true));
+  else finish(value, failed);
 };
 const major = Number.parseInt(process.versions.node, 10);
 if (!Number.isInteger(major) || major < 25 || process.permission?.has("net") !== false) {

@@ -614,7 +614,17 @@ const responseHandler: Browser.BrowserHandlers["responseHandler"] = (
 The strict complete-document parser and its existing input/element/attribute
 limits apply; there is no extraction, repair, or automatic execution merely
 because a hook is present. Inline classic programs share globals and lexical
-bindings. Static external classic scripts use the existing script host and exact
+bindings. Each classic execution drains the realm's Promise microtask queue,
+including nested reactions, under the remaining evaluation deadline before the
+next adjacent inline script runs. This checkpoint does not yield a timer task.
+Node's `vm` uses `microtaskMode: "afterEvaluate"`; trusted IPC and completion
+bridges explicitly re-enter the owning realm. Promise resolution, thenable lookup,
+and species construction use captured guest intrinsics under the remaining deadline.
+Only a settlement flag and bounded encoded string reach the host completion waiter;
+no host Promise resolver, rejection callback, or capability executor is passed to
+user constructors. Public Promise objects remain mutable. This adds no document
+lifecycle events and does not make the VM a malicious-code sandbox.
+Static external classic scripts use the existing script host and exact
 origin allowlist: blocking scripts finish before later inline scripts; deferred
 external scripts run in order afterward; async external scripts run when loaded
 (`async` wins over `defer`). Module, `nomodule`, and non-JavaScript types are
