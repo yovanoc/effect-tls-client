@@ -19,6 +19,31 @@ request. The example accepts `chrome_146`, `chrome_146_PSK`, `chrome_152`, and
 `chrome_152_PSK`; `Browser.open` derives the matching Chrome identity from the
 selected profile. It uses the platform-neutral `examples/runtime.mjs` loader.
 
+### Live measurement harness
+
+With Bun and Node **25.9.0** on `PATH`, explicitly opt in to one fixed target:
+
+```sh
+TLS_CLIENT_INTEGRATION=1 TLS_CLIENT_LIVE_TARGET=datadome bun scripts/live-challenge.ts
+TLS_CLIENT_INTEGRATION=1 TLS_CLIENT_LIVE_TARGET=cloudflare bun scripts/live-challenge.ts
+```
+
+Otherwise it prints `{"kind":"LIVE_OFF"}` without requests. This reviewed-source
+measurement runs original inline classic programs sequentially with the complete
+response snapshot, no source changes or shims, a 5-second runtime deadline, and
+16 network requests per evaluation. DataDome permits only the page, `js.datadome.co`,
+and `api-js.datadome.co` origins; Cloudflare guest requests additionally require
+`/cdn-cgi/challenge-platform/`. Host-call counters exclude internal redirect hops;
+the library checks their origins, but the host wrapper cannot check their paths.
+It prints one schema-encoded, bounded receipt containing counts and booleans only;
+unexpected failures print `UNKNOWN` and exit 2. `proven` requires initial non-2xx
+enforcement, a fresh provider cookie, one same-URL retry, and a nonredirected 2xx
+without recognized challenges or provider markers. Cookie changes alone are not
+clearance; unsupported document/VM features can prevent measurement. Nothing runs
+against live targets during local tests (`bun test scripts/live-policy.test.ts`);
+the test lives beside the scripts because the package's TypeScript `rootDir`
+excludes root scripts.
+
 ## Session and identity
 
 Create a browser session with `Browser.open` and a `BrowserSessionConfig`:
@@ -153,6 +178,24 @@ const program = Effect.scoped(
   }),
 );
 ```
+
+### Final response hook
+
+Pass an optional `responseHandler(response, context)` to `Browser.open` or
+`Browser.fromSession` to inspect ordinary final navigation responses, including
+unrecognized DataDome `403` pages. It runs only after Location and HTML redirects
+settle; recognized AWS/Cloudflare challenges go exclusively to `challengeHandler`.
+The shared `BrowserChallengeContext` exposes `body`, `transport`, and explicit
+`evaluateClassic(source, { document: "response" })` for reviewed scripts with the
+session's Go Jar and script network policy. Supply `scriptRuntime` for evaluation;
+response HTML never executes automatically.
+
+Return `Effect.succeedNone` to preserve the response, or `Effect.succeedSome({})`
+to retry the same URL (optional `url` and `headers` override the retry). Both hooks
+share `maxChallengeRetries` and the 5-second handler deadline; exhausted retries
+return the response without invoking either hook. Evaluation resources and cookie
+writes use the same lifetime as the challenge path. Omitting `responseHandler`
+adds no script execution or cookie reads.
 
 ### Composing challenge handlers
 
@@ -390,8 +433,9 @@ tags are a, address, article, aside, b, blockquote, code, div, em, footer, heade
 i, main, p, section, small, span, strong, sub, sup, u; standard void tags except
 col are accepted. Script/style contain inert raw text. Simple comments, properly
 nested explicit closing tags, quoted/unquoted/boolean attributes, amp/apos/gt/lt/quot
-and valid numeric references are supported. Full documents, doctype, document repair,
-unsupported tags/references and script escape syntax reject the whole fragment.
+and valid numeric references are supported. Full documents, doctypes in fragment
+mode, document repair, unsupported tags/references and script escape syntax reject
+the whole fragment.
 Unsupported syntax and limits become finite `BrowserScriptError` reasons, without
 embedding HTML. Raw HTML is not sent over IPC, fetched, or persisted by BrowserMock;
 only Schema-validated parsed records and complete textContent cross the boundary.
@@ -429,8 +473,12 @@ native-browser fingerprinting or provider-selector support.
 ### Explicit complete-document snapshot (experimental)
 
 Low-level callers may instead pass `document?: string` in `BrowserScriptContext`,
-mutually exclusive with `html`. Supply a complete `<!doctype html>` document with
-explicit `html`, `head`, and `body` opening and closing tags:
+mutually exclusive with `html`. Supply a complete document with explicit `html`,
+`head`, and `body` opening and closing tags. The only accepted doctypes are
+`<!doctype html>` and `<!DOCTYPE html SYSTEM "about:legacy-compat">` (keywords are
+ASCII-case-insensitive; either matching quote style is accepted). A doctype may
+be omitted only when explicit `<html` followed by HTML whitespace or `>` is the
+first token after optional leading HTML whitespace and simple comments:
 
 ```ts
 const context = {
@@ -463,7 +511,8 @@ unattributed, unslashed closure is still required. No trimming, repair, omission
 or fabricated IDs occurs. Head and fragment noscript remain unsupported, and
 `createElement("noscript")` is still unsupported. Noscript cannot accept appended
 children or attribute/text writes. Table, foreign content, form, base, omitted
-structural parts, legacy doctypes, and BOMs reject.
+html/head/body roots, PUBLIC or other SYSTEM identifiers, internal subsets, and
+BOMs reject.
 Whitespace after `</body>` or `</html>` is appended to html/body `textContent`, following the native insertion-mode rules.
 
 Original parsed html/head/body attributes and record identity are readonly;
@@ -706,8 +755,8 @@ await window.acquireFixture(); // Separate, fixture-defined acquisition promise.
 
 Awaiting `load` alone does not mean acquisition succeeded. The external asset
 must be reviewed and its exact origin allowed; verify the actual follow-up page
-rather than treating a load event or returned value as clearance. Unawaited load
-or acquisition work ends when evaluation completes.
+rather than treating a load event or returned value as clearance. After successful
+completion, pending natural work is retained until idle or the bounded cutoff below.
 
 Options are Schema-validated when the handler executes; invalid options fail
 with `BrowserSessionError` kind `Config` before evaluation. `cookieNames` is a
@@ -738,11 +787,15 @@ execution without that capability fails with `BrowserScriptError`, reason
 Direct callers can use `runBoundedScript(runtime, source, context, host, "classic")`;
 the fifth argument is Schema-validated and defaults to `"async"`.
 
-The script completion value is awaited once under the same shared deadline,
-then authoritative host cookie writes are flushed. A final expression Promise
-can explicitly wait for acquisition work; undefined completion returns an empty
-string, not clearance or a retry. Unawaited acquisition is **not** implicitly
-awaited. This adds no HTML script discovery, source rewriting, automatic SDK
+The script completion value is awaited once under the same shared deadline.
+After success, pending script-element loads, fetch/XHR requests, and scheduled
+timers (including nested work) are retained until idle or 100 ms before that
+deadline, reserving time to flush authoritative cookie writes and encode the
+result. Expiry discards remaining work without failing evaluation; recurring
+intervals keep it alive until this cutoff. Failure does not retain work. A final
+expression Promise can explicitly wait for acquisition; undefined completion
+returns an empty string, not clearance or a retry. This adds no HTML script
+discovery, source rewriting, automatic SDK
 configuration, vendor resolver, or claim of challenge clearance. All existing
 source/network/frame/crypto/timer/DOM quotas, origins, credentials, Node permission
 denials and the hard process cutoff remain unchanged. String-based `eval` and
@@ -756,31 +809,36 @@ before callback execution.
 If reviewed source uses `document.loadScript`, await the actual acquisition
 operation too, not just asset loading. Assign shared entry points to `window`
 globals when using default async evaluation: that source runs inside an async
-wrapper, so local declarations are not shared globals. Unawaited work ends when evaluation completes. The
+wrapper, so local declarations are not shared globals. Bounded retention of
+unawaited natural work is not a guarantee of acquisition completion. The
 runtime defaults to a 2-second hard deadline; navigation also caps the whole
 handler at 5 seconds. Origin review/allowlisting does not provide an exact-byte
 asset integrity pin. Existing source, input, body, origin, credential, and
 network quotas still apply. For advanced per-response configuration, use the
 existing custom `challengeHandler` rather than a separate callback API.
 
-The bridge is intentionally small: up to 8 network requests per evaluation.
+The bridge defaults to 8 network requests per evaluation, including redirect hops.
+Set `BrowserMock.layer({ maxNetworkRequests })` (or the custom runtime property)
+to an integer from 1 through 16; invalid values fail configuration validation.
 Host-side network requests are serialized to preserve authoritative cookie
 snapshots. Other
 limits are 128 request headers and 64 KiB of header-name/value bytes per
 request, 16 KiB per request body, 64 KiB per fetch/XHR response, 1 MiB per
-`document.loadScript` asset, and 1 MiB of total network data per evaluation
+`document.loadScript` asset, and 2 MiB of total network data per evaluation
 (including serialized requests, response headers, and bodies). The 64 KiB
 initial `context.evaluate` source limit is separate from the network-loaded
 script asset limit. Host-to-runner network-response JSON IPC is capped at 8 MiB
-per line, and all host-to-runner messages share an 8 MiB evaluation budget;
+per line, and all host-to-runner messages share a 16 MiB evaluation budget;
 startup and control lines remain capped at 128 KiB. This covers the sixfold
-worst-case JSON escaping of a 1 MiB body plus bounded headers and cookie state.
+worst-case JSON escaping of two near-1 MiB bodies plus bounded headers and cookie state.
 Runner-to-host IPC remains capped at 128 KiB per line and 1 MiB per evaluation.
 Script cookie state and writes are capped at 64 KiB, with at most 64 writes,
 64 active timers, and 256 timer firings. Timers are capped at 120 seconds.
 Evaluation defaults to a 2-second hard process deadline (configurable up to
-120 seconds); the child and its timers are terminated on completion, failure,
-timeout, or scope closure. Fetch supports string URLs, string bodies, and bounded
+120 seconds); after successful completion, natural work is retained only until
+idle or the deadline reserve described above. The child and its timers are
+terminated after final cookie synchronization, on failure, timeout, or scope
+closure. Fetch supports string URLs, string bodies, and bounded
 FormData multipart bodies. It rejects explicit `mode` values, `credentials` values
 other than `same-origin`, and `redirect` values other than `follow`. Credentials
 are sent only when each request hop matches the page origin: cross-origin fetches

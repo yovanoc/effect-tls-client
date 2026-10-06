@@ -35,11 +35,10 @@ const MAX_REDIRECTS = 15;
 const MAX_CHALLENGE_RETRIES = 1;
 const MAX_CONFIG_REDIRECTS = 100;
 const MAX_CONFIG_CHALLENGE_RETRIES = 10;
-const MAX_SCRIPT_REQUESTS = 8;
 const MAX_SCRIPT_REDIRECTS = 5;
 const MAX_FETCH_RESPONSE_BYTES = 64 * 1024;
 const MAX_SCRIPT_ASSET_BYTES = 1024 * 1024;
-const MAX_SCRIPT_NETWORK_BYTES = 1024 * 1024;
+const MAX_SCRIPT_NETWORK_BYTES = 2 * 1024 * 1024;
 const MAX_SCRIPT_REQUEST_BODY_BYTES = 16 * 1024;
 const MAX_SCRIPT_HEADERS = 128;
 const MAX_SCRIPT_HEADER_BYTES = 64 * 1024;
@@ -236,6 +235,11 @@ export type BrowserChallengeHandler = (
 /** Optional application-owned script and challenge capabilities. */
 export interface BrowserHandlers {
   readonly challengeHandler?: BrowserChallengeHandler;
+  /** Runs only on final navigation responses without a recognized challenge. */
+  readonly responseHandler?: (
+    response: TlsResponse,
+    context: BrowserChallengeContext,
+  ) => ReturnType<BrowserChallengeHandler>;
   readonly scriptRuntime?: BrowserScriptRuntime;
   readonly frameReviewer?: BrowserFrameReviewer;
 }
@@ -680,6 +684,7 @@ const makeScriptHost = (
   identityHeaders: ReadonlyArray<Pair>,
   headerOrder: ReadonlyArray<string> | undefined,
   allowedOrigins: ReadonlyArray<string>,
+  maxNetworkRequests: number,
   frameReviewer: BrowserFrameReviewer | undefined,
   rootSourceBytes: number,
 ): BrowserScriptHost => {
@@ -809,9 +814,9 @@ const makeScriptHost = (
         let referer = pageUrl;
 
         for (let redirect = 0; ; redirect += 1) {
-          if (++requestCount > MAX_SCRIPT_REQUESTS) {
+          if (++requestCount > maxNetworkRequests) {
             return yield* new BrowserScriptError({
-              reason: `script network request budget exceeds ${MAX_SCRIPT_REQUESTS} requests`,
+              reason: `script network request budget exceeds ${maxNetworkRequests} requests`,
             });
           }
           const requestOrigin =
@@ -1244,6 +1249,17 @@ const makeBrowserSession = (
             cause,
           }),
       });
+      const maxNetworkRequests = yield* Schema.decodeEffect(
+        Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })),
+      )(runtime.maxNetworkRequests ?? 8).pipe(
+        Effect.mapError(
+          (cause) =>
+            new BrowserScriptError({
+              reason: "invalid script maxNetworkRequests",
+              cause,
+            }),
+        ),
+      );
       const rootSource = yield* Schema.decodeUnknownEffect(Schema.String)(
         source,
       ).pipe(
@@ -1262,6 +1278,7 @@ const makeBrowserSession = (
         requestIdentityHeaders,
         requestHeaderOrder,
         allowedOrigins,
+        maxNetworkRequests,
         handlers.frameReviewer,
         new TextEncoder().encode(rootSource).byteLength,
       );
@@ -1407,55 +1424,81 @@ const makeBrowserSession = (
             Exit.isFailure(exit) ? response.close : Effect.void,
           ),
         );
+        if (challenge === undefined) {
+          const htmlTarget = redirectTarget(response, body);
+          if (Option.isSome(htmlTarget)) {
+            const next = yield* absoluteUrl(
+              htmlTarget.value,
+              response.url,
+            ).pipe(Effect.ensuring(response.close));
+            return yield* step({
+              current: next,
+              referer: response.url,
+              extraHeaders: [],
+              hop: input.hop + 1,
+              challengeRetries: input.challengeRetries,
+            });
+          }
+        }
+
+        const handler =
+          challenge === undefined
+            ? handlers.responseHandler?.bind(undefined, response)
+            : handlers.challengeHandler?.bind(undefined, challenge);
         if (
-          challenge !== undefined &&
-          handlers.challengeHandler !== undefined &&
+          handler !== undefined &&
           input.challengeRetries < maxChallengeRetries
         ) {
-          const resolution = yield* handlers
-            .challengeHandler(challenge, {
-              transport,
-              response,
-              body,
-              evaluateClassic: (source, options) =>
-                evaluate(
-                  response,
-                  source,
-                  documentReferrer,
-                  "classic",
-                  body,
-                  options,
-                ),
-              evaluate: (source, options) =>
-                evaluate(
-                  response,
-                  source,
-                  documentReferrer,
-                  "async",
-                  body,
-                  options,
-                ),
-            })
-            .pipe(
-              Effect.timeoutOrElse({
-                duration: CHALLENGE_HANDLER_TIMEOUT,
-                orElse: () =>
-                  Effect.fail(
-                    new BrowserSessionError({
-                      operation: "challenge handler",
-                      kind: "ChallengeLimit",
-                      message: "challenge handler timed out",
-                    }),
-                  ),
-              }),
-              Effect.onExit((exit) =>
-                Exit.isFailure(exit) ? response.close : Effect.void,
+          const context: BrowserChallengeContext = {
+            transport,
+            response,
+            body,
+            evaluateClassic: (source, options) =>
+              evaluate(
+                response,
+                source,
+                documentReferrer,
+                "classic",
+                body,
+                options,
               ),
-            );
+            evaluate: (source, options) =>
+              evaluate(
+                response,
+                source,
+                documentReferrer,
+                "async",
+                body,
+                options,
+              ),
+          };
+          const operation =
+            challenge === undefined ? "response handler" : "challenge handler";
+          const resolution = yield* handler(context).pipe(
+            Effect.timeoutOrElse({
+              duration: CHALLENGE_HANDLER_TIMEOUT,
+              orElse: () =>
+                Effect.fail(
+                  new BrowserSessionError({
+                    operation,
+                    kind: "ChallengeLimit",
+                    message: `${operation} timed out`,
+                  }),
+                ),
+            }),
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit) ? response.close : Effect.void,
+            ),
+          );
           if (Option.isSome(resolution)) {
             const retryHeaders = resolution.value.headers ?? [];
             const next = yield* Effect.gen(function* () {
-              yield* validateHeaders("challenge headers", retryHeaders);
+              yield* validateHeaders(
+                challenge === undefined
+                  ? "response headers"
+                  : "challenge headers",
+                retryHeaders,
+              );
               return resolution.value.url === undefined
                 ? input.current
                 : yield* absoluteUrl(resolution.value.url, input.current);
@@ -1468,24 +1511,6 @@ const makeBrowserSession = (
               challengeRetries: input.challengeRetries + 1,
             });
           }
-        }
-
-        if (challenge !== undefined) {
-          return pageFrom(response, body, challenge);
-        }
-
-        const htmlTarget = redirectTarget(response, body);
-        if (Option.isSome(htmlTarget)) {
-          const next = yield* absoluteUrl(htmlTarget.value, response.url).pipe(
-            Effect.ensuring(response.close),
-          );
-          return yield* step({
-            current: next,
-            referer: response.url,
-            extraHeaders: [],
-            hop: input.hop + 1,
-            challengeRetries: input.challengeRetries,
-          });
         }
 
         return pageFrom(response, body, challenge);

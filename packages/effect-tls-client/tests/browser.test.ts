@@ -4079,7 +4079,7 @@ describe("browser layer", () => {
             script.onload = () => resolve("load"); script.onerror = () => resolve("error");
             document.head.appendChild(script);
           });
-          return [await load(), await load()].join("|");
+          return [await load(), await load(), await load(), await load()].join("|");
         `,
             {
               url: "https://allowed.test/page",
@@ -4101,8 +4101,9 @@ describe("browser layer", () => {
               setCookie: () => Effect.succeed(""),
             },
           );
-          expect(aggregate.value).toBe("load|error");
-          expect(largeRequests).toBe(2);
+          expect(aggregate.value).toBe("load|load|load|error");
+          expect(largeRequests).toBe(4);
+          const retentionStarted = performance.now();
           const unawaited = yield* runtime.evaluate(
             `
           const script = document.createElement("script"); script.src = "/never.js";
@@ -4120,6 +4121,7 @@ describe("browser layer", () => {
             },
           );
           expect(unawaited.value).toBe("root finished");
+          expect(performance.now() - retentionStarted).toBeGreaterThan(200);
         }),
     );
   });
@@ -4896,8 +4898,11 @@ describe("frame host", () => {
             bodyBytes: null,
           });
           yield* load(host);
+          yield* load(host);
+          yield* load(host);
+          yield* load(host);
           const failure = yield* rejected(load(host));
-          expect(failure.reason).toMatch(/byte budget|1 MiB/u);
+          expect(failure.reason).toContain("byte budget");
           return "ok";
         }),
       empty,

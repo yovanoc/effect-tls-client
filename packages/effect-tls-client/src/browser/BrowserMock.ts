@@ -34,16 +34,15 @@ const TimeoutMs = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(
 );
 const MAX_SOURCE_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
-const MAX_INPUT_BYTES = 8 * 1024 * 1024;
+const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 const MAX_INPUT_LINE_BYTES = 8 * 1024 * 1024;
 const MAX_CONTROL_INPUT_LINE_BYTES = 128 * 1024;
 const MAX_OUTPUT_LINE_BYTES = 128 * 1024;
-const MAX_NETWORK_REQUESTS = 8;
 const MAX_CONCURRENT_REQUESTS = 4;
 const MAX_REQUEST_BODY_BYTES = 16 * 1024;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_SCRIPT_ASSET_BYTES = 1024 * 1024;
-const MAX_TOTAL_NETWORK_BYTES = 1024 * 1024;
+const MAX_TOTAL_NETWORK_BYTES = 2 * 1024 * 1024;
 const MAX_COOKIE_BYTES = 64 * 1024;
 const MAX_COOKIE_WRITES = 64;
 const MAX_SCRIPT_HEADERS = 128;
@@ -282,22 +281,23 @@ const RunnerInputMessage = Schema.Union([
 const RunnerStartJson = Schema.fromJsonString(RunnerStart);
 const RunnerMessageJson = Schema.fromJsonString(RunnerMessage);
 
-const RUNNER_SOURCE = makeBrowserScriptRunnerSource({
-  maxTimeoutMs: MAX_TIMEOUT_MS,
-  maxInputLineBytes: MAX_INPUT_LINE_BYTES,
-  maxControlInputLineBytes: MAX_CONTROL_INPUT_LINE_BYTES,
-  maxOutputLineBytes: MAX_OUTPUT_LINE_BYTES,
-  maxOutputBytes: MAX_OUTPUT_BYTES,
-  maxCookieBytes: MAX_COOKIE_BYTES,
-  maxNetworkRequests: MAX_NETWORK_REQUESTS,
-  maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES,
-  maxTotalNetworkBytes: MAX_TOTAL_NETWORK_BYTES,
-  maxHeaders: MAX_SCRIPT_HEADERS,
-  maxHeaderBytes: MAX_SCRIPT_HEADER_BYTES,
-  maxCookieWrites: MAX_COOKIE_WRITES,
-  maxTimers: MAX_TIMERS,
-  maxTimerDelayMs: MAX_TIMER_DELAY_MS,
-});
+const makeRunnerSource = (maxNetworkRequests: number) =>
+  makeBrowserScriptRunnerSource({
+    maxTimeoutMs: MAX_TIMEOUT_MS,
+    maxInputLineBytes: MAX_INPUT_LINE_BYTES,
+    maxControlInputLineBytes: MAX_CONTROL_INPUT_LINE_BYTES,
+    maxOutputLineBytes: MAX_OUTPUT_LINE_BYTES,
+    maxOutputBytes: MAX_OUTPUT_BYTES,
+    maxCookieBytes: MAX_COOKIE_BYTES,
+    maxNetworkRequests,
+    maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES,
+    maxTotalNetworkBytes: MAX_TOTAL_NETWORK_BYTES,
+    maxHeaders: MAX_SCRIPT_HEADERS,
+    maxHeaderBytes: MAX_SCRIPT_HEADER_BYTES,
+    maxCookieWrites: MAX_COOKIE_WRITES,
+    maxTimers: MAX_TIMERS,
+    maxTimerDelayMs: MAX_TIMER_DELAY_MS,
+  });
 
 interface Output {
   readonly result?: Schema.Schema.Type<typeof RunnerOutput>;
@@ -479,7 +479,11 @@ const makeEvaluate = (
           .spawn(
             ChildProcess.make(
               executable,
-              ["--permission", "-e", RUNNER_SOURCE],
+              [
+                "--permission",
+                "-e",
+                makeRunnerSource(options.maxNetworkRequests ?? 8),
+              ],
               {
                 detached: true,
                 env: environment,
@@ -619,12 +623,12 @@ const makeEvaluate = (
             }
             const requestBytes = lineBytes(JSON.stringify(event));
             networkRequests += 1;
-            if (networkRequests > MAX_NETWORK_REQUESTS) {
+            if (networkRequests > (options.maxNetworkRequests ?? 8)) {
               yield* writeInput({
                 type: "reply",
                 id: event.id,
                 ok: false,
-                error: `script request budget exceeds ${MAX_NETWORK_REQUESTS} requests`,
+                error: `script request budget exceeds ${options.maxNetworkRequests ?? 8} requests`,
               });
               return;
             }
@@ -803,7 +807,7 @@ const makeEvaluate = (
                   return yield* new BrowserScriptError({
                     reason: "frame budget exceeded (4 frames)",
                   });
-                if (++networkRequests > MAX_NETWORK_REQUESTS)
+                if (++networkRequests > (options.maxNetworkRequests ?? 8))
                   return yield* new BrowserScriptError({
                     reason: "script network request budget exceeded",
                   });
@@ -1095,6 +1099,9 @@ export const BrowserMockOptions = Schema.Struct({
   executable: Schema.optionalKey(Schema.String),
   allowedOrigins: Schema.optionalKey(Schema.Array(Schema.String)),
   timeoutMs: Schema.optionalKey(TimeoutMs),
+  maxNetworkRequests: Schema.optionalKey(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })),
+  ),
 });
 export interface BrowserMockOptions extends Schema.Schema.Type<
   typeof BrowserMockOptions
@@ -1134,6 +1141,7 @@ export class BrowserMock extends Context.Service<
         const hostRequestSemaphore = yield* Semaphore.make(1);
         return BrowserMock.of({
           allowedOrigins,
+          maxNetworkRequests: options.maxNetworkRequests ?? 8,
           timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           evaluateClassic: makeEvaluate(
             spawner,

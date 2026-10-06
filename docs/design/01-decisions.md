@@ -152,3 +152,14 @@ the public fingerprint echo remains disabled unless explicitly opted in by
 and platform-specific process behavior must be exercised where the binary runs.
 An external service is useful as a fingerprint regression signal but must never
 make ordinary CI, local development, or package installation network-dependent.
+
+## D20 — Bounded document prologue
+
+**Decision:** The experimental document snapshot accepts `<!doctype html>` or the
+exact `SYSTEM "about:legacy-compat"` form (case-insensitive keywords and matching
+single or double quotes). A doctype may be omitted only before an explicit first
+`<html>` start tag after leading HTML whitespace and simple comments. Parsing still
+requires explicit html/head/body roots and exposes no DocumentType or quirks API.
+
+**Why:** Permit the narrow prologue variations needed without HTML repair or
+expanding the bounded document model.

@@ -19,6 +19,13 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const bootstrap = String.raw`
 (() => {
   const post = __post;
+  const naturalWork = __naturalWork;
+  delete globalThis.__naturalWork;
+  let idleResolve;
+  const waitForIdle = () => new NativePromise((resolve) => {
+    idleResolve = resolve;
+    if (!post('{"type":"retention.wait"}')) { idleResolve = undefined; resolve(); }
+  });
   const childRealm = __childRealm;
   const consumeBudget = __consumeBudget;
   delete globalThis.__childRealm; delete globalThis.__consumeBudget;
@@ -929,7 +936,9 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (!authoritativeCookies || cookieVersion <= acknowledgedCookieVersion) return Promise.resolve();
     return new Promise((resolve, reject) => cookieWaiters.push({ version: cookieVersion, resolve, reject }));
   };
-  const request = (kind, url, method, headers, body) => flushCookies().then(() => new Promise((resolve, reject) => {
+  const request = (kind, url, method, headers, body) => {
+    naturalWork(1);
+    return flushCookies().then(() => new Promise((resolve, reject) => {
     if (childRealm) { reject(new NativeTypeError("frame network APIs are unsupported")); return; }
     try {
       if (outgoingNetworkRequests >= MAX_NETWORK_REQUESTS) throw new NativeTypeError("script network request budget exceeded");
@@ -975,7 +984,11 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     } catch (cause) {
       reject(cause);
     }
-  }));
+  })).then(
+      (value) => { naturalWork(-1); return value; },
+      (cause) => { naturalWork(-1); throw cause; },
+    );
+  };
   const safeMessage = (cause) => {
     try {
       if (typeof cause === "string") return cause;
@@ -989,6 +1002,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (timer.interval === undefined) { timers.delete(id); send({ type: "timer.clear", id }); }
     try { timer.callback(...timer.args); }
     catch (cause) { reportException(cause); }
+    if (timer.interval === undefined) naturalWork(-1);
     if (timer.interval !== undefined && timers.get(id) === timer) {
       send({ type: "timer.set", id, ms: timer.interval });
     }
@@ -996,6 +1010,10 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
   const receive = (raw) => {
     let message;
     try { message = JSON.parse(String(raw)); } catch { return; }
+    if (message.type === "retention.done") {
+      if (idleResolve) { const resolve = idleResolve; idleResolve = undefined; resolve(); }
+      return;
+    }
     if (message.type === "cookie.sync") {
       syncCookies(message.cookie, message.version, message.applied, message.error);
       return;
@@ -1219,6 +1237,7 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     const id = ++nextTimerId;
     const ms = Number.isFinite(Number(delay)) ? Math.max(0, Math.min(Number(delay), ${limits.maxTimerDelayMs})) : 0;
     timers.set(id, { callback, args });
+    naturalWork(1);
     send({ type: "timer.set", id, ms });
     return id;
   };
@@ -1228,12 +1247,13 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     const id = ++nextTimerId;
     const ms = Number.isFinite(Number(delay)) ? Math.max(0, Math.min(Number(delay), ${limits.maxTimerDelayMs})) : 0;
     timers.set(id, { callback, args, interval: ms });
+    naturalWork(1);
     send({ type: "timer.set", id, ms });
     return id;
   };
   const clearTimeout = (id) => {
     const number = Number(id);
-    if (timers.delete(number)) send({ type: "timer.clear", id: number });
+    if (timers.delete(number)) { naturalWork(-1); send({ type: "timer.clear", id: number }); }
   };
   const clearInterval = clearTimeout;
   class Event {
@@ -1749,9 +1769,10 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     if (!src) throw new NativeTypeError("BrowserMock requires an external script src; inline scripts are unsupported");
     state.started = true;
     attached[attached.length] = element;
+    naturalWork(1);
     apply(promiseThen, loadExternalScript(src), [
-      () => element.dispatchEvent(new Event("load")),
-      () => element.dispatchEvent(new Event("error")),
+      () => { try { element.dispatchEvent(new Event("load")); } finally { naturalWork(-1); } },
+      () => { try { element.dispatchEvent(new Event("error")); } finally { naturalWork(-1); } },
     ]);
     return element;
   };
@@ -2020,18 +2041,20 @@ export const makeBrowserScriptRunnerSource = (limits: RunnerLimits): string => {
     configurable: true,
     value: () => JSON.stringify({ setCookies: pendingCookieWrites.map((entry) => entry.value), error: cookieError }),
   });
+  Object.defineProperty(globalThis, "__waitForIdle", { value: waitForIdle, configurable: true });
   Object.defineProperty(globalThis, "__cookieFlush", { value: flushCookies, configurable: true });
   Object.defineProperty(globalThis, "__safeMessage", { value: safeMessage, configurable: true });
 })();
 `;
 
   const completionPrelude = String.raw`(() => {
-    const snapshot = __cookieSnapshot, flush = __cookieFlush, describe = __safeMessage;
+    const snapshot = __cookieSnapshot, flush = __cookieFlush, describe = __safeMessage, idle = __waitForIdle;
     const parse = JSON.parse, stringify = JSON.stringify, string = String;
     return [false, true].map((failed) => async (value) => {
       try {
         if (failed) throw value;
         value = await value;
+        await idle();
         await flush();
         const state = parse(snapshot());
         if (state.error) return stringify({ ok: false, reason: state.error });
@@ -2217,6 +2240,31 @@ const invokeInRealm = (realm, fn, value) => {
 const deliverTo = (realm, line) => invokeInRealm(realm, receivers.get(realm), line);
 let context;
 let finished = false;
+let naturalWorkCount = 0;
+let retentionWaiting = false;
+let retentionExpired = false;
+let retentionTimer;
+let idleCheck;
+const endRetention = (expired) => {
+  if (!retentionWaiting || finished) return;
+  retentionWaiting = false;
+  retentionExpired = expired;
+  clearTimeout(retentionTimer); clearImmediate(idleCheck);
+  try { deliverTo(context, '{"type":"retention.done"}'); }
+  catch (cause) { writeFinal({ ok: false, reason: safeMessage(cause) }); }
+};
+const checkIdle = () => {
+  if (!retentionWaiting || finished || idleCheck !== undefined) return;
+  // Let response/timer promise reactions (including nested work) drain before idle.
+  idleCheck = setImmediate(() => {
+    idleCheck = undefined;
+    if (naturalWorkCount === 0) endRetention(false);
+  });
+};
+const naturalWork = (delta) => {
+  naturalWorkCount += delta;
+  checkIdle();
+};
 const safeMessage = (cause) => {
   try {
     if (typeof cause === "string") return cause;
@@ -2227,6 +2275,7 @@ const safeMessage = (cause) => {
 const writeFinal = (output) => {
   if (finished) return;
   finished = true;
+  clearTimeout(retentionTimer); clearImmediate(idleCheck);
   frames.clear(); timerOwners.clear();
   hostCryptoKeys.clear();
   hostCryptoKeyIds.clear();
@@ -2237,6 +2286,13 @@ const post = (line, owner = context) => {
     let bytes = Buffer.byteLength(line) + 1;
     if (typeof line !== "string" || bytes - 1 > MAX_OUTPUT_LINE_BYTES || outputBytes + bytes > MAX_OUTPUT_BYTES) return false;
     const message = JSON.parse(line);
+    if (message.type === "retention.wait") {
+      if (owner !== context || retentionWaiting) return false;
+      retentionWaiting = true;
+      retentionTimer = setTimeout(() => endRetention(true), Math.max(0, deadline - hostMonotonicNow() - 100));
+      checkIdle();
+      return true;
+    }
     if (message.type === "frame.load") {
       if (owner !== context || ++nextFrameId > 4) return false;
       frames.set(message.id, { id: nextFrameId, parent: owner, url: message.url });
@@ -2270,12 +2326,13 @@ const post = (line, owner = context) => {
 const bootstrap = ${JSON.stringify(bootstrap)};
 // Node 25 can retain VM-created globals after deletion through the host sandbox.
 // These fixed kernel sources run before any guest code and verify realm-local removal.
-const cleanupPrivateBindings = "{ for (const key of ['__scriptErrorReporter', '__receive', '__post', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
-const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupPrivateBindings = "{ for (const key of ['__scriptErrorReporter', '__receive', '__post', '__naturalWork', '__childRealm', '__consumeBudget', '__documentSnapshot', '__documentRoot', '__urlOperation', '__pageUrl', '__pageLocation', '__referrer', '__cookie', '__userAgent', '__languages', '__authoritativeCookies', '__performanceNow', '__performanceTimeOrigin', '__randomBytes', '__cryptoOperation', '__encodeBlobText', '__decodeBlobText']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
+const cleanupCookieBindings = "{ for (const key of ['__cookieSnapshot', '__cookieFlush', '__safeMessage', '__waitForIdle']) { if (!Reflect.deleteProperty(globalThis, key) || key in globalThis) throw new Error('private binding cleanup failed: ' + key); } }";
 const handleParentLine = (line) => {
   try {
     if (Buffer.byteLength(line) > MAX_INPUT_LINE_BYTES) throw new Error("host IPC line exceeds the limit");
     let message = JSON.parse(line);
+    if (retentionExpired && message.type !== "cookie.sync" && message.type !== "fatal") return;
     if (message.type === "fatal") {
       writeFinal({ ok: false, reason: String(message.reason) });
       return;
@@ -2371,6 +2428,7 @@ const createRealm = (input, childRealm) => {
   const pageLocation = hostPageLocation(String(input.url));
   const sandbox = Object.assign(Object.create(null), {
     __post: (line) => post(line, realm),
+    __naturalWork: naturalWork,
     __childRealm: childRealm,
     __documentSnapshot: JSON.stringify(childRealm ? null : input.documentSnapshot ?? null),
     __documentRoot: JSON.stringify(childRealm ? null : input.documentRoot ?? null),

@@ -325,11 +325,7 @@ it.effect(
         const wrap = (body: string) =>
           "<!doctype html><html><head></head><body>" + body + "</body></html>";
         for (const [document, reason, failure] of [
-          [
-            "<html><head></head><body></body></html>",
-            "unsupported HTML document",
-            "UnsupportedInput",
-          ],
+          ["<body></body>", "unsupported HTML document", "UnsupportedInput"],
           [wrap("<div>"), "unsupported HTML document", "UnsupportedInput"],
           [
             wrap("<noscript>" + "x".repeat(40000) + "</noscript>"),
@@ -643,7 +639,7 @@ it.effect(
           "<!doctype html><html><head></head><body>" + body + "</body></html>";
         for (const [rule, document] of [
           ["InputEncoding", wrap("\u0000")],
-          ["Doctype", "<html></html>"],
+          ["Doctype", "<body></body>"],
           ["DocumentStructure", "<!doctype html><head></head>"],
           [
             "HeadContentSubset",

@@ -163,6 +163,8 @@ export const BrowserScriptMode = Schema.Literals(["async", "classic"]);
 export interface BrowserScriptRuntime {
   readonly evaluateClassic?: BrowserScriptRuntime["evaluate"];
   readonly allowedOrigins?: ReadonlyArray<string>;
+  /** Per-evaluation request cap, including redirects: integer 1–16, default 8. */
+  readonly maxNetworkRequests?: number;
   readonly timeoutMs?: number;
   readonly evaluate: (
     source: string,

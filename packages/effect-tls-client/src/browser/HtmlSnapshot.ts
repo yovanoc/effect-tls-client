@@ -388,9 +388,37 @@ const parseHtml = (
       reject("only the standard <!doctype html> is supported", "Doctype");
     }
     cursor += 4;
-    if (!isHtmlWhitespace(source[cursor]) && source[cursor] !== ">") {
+    if (source[cursor] === ">") {
+      cursor += 1;
+      documentPhase = "beforeHtml";
+      return;
+    }
+    if (!isHtmlWhitespace(source[cursor])) {
       reject("legacy doctype identifiers are unsupported", "Doctype");
     }
+    while (isHtmlWhitespace(source[cursor])) cursor += 1;
+    if (
+      !asciiEqualsAt(cursor, "system") ||
+      !isHtmlWhitespace(source[cursor + 6])
+    ) {
+      reject("legacy doctype identifiers are unsupported", "Doctype");
+    }
+    cursor += 6;
+    while (isHtmlWhitespace(source[cursor])) cursor += 1;
+    const quote = source[cursor];
+    if (quote !== "'" && quote !== '"') {
+      reject("legacy doctype identifiers are unsupported", "Doctype");
+    }
+    cursor += 1;
+    const identifierStart = cursor;
+    while (cursor < source.length && source[cursor] !== quote) cursor += 1;
+    if (
+      cursor === source.length ||
+      source.slice(identifierStart, cursor) !== "about:legacy-compat"
+    ) {
+      reject("legacy doctype identifiers are unsupported", "Doctype");
+    }
+    cursor += 1;
     while (isHtmlWhitespace(source[cursor])) cursor += 1;
     if (source[cursor] !== ">") {
       reject("legacy doctype identifiers are unsupported", "Doctype");
@@ -672,6 +700,14 @@ const parseHtml = (
         continue;
       }
       if (mode === "document" && currentPhase() === "beforeDoctype") {
+        if (
+          source[cursor] === "<" &&
+          asciiEqualsAt(cursor + 1, "html") &&
+          (isHtmlWhitespace(source[cursor + 5]) || source[cursor + 5] === ">")
+        ) {
+          documentPhase = "beforeHtml";
+          continue;
+        }
         parseDoctype();
         continue;
       }

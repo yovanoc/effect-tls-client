@@ -1227,7 +1227,7 @@ describeRealIntegration("real BrowserMock integration", () => {
                         "true",
                         "script fetch response exceeds the 64 KiB limit",
                         "script asset exceeds the 1 MiB limit",
-                        "script network byte budget exceeded",
+                        "", // Both valid assets now fit the 2 MiB total budget.
                       ].join("|"),
                     );
                     return Option.none();
@@ -1398,7 +1398,7 @@ describeRealIntegration("real BrowserMock integration", () => {
       }),
   );
 
-  it.live("does not wait for an unawaited acquisition", () =>
+  it.live("retains unawaited natural acquisition work until idle", () =>
     Effect.gen(function* () {
       const fixture = yield* Effect.promise(() =>
         startAcquisitionFixture("no-cookie"),
@@ -1420,12 +1420,15 @@ describeRealIntegration("real BrowserMock integration", () => {
       ).pipe(Effect.ensuring(Effect.promise(fixture.close)));
 
       expect(result.page.status).toBe(202);
-      expect(fixture.paths).toEqual(["/challenge", "/acq.js"]);
+      expect(fixture.paths).toEqual(["/challenge", "/acq.js", "/verify"]);
       expect(result.cookies).not.toContainEqual(
         expect.objectContaining({ name: "clearance" }),
       );
-      expect(result.cookies).not.toContainEqual(
-        expect.objectContaining({ name: "acquisition-marker" }),
+      expect(result.cookies).toContainEqual(
+        expect.objectContaining({
+          name: "acquisition-marker",
+          value: "complete",
+        }),
       );
     }),
   );

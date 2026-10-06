@@ -378,12 +378,104 @@ describe("parseHtmlDocument", () => {
     });
   });
 
+  it("accepts an omitted doctype only before an explicit html root", () => {
+    const document = "<html><head></head><body>content</body></html>";
+    const withDoctype = parseHtmlDocument(`<!doctype html>${document}`);
+
+    expect(parseHtmlDocument(document)).toEqual(withDoctype);
+    expect(
+      parseHtmlDocument(` \n<!-- leading comment -->\n${document}`),
+    ).toEqual(withDoctype);
+  });
+
   it.each([
-    ["missing doctype", "<html><head></head><body></body></html>"],
     [
-      "legacy doctype",
-      '<!doctype html PUBLIC "legacy"><html><head></head><body></body></html>',
+      "legacy doctype with double quotes",
+      '<!DOCTYPE html SYSTEM "about:legacy-compat">',
     ],
+    [
+      "legacy doctype with single quotes",
+      "<!DOCTYPE html SYSTEM 'about:legacy-compat'>",
+    ],
+    [
+      "mixed-case legacy doctype",
+      '<!dOcTyPe hTmL sYsTeM "about:legacy-compat">',
+    ],
+    [
+      "newline-separated legacy doctype",
+      '<!doctype\nhtml\nSYSTEM\n"about:legacy-compat"\n>',
+    ],
+  ])("accepts %s", (_case, doctype) => {
+    expect(
+      parseHtmlDocument(`${doctype}<html><head></head><body></body></html>`)
+        ._tag,
+    ).toBe("Success");
+  });
+
+  it.each([
+    [
+      "PUBLIC identifiers",
+      '<!doctype html PUBLIC "legacy"><html><head></head><body></body></html>',
+      "Doctype",
+    ],
+    [
+      "other SYSTEM identifiers",
+      '<!doctype html SYSTEM "about:other"><html><head></head><body></body></html>',
+      "Doctype",
+    ],
+    [
+      "case-different SYSTEM identifier",
+      '<!doctype html SYSTEM "ABOUT:LEGACY-COMPAT"><html><head></head><body></body></html>',
+      "Doctype",
+    ],
+    [
+      "mismatched double-quoted identifier",
+      `<!doctype html SYSTEM "about:legacy-compat'><html><head></head><body></body></html>`,
+      "Doctype",
+    ],
+    [
+      "mismatched single-quoted identifier",
+      `<!doctype html SYSTEM 'about:legacy-compat"><html><head></head><body></body></html>`,
+      "Doctype",
+    ],
+    [
+      "internal subset",
+      "<!doctype html [internal]><html><head></head><body></body></html>",
+      "Doctype",
+    ],
+    [
+      "duplicate doctypes",
+      "<!doctype html><!doctype html><html><head></head><body></body></html>",
+      "MarkupSyntax",
+    ],
+    [
+      "misplaced doctype",
+      "<html><!doctype html><head></head><body></body></html>",
+      "MarkupSyntax",
+    ],
+    ["<htmlx> root", "<htmlx><head></head><body></body></htmlx>", "Doctype"],
+    [
+      "self-closing <html/> root",
+      "<html/><head></head><body></body>",
+      "Doctype",
+    ],
+    ["malformed <html/ root", "<html/", "Doctype"],
+    ["body as first element", "<body></body>", "Doctype"],
+    ["other first element", "<div></div>", "Doctype"],
+    [
+      "text before html",
+      "text<html><head></head><body></body></html>",
+      "DocumentStructure",
+    ],
+    ["fragment in document mode", "<div>content</div>", "Doctype"],
+  ])("rejects %s with its bounded document rule", (_case, document, rule) => {
+    expect(parseHtmlDocument(document)).toMatchObject({
+      _tag: "Unsupported",
+      rule,
+    });
+  });
+
+  it.each([
     [
       "leading BOM",
       "\uFEFF<!doctype html><html><head></head><body></body></html>",
@@ -497,7 +589,7 @@ describe("document-only rejection families", () => {
     "<!doctype html><html><head></head><body>" + body + "</body></html>";
   it.each([
     ["InputEncoding", wrap("\u0000")],
-    ["Doctype", "<html><head></head><body></body></html>"],
+    ["Doctype", "<body></body>"],
     ["DocumentStructure", "<!doctype html><head></head><body></body>"],
     [
       "HeadContentSubset",
