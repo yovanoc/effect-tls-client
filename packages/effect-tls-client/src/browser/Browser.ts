@@ -694,6 +694,7 @@ const makeScriptHost = (
   headerOrder: ReadonlyArray<string> | undefined,
   allowedOrigins: ReadonlyArray<string>,
   allowedPathPrefixes: ScriptPolicy["allowedPathPrefixes"],
+  allowedRequestKinds: ScriptPolicy["allowedRequestKinds"],
   maxNetworkRequests: number,
   frameReviewer: BrowserFrameReviewer | undefined,
   rootSourceBytes: number,
@@ -796,6 +797,8 @@ const makeScriptHost = (
               pageUrl,
               allowedOrigins,
               allowedPathPrefixes,
+              input.kind,
+              allowedRequestKinds,
             );
             if (
               input.kind === "frame" &&
@@ -925,6 +928,8 @@ const makeScriptHost = (
                   target.toString(),
                   allowedOrigins,
                   allowedPathPrefixes,
+                  input.kind,
+                  allowedRequestKinds,
                 );
                 if (
                   final.origin !== target.origin ||
@@ -959,6 +964,8 @@ const makeScriptHost = (
                     target.toString(),
                     allowedOrigins,
                     allowedPathPrefixes,
+                    input.kind,
+                    allowedRequestKinds,
                   ),
                 catch: (cause) =>
                   new BrowserScriptError({
@@ -1038,7 +1045,7 @@ const makeScriptHost = (
             } as const;
           }).pipe(Effect.ensuring(response.close));
 
-          if ("next" in responseResult) {
+          if (responseResult.next !== undefined) {
             const next = responseResult.next;
             if (target.origin !== next.origin) {
               headers = headers.filter(
@@ -1312,6 +1319,7 @@ const makeBrowserSession = (
         requestHeaderOrder,
         allowedOrigins,
         policy.allowedPathPrefixes,
+        policy.allowedRequestKinds,
         maxNetworkRequests,
         handlers.frameReviewer,
         new TextEncoder().encode(rootSource).byteLength,

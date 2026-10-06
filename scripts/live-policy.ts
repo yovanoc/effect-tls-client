@@ -8,6 +8,7 @@ export interface LiveRule {
   readonly origin: string;
   /** Include the trailing slash: a directory, never a lookalike prefix. */
   readonly pathPrefix?: string;
+  readonly allowedRequestKinds?: ReadonlyArray<"fetch" | "script" | "frame">;
 }
 
 export const MAX_HOST_CALL_COUNT = 256;
@@ -63,6 +64,8 @@ export const restrictHost = (
             !rules.some(
               (rule) =>
                 resolved.origin === rule.origin &&
+                (rule.allowedRequestKinds === undefined ||
+                  rule.allowedRequestKinds.includes(input.kind)) &&
                 (rule.pathPrefix === undefined ||
                   (rule.pathPrefix.endsWith("/") &&
                     resolved.pathname.startsWith(rule.pathPrefix))),

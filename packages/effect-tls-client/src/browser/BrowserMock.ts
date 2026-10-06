@@ -26,6 +26,7 @@ import { parseHtmlDocument, parseHtmlSnapshot } from "./HtmlSnapshot.js";
 import {
   normalizeAllowedOrigins,
   AllowedPathPrefixes,
+  AllowedRequestKinds,
   resolveAllowedUrl,
   scriptOrigin,
 } from "./ScriptPolicy.js";
@@ -687,6 +688,8 @@ const makeEvaluate = (
                     context.url,
                     options.allowedOrigins ?? [],
                     options.allowedPathPrefixes,
+                    event.kind,
+                    options.allowedRequestKinds,
                   ).toString(),
                 catch: (cause) =>
                   new BrowserScriptError({
@@ -858,6 +861,8 @@ const makeEvaluate = (
                       context.url,
                       options.allowedOrigins ?? [],
                       options.allowedPathPrefixes,
+                      "frame",
+                      options.allowedRequestKinds,
                     ).href,
                   catch: (cause) =>
                     new BrowserScriptError({
@@ -896,6 +901,8 @@ const makeEvaluate = (
                       context.url,
                       options.allowedOrigins ?? [],
                       options.allowedPathPrefixes,
+                      "frame",
+                      options.allowedRequestKinds,
                     );
                     if (
                       frame.parentUrl !== context.url ||
@@ -1135,6 +1142,7 @@ export const BrowserMockOptions = Schema.Struct({
   executable: Schema.optionalKey(Schema.String),
   allowedOrigins: Schema.optionalKey(Schema.Array(Schema.String)),
   allowedPathPrefixes: Schema.optionalKey(AllowedPathPrefixes),
+  allowedRequestKinds: Schema.optionalKey(AllowedRequestKinds),
   timeoutMs: Schema.optionalKey(TimeoutMs),
   maxNetworkRequests: Schema.optionalKey(
     Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 16 })),
@@ -1188,6 +1196,9 @@ export class BrowserMock extends Context.Service<
           ...(options.allowedPathPrefixes === undefined
             ? {}
             : { allowedPathPrefixes: options.allowedPathPrefixes }),
+          ...(options.allowedRequestKinds === undefined
+            ? {}
+            : { allowedRequestKinds: options.allowedRequestKinds }),
           timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
           evaluateDocument: (context, host) =>
             makeEvaluate(

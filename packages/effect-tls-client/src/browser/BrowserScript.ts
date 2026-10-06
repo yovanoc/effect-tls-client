@@ -1,5 +1,8 @@
 import { Clock, Context, Duration, Effect, Schema, type Option } from "effect";
 
+import type { AllowedRequestKinds } from "./ScriptPolicy.js";
+export type { AllowedRequestKinds } from "./ScriptPolicy.js";
+
 import { DOCUMENT_INPUT_RULES } from "./HtmlSnapshot.js";
 
 const MAX_SOURCE_BYTES = 64 * 1024;
@@ -182,6 +185,8 @@ export interface BrowserScriptRuntime {
   readonly allowedPathPrefixes?: Readonly<
     Record<string, ReadonlyArray<string>>
   >;
+  /** Optional per-origin operation restrictions; never grants an origin. */
+  readonly allowedRequestKinds?: AllowedRequestKinds;
   /** Per-evaluation request cap, including redirects: integer 1–16, default 8. */
   readonly maxNetworkRequests?: number;
   readonly timeoutMs?: number;

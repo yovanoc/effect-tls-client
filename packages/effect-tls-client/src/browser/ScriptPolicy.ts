@@ -75,8 +75,31 @@ export const AllowedPathPrefixes = Schema.Record(
   ),
 );
 
+export type AllowedRequestKinds = Readonly<
+  Record<string, ReadonlyArray<"fetch" | "script" | "frame">>
+>;
+
+export const AllowedRequestKinds = Schema.Record(
+  Schema.String,
+  Schema.Array(Schema.Literals(["fetch", "script", "frame"])).check(
+    Schema.isMaxLength(3),
+  ),
+).check(
+  Schema.isMaxProperties(MAX_ALLOWED_ORIGINS),
+  Schema.makeFilter((mapping) =>
+    Object.keys(mapping).every((origin) => {
+      try {
+        return normalizeAllowedOrigins([origin])[0] === origin;
+      } catch {
+        return false;
+      }
+    }),
+  ),
+);
+
 export const ScriptPolicy = Schema.Struct({
   allowedPathPrefixes: Schema.optionalKey(AllowedPathPrefixes),
+  allowedRequestKinds: Schema.optionalKey(AllowedRequestKinds),
 });
 export interface ScriptPolicy extends Schema.Schema.Type<typeof ScriptPolicy> {}
 
@@ -87,6 +110,8 @@ export const resolveAllowedUrl = (
   base: string,
   allowedOrigins: ReadonlyArray<string>,
   allowedPathPrefixes?: Readonly<Record<string, ReadonlyArray<string>>>,
+  requestKind: "fetch" | "script" | "frame" = "fetch",
+  allowedRequestKinds?: AllowedRequestKinds,
 ): URL => {
   const url = parseUrl(input, base);
   if (
@@ -96,6 +121,16 @@ export const resolveAllowedUrl = (
     !allowedOrigins.includes(url.origin)
   ) {
     throw new TypeError(`script network origin is not allowed: ${url.origin}`);
+  }
+  const kinds =
+    allowedRequestKinds !== undefined &&
+    Object.hasOwn(allowedRequestKinds, url.origin)
+      ? allowedRequestKinds[url.origin]
+      : undefined;
+  if (kinds !== undefined && !kinds.includes(requestKind)) {
+    throw new TypeError(
+      `script network request kind is not allowed: ${requestKind}`,
+    );
   }
   const prefixes =
     allowedPathPrefixes !== undefined &&

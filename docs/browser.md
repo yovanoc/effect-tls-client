@@ -32,16 +32,30 @@ Otherwise it prints `{"kind":"LIVE_OFF"}` without requests. This reviewed-source
 measurement calls `context.evaluateDocument()` once per hook invocation for the
 complete response, running supported inline and static external classic scripts
 in one realm with no source changes or shims, a 25-second runtime deadline, a
-30-second handler deadline, and 16 network requests per evaluation. DataDome
-permits only the page, `js.datadome.co`, and `api-js.datadome.co` origins;
-Cloudflare guest requests additionally require
-`/cdn-cgi/challenge-platform/`, enforced by the runtime's `allowedPathPrefixes`
-on initial requests and every redirect hop before sending. `network` and
-`hostCalls` observe operations that reach the harness-wrapped host, including
-policy denials made there. BrowserMock denials made before that callback and
-library-managed redirect hops are not counted; the library still applies its
-origin/path policy before sending each hop. Thus zero observed denials is not
-evidence that no request was rejected by an earlier policy layer.
+30-second handler deadline, and 16 network requests per evaluation. DataDome's
+existing page, `js.datadome.co`, and `api-js.datadome.co` origin grants are
+unchanged. The only added origin is the exact
+`https://ct.captcha-delivery.com`, restricted to `script` requests; the library
+checks this request-kind policy before every redirect hop, and the harness host
+wrapper mirrors it. This permits only URLs loaded as static document scripts or
+referenced by the unchanged scripts being evaluated. CT fetch/XHR requests
+(including POSTs) and frames remain denied. No `*.captcha-delivery.com` origin,
+frame reviewer, handcrafted URL/API request, or vendor entry point is enabled.
+DataDome's public [JavaScript Tag `script-src` guidance](research/datadome-public-domain-policy.md#six-published-role-scope-facts)
+identifies `ct.captcha-delivery.com` as a host for response-page scripts after a
+request is blocked. That documents a script-delivery role only: the purpose of
+an individual asset remains **UNKNOWN**, not a Device Check classification.
+The existing `captchaDelivery` receipt count compares public hostnames only and
+is not a purpose classification or grant. Cloudflare guest requests additionally
+require `/cdn-cgi/challenge-platform/`, enforced by the runtime's
+`allowedPathPrefixes` on initial requests and every redirect hop before sending.
+`network` and `hostCalls` observe operations that reach the harness-wrapped host,
+including policy denials made there. BrowserMock denials before that callback
+and library-managed redirect hops are not counted; the library still applies
+its origin/path/request-kind policy before sending each hop. Thus zero observed
+denials is not evidence that no request was rejected by an earlier policy
+layer. `staticScriptsNotAllowed` compares only URLs parsed from the initial
+document; it does not classify or observe dynamic script purpose.
 
 The schema-encoded receipt includes bounded counters, booleans, up to 16 rounded
 evaluation timings, and `failureClass` (`NONE`, `TIMEOUT`, `SCRIPT`, or `OTHER`).

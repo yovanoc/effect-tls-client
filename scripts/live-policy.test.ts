@@ -30,6 +30,7 @@ const effectIt = <A, E>(name: string, run: () => Effect.Effect<A, E>) =>
   it(name, () => Effect.runPromise(run()));
 
 const origin = "https://example.test";
+const ctOrigin = "https://ct.captcha-delivery.com";
 const prefix = "/cdn-cgi/challenge-platform/";
 const request = (url: string) => ({
   kind: "fetch" as const,
@@ -62,6 +63,91 @@ const fixture = () => {
 };
 
 describe("live script network policy", () => {
+  effectIt(
+    "permits only exact CT script loads and never delegates fetches or frames",
+    () =>
+      Effect.gen(function* () {
+        const calls = {
+          requests: [] as Array<Parameters<BrowserScriptHost["request"]>[0]>,
+          receivers: [] as Array<unknown>,
+          frames: [] as Array<string>,
+        };
+        const host = {
+          request(
+            this: BrowserScriptHost,
+            input: Parameters<BrowserScriptHost["request"]>[0],
+          ) {
+            calls.receivers.push(this);
+            calls.requests.push(input);
+            return Effect.succeed({
+              status: 200,
+              url: input.url,
+              headers: [],
+              body: "",
+              cookie: "",
+            });
+          },
+          setCookie: () => Effect.succeed(""),
+          loadFrame(this: BrowserScriptHost, url: string) {
+            calls.receivers.push(this);
+            calls.frames.push(url);
+            return Effect.fail(
+              new BrowserScriptError({ reason: "unexpected frame delegation" }),
+            );
+          },
+        } satisfies BrowserScriptHost;
+        const policy = restrictHost(
+          [{ origin: ctOrigin, allowedRequestKinds: ["script"] }],
+          host,
+          `${origin}/page`,
+        );
+        const headers = [["accept", "*/*"]] as const;
+        const scriptInput = {
+          ...request(`${ctOrigin}/response.js`),
+          kind: "script" as const,
+          headers,
+        };
+        const getInput = request(`${ctOrigin}/collect`);
+        const postInput = { ...getInput, method: "POST", body: "payload" };
+        const siblingScript = {
+          ...scriptInput,
+          url: "https://geo.captcha-delivery.com/response.js",
+        };
+
+        const script = policy.host.request(scriptInput);
+        expect(calls.requests).toEqual([]);
+        expect(policy.hostCalls.request).toBe(0);
+        yield* script;
+        for (const input of [getInput, postInput, siblingScript]) {
+          const result = yield* policy.host.request(input).pipe(Effect.result);
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result))
+            expect(result.failure).toBeInstanceOf(BrowserScriptError);
+        }
+
+        expect(calls.requests).toHaveLength(1);
+        expect(calls.requests[0]).toMatchObject({
+          kind: "script",
+          url: `${ctOrigin}/response.js`,
+          method: "GET",
+          headers,
+          body: null,
+          bodyBytes: null,
+        });
+        expect(calls.requests[0]?.headers).toBe(headers);
+        expect(calls.receivers).toEqual([host]);
+        expect("loadFrame" in policy.host).toBe(false);
+        expect(calls.frames).toEqual([]);
+        expect(policy.counters).toEqual({ allowed: 1, denied: 3 });
+        expect(policy.hostCalls).toEqual({
+          request: 4,
+          scriptLoad: 2,
+          setCookie: 0,
+          exportCookies: 0,
+        });
+      }),
+  );
+
   effectIt("allows directory prefixes and resolves relative URLs", () =>
     Effect.gen(function* () {
       const policy = fixture();
@@ -262,6 +348,7 @@ describe("static HTML observations", () => {
     <script src="https://js.datadome.co/tags.js"></script>
     <script src="https://api-js.datadome.co/tags.js"></script>
     <script src="https://captcha-delivery.com/a.js"></script>
+    <script src="https://ct.captcha-delivery.com/response.js"></script>
     <script src="https://geo.captcha-delivery.com/a.js"></script>
     <script src="https://challenges.cloudflare.com/a.js"></script>
     <script src="/cdn-cgi/challenge-platform/a.js"></script>
@@ -272,6 +359,7 @@ describe("static HTML observations", () => {
     "https://page.test",
     "https://js.datadome.co",
     "https://api-js.datadome.co",
+    ctOrigin,
   ];
   const cloudflareAllowedOrigins = ["https://page.test"];
 
@@ -283,7 +371,7 @@ describe("static HTML observations", () => {
         sameOrigin: 1,
         datadomeTag: 1,
         datadomeApi: 1,
-        captchaDelivery: 2,
+        captchaDelivery: 3,
         cloudflare: 2,
         other: 1,
         unparsable: 1,
@@ -295,7 +383,7 @@ describe("static HTML observations", () => {
 
   for (const [target, allowedOrigins, expected] of [
     ["DataDome", dataDomeAllowedOrigins, 4],
-    ["Cloudflare", cloudflareAllowedOrigins, 6],
+    ["Cloudflare", cloudflareAllowedOrigins, 7],
   ] as const) {
     it(`counts static origins outside the ${target} allowlist`, () => {
       expect(

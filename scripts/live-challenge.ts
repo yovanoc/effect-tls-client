@@ -660,6 +660,10 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
           { origin },
           { origin: "https://js.datadome.co" },
           { origin: "https://api-js.datadome.co" },
+          {
+            origin: "https://ct.captcha-delivery.com",
+            allowedRequestKinds: ["script"],
+          },
         ]
       : [{ origin, pathPrefix: "/cdn-cgi/challenge-platform/" }];
   const allowedOrigins = rules.map((rule) => rule.origin);
@@ -668,6 +672,13 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
   const allowedPathPrefixes = Object.fromEntries(
     rules.flatMap((rule) =>
       rule.pathPrefix === undefined ? [] : [[rule.origin, [rule.pathPrefix]]],
+    ),
+  );
+  const allowedRequestKinds = Object.fromEntries(
+    rules.flatMap((rule) =>
+      rule.allowedRequestKinds === undefined
+        ? []
+        : [[rule.origin, rule.allowedRequestKinds]],
     ),
   );
   const state = {
@@ -887,6 +898,9 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     Browser.BrowserMock.layer({
       allowedOrigins,
       allowedPathPrefixes,
+      ...(Object.keys(allowedRequestKinds).length === 0
+        ? {}
+        : { allowedRequestKinds }),
       maxNetworkRequests: 16,
       timeoutMs: EVALUATION_TIMEOUT_MS,
     }).pipe(Layer.provide(services)),
