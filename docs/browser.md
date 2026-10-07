@@ -1036,6 +1036,22 @@ remain allowed, but session Authorization, Proxy-Authorization, Jar cookies, and
 response Set-Cookie updates are omitted. XHR is asynchronous, supports string
 and FormData multipart bodies, and rejects `withCredentials = true`. Its
 `responseType` only parses JSON for `"json"`; every other value returns a string.
+Guest Fetch/Request headers (including clones and later `append`/`set` calls)
+and XHR `setRequestHeader` silently ignore case-insensitive `Sec-*` and `Proxy-*`
+assignments. This follows the public Fetch [forbidden request-header prefixes](https://fetch.spec.whatwg.org/#forbidden-request-header)
+and [request header guard](https://fetch.spec.whatwg.org/#headers-validate), and
+XHR's [setRequestHeader](<https://xhr.spec.whatwg.org/#the-setrequestheader()-method>)
+return-without-setting rule. Standalone `new Headers()` has guard `none` and
+retains these names; copying it into a request applies the request guard.
+Legal custom headers, `Accept-Language` overrides, and request bodies remain
+caller-controlled. The native Browser script host independently rejects reserved
+names with `BrowserScriptError` before a Go request, including custom runtimes
+that bypass the runner. The existing explicitly controlled-header rejection
+list otherwise remains unchanged; this is not a full forbidden-header/API rewrite.
+Trusted application identity, navigation and handler retry headers are not guest
+assignments and retain their existing configuration behavior. These local boundary
+guarantees do not establish provider clearance or physical wire equivalence.
+
 This is an intentionally small Fetch/XHR subset, not a full browser API.
 
 The runtime always starts Node with `--permission` and verifies that its

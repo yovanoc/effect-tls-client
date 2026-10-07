@@ -1049,8 +1049,13 @@ export const makeBrowserScriptRunnerSource = (
     if (response.error) task.reject(new TypeError(String(response.error)));
     else task.resolve(response);
   };
+  // Fetch reserves these prefixes for user-agent headers; standalone Headers has guard none.
+  const requestHeaderGuard = {};
+  const reservedRequestHeader = (name) => name.startsWith("sec-") || name.startsWith("proxy-");
   class Headers {
-    constructor(input) {
+    #requestGuard;
+    constructor(input, guard) {
+      this.#requestGuard = guard === requestHeaderGuard;
       this.values = [];
       if (input instanceof Headers) {
         for (const [name, value] of input.values) this.append(name, value);
@@ -1060,11 +1065,18 @@ export const makeBrowserScriptRunnerSource = (
         for (const [name, value] of Object.entries(input)) this.append(name, value);
       }
     }
-    append(name, value) { this.values.push([String(name).toLowerCase(), String(value)]); }
+    append(name, value) {
+      const key = String(name).toLowerCase();
+      const text = String(value);
+      if (this.#requestGuard && reservedRequestHeader(key)) return;
+      this.values.push([key, text]);
+    }
     set(name, value) {
       const key = String(name).toLowerCase();
+      const text = String(value);
+      if (this.#requestGuard && reservedRequestHeader(key)) return;
       this.values = this.values.filter(([entry]) => entry !== key);
-      this.append(key, value);
+      this.append(key, text);
     }
     get(name) {
       const key = String(name).toLowerCase();
@@ -1089,7 +1101,7 @@ export const makeBrowserScriptRunnerSource = (
       const options = init ?? {};
       const url = rawUrl;
       const method = String(options.method ?? source?.method ?? "GET").toUpperCase();
-      const headers = new Headers(options.headers ?? source?.headers);
+      const headers = new Headers(options.headers ?? source?.headers, requestHeaderGuard);
       const bodyOption = options.body;
       const body = bodyOption !== undefined ? bodyOption : source?.body ?? null;
       const credentials = options.credentials ?? source?.credentials ?? "same-origin";
@@ -1115,7 +1127,7 @@ export const makeBrowserScriptRunnerSource = (
       const state = getRequestState(this);
       if (state.bodyUsed) throw new TypeError("Request body is already used");
       const clone = objectCreate(Request.prototype);
-      apply(weakMapSet, requestStates, [clone, { ...state, headers: new Headers(state.headers), bodyUsed: false }]);
+      apply(weakMapSet, requestStates, [clone, { ...state, headers: new Headers(state.headers, requestHeaderGuard), bodyUsed: false }]);
       return clone;
     }
   }
@@ -1142,7 +1154,7 @@ export const makeBrowserScriptRunnerSource = (
       const requestObject = new Request(requestInput, init);
       const state = getRequestState(requestObject);
       const { url, method } = state;
-      const headers = new Headers(state.headers);
+      const headers = new Headers(state.headers, requestHeaderGuard);
       let body = null;
       if (state.body instanceof FormData) {
         if (method === "GET" || method === "HEAD") throw new TypeError("GET and HEAD cannot have a body");
@@ -1177,7 +1189,7 @@ export const makeBrowserScriptRunnerSource = (
         if (value) throw new TypeError("XMLHttpRequest.withCredentials is not supported");
       },
     });
-    this._headers = new Headers();
+    this._headers = new Headers(undefined, requestHeaderGuard);
     this._listeners = new Map();
   }
   XMLHttpRequest.prototype.addEventListener = function(type, callback) {

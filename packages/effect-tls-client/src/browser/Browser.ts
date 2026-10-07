@@ -740,7 +740,11 @@ const makeScriptHost = (
                 );
               }
               const lowerName = name.toLowerCase();
-              if (SCRIPT_CONTROLLED_HEADERS.has(lowerName)) {
+              if (
+                SCRIPT_CONTROLLED_HEADERS.has(lowerName) ||
+                lowerName.startsWith("sec-") ||
+                lowerName.startsWith("proxy-")
+              ) {
                 throw new TypeError(
                   `script cannot set the ${lowerName} header`,
                 );
