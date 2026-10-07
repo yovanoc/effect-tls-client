@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { Cause, Effect, Result, Schema } from "effect";
+import { Cause, Deferred, Effect, Fiber, Layer, Result, Schema } from "effect";
+import { NodeServices } from "@effect/platform-node";
+import {
+  BrowserMock,
+  BrowserMockOptions,
+} from "../packages/effect-tls-client/src/browser/BrowserMock.js";
+import { runBoundedScript } from "../packages/effect-tls-client/src/browser/BrowserScript.js";
 import {
   BrowserScriptError,
   type BrowserScriptHost,
@@ -25,6 +31,7 @@ import {
   incrementCount,
   readExportedCookies,
   Receipt,
+  NativePreflightRejections,
   restrictRuntime,
   staticHtmlObservations,
 } from "./live-challenge.js";
@@ -511,6 +518,7 @@ describe("conservative live proof gate", () => {
     evaluations: { attempts: 1, success: 1, failure: 0 },
     failureClass: "NONE" as const,
     failureReason: "NONE" as const,
+    nativePreflightRejections: 0 as const,
     networkDenied: 0,
     staticScriptsNotAllowed: 0,
     providerCookieChanged: true,
@@ -592,6 +600,10 @@ describe("conservative live proof gate", () => {
   it("requires observed enforcement and zero denied or non-allowed work", () => {
     expect(isProven(valid({ initialEnforcementObserved: false }))).toBe(false);
     expect(isProven(valid({ networkDenied: 1 }))).toBe(false);
+    expect(isProven(valid({ nativePreflightRejections: 1 }))).toBe(false);
+    expect(isProven(valid({ nativePreflightRejections: "UNKNOWN" }))).toBe(
+      false,
+    );
     expect(isProven(valid({ staticScriptsNotAllowed: 1 }))).toBe(false);
   });
 
@@ -1046,6 +1058,7 @@ describe("trusted returned host replies", () => {
           failureClass: "SCRIPT",
           failureReason: "OTHER",
           network: { allowed: 1, denied: 0 },
+          nativePreflightRejections: 0,
           hostCalls: makeHostCallCounters(),
           hostReplies: replies,
           providerCookieBefore: false,
@@ -1088,4 +1101,228 @@ describe("trusted returned host replies", () => {
         ).toThrow();
       }),
   );
+});
+
+const describeNative =
+  process.env.TLS_CLIENT_INTEGRATION === "1" ? describe : describe.skip;
+
+describeNative(
+  "composed authored document parent preflight observations",
+  () => {
+    const pageUrl = "http://127.0.0.1:43127/page";
+    const localOrigin = new URL(pageUrl).origin;
+    const source =
+      '\r\nwindow.finished = fetch("/fetch").then(r => r.text()).then(body => { window.fixtureBody = body; document.cookie = "authored-body=" + body; }, () => { window.fixtureBody = "caught"; });\r\n';
+    const document = `<html><head><script>${source}</script></head><body><div id="fixture">authored</div></body></html>`;
+
+    for (const mode of [
+      "native-denied",
+      "unset",
+      "wrapper-denied",
+      "permitted",
+      "host-failed",
+    ] as const) {
+      effectIt(mode, () =>
+        Effect.gen(function* () {
+          let parentRejections = 0;
+          const network = { allowed: 0, denied: 0 };
+          const hostCalls = makeHostCallCounters();
+          const hostReplies: Array<(typeof HostRepliesSchema.Type)[number]> =
+            [];
+          const seen: Array<unknown> = [];
+          const cookieWrites: Array<string> = [];
+          const body = "authored response unchanged";
+          const host: BrowserScriptHost = {
+            request(input) {
+              seen.push([this, input]);
+              return mode === "host-failed"
+                ? Effect.fail(
+                    new BrowserScriptError({ reason: "authored host failure" }),
+                  )
+                : Effect.succeed({
+                    status: 200,
+                    url: input.url,
+                    headers: [],
+                    body,
+                    cookie: "",
+                  });
+            },
+            setCookie: (value) =>
+              Effect.sync(() => {
+                cookieWrites.push(value);
+                return "";
+              }),
+          };
+          const options = {
+            allowedOrigins: [localOrigin],
+            ...(mode === "native-denied" || mode === "unset"
+              ? { allowedRequestKinds: { [localOrigin]: [] } }
+              : {}),
+            ...(mode === "unset"
+              ? {}
+              : {
+                  onNetworkRejected: Effect.sync(() => {
+                    parentRejections++;
+                  }),
+                }),
+          };
+          const runtime = yield* Effect.service(BrowserMock).pipe(
+            Effect.provide(
+              BrowserMock.layer(options).pipe(
+                Layer.provide(NodeServices.layer),
+              ),
+            ),
+          );
+          const wrapped = restrictRuntime(
+            runtime,
+            mode === "wrapper-denied" ? [] : [{ origin: localOrigin }],
+            network,
+            hostCalls,
+            hostReplies,
+          );
+          const result = yield* runBoundedScript(
+            wrapped,
+            "",
+            { url: pageUrl, cookie: "", userAgent: "fixture", document },
+            host,
+            "document",
+          );
+          expect(result).toEqual({ value: "", setCookies: [] });
+          expect(inlineClassicPrograms(document)).toEqual([source]);
+          expect(parentRejections).toBe(mode === "native-denied" ? 1 : 0);
+          expect(network).toEqual(
+            mode === "native-denied" || mode === "unset"
+              ? { allowed: 0, denied: 0 }
+              : mode === "wrapper-denied"
+                ? { allowed: 0, denied: 1 }
+                : { allowed: 1, denied: 0 },
+          );
+          expect(hostCalls.request).toBe(
+            mode === "native-denied" || mode === "unset" ? 0 : 1,
+          );
+          expect(cookieWrites).toEqual(
+            mode === "permitted" ? [`authored-body=${body}`] : [],
+          );
+          expect(hostCalls.setCookie).toBe(mode === "permitted" ? 1 : 0);
+          expect(hostReplies).toHaveLength(mode === "permitted" ? 1 : 0);
+          expect(seen).toHaveLength(
+            mode === "permitted" || mode === "host-failed" ? 1 : 0,
+          );
+          if (seen.length > 0)
+            expect(seen[0]).toEqual([
+              host,
+              { ...request(`${localOrigin}/fetch`), bodyBytes: null },
+            ]);
+        }),
+      );
+    }
+
+    for (const [name, observer] of [
+      [
+        "failure",
+        Effect.fail(
+          new BrowserScriptError({ reason: "authored observer failure" }),
+        ),
+      ],
+      ["defect", Effect.die("authored observer defect")],
+      ["pending", Effect.never],
+    ] as const) {
+      effectIt(
+        `observer ${name} cannot replace a caught request rejection`,
+        () =>
+          Effect.gen(function* () {
+            let invocations = 0;
+            const runtime = yield* Effect.service(BrowserMock).pipe(
+              Effect.provide(
+                BrowserMock.layer({
+                  onNetworkRejected: Effect.sync(() => {
+                    invocations++;
+                  }).pipe(Effect.andThen(observer)),
+                }).pipe(Layer.provide(NodeServices.layer)),
+              ),
+            );
+            const result = yield* runBoundedScript(
+              runtime,
+              "",
+              { url: pageUrl, cookie: "", userAgent: "fixture", document },
+              {
+                request: () =>
+                  Effect.fail(
+                    new BrowserScriptError({ reason: "must not delegate" }),
+                  ),
+                setCookie: () => Effect.succeed(""),
+              },
+              "document",
+            );
+            expect(result).toEqual({ value: "", setCookies: [] });
+            expect(invocations).toBe(1);
+          }),
+      );
+    }
+
+    effectIt(
+      "interruption during host execution is not a preflight rejection",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            let rejections = 0;
+            const entered = yield* Deferred.make<void>();
+            const runtime = yield* Effect.service(BrowserMock).pipe(
+              Effect.provide(
+                BrowserMock.layer({
+                  allowedOrigins: [localOrigin],
+                  onNetworkRejected: Effect.sync(() => {
+                    rejections++;
+                  }),
+                }).pipe(Layer.provide(NodeServices.layer)),
+              ),
+            );
+            const fiber = yield* runBoundedScript(
+              runtime,
+              "",
+              { url: pageUrl, cookie: "", userAgent: "fixture", document },
+              {
+                request: () =>
+                  Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Effect.never),
+                  ),
+                setCookie: () => Effect.succeed(""),
+              },
+              "document",
+            ).pipe(Effect.forkScoped);
+            yield* Deferred.await(entered);
+            yield* Fiber.interrupt(fiber);
+            const exit = yield* Fiber.await(fiber);
+            expect(exit._tag).toBe("Failure");
+            expect(rejections).toBe(0);
+          }),
+        ),
+    );
+  },
+);
+
+it("validates native observation counts separately, including unknown and saturation", () => {
+  for (const value of [0, MAX_HOST_CALL_COUNT, "UNKNOWN"] as const)
+    expect(Schema.decodeUnknownSync(NativePreflightRejections)(value)).toBe(
+      value,
+    );
+  for (const value of [-1, 0.5, MAX_HOST_CALL_COUNT + 1, "0", null])
+    expect(() =>
+      Schema.decodeUnknownSync(NativePreflightRejections)(value),
+    ).toThrow();
+  expect(incrementCount(MAX_HOST_CALL_COUNT)).toBe(MAX_HOST_CALL_COUNT);
+});
+
+it("keeps the parent observer opt-in and Effect-valued", () => {
+  const options = Schema.decodeSync(BrowserMockOptions)({});
+  expect(Object.hasOwn(options, "onNetworkRejected")).toBe(false);
+  const observer = Effect.void;
+  expect(
+    Schema.decodeSync(BrowserMockOptions)({ onNetworkRejected: observer })
+      .onNetworkRejected,
+  ).toBe(observer);
+  for (const onNetworkRejected of [null, "observer", () => Effect.void])
+    expect(() =>
+      Schema.decodeUnknownSync(BrowserMockOptions)({ onNetworkRejected }),
+    ).toThrow();
 });

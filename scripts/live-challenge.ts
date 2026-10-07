@@ -21,6 +21,10 @@ const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 const HostCallCount = Count.check(
   Schema.isLessThanOrEqualTo(MAX_HOST_CALL_COUNT),
 );
+export const NativePreflightRejections = Schema.Union([
+  HostCallCount,
+  Schema.Literal("UNKNOWN"),
+]);
 export const HostCallCountersSchema = Schema.Struct({
   request: HostCallCount,
   scriptLoad: HostCallCount,
@@ -207,6 +211,7 @@ export const Receipt = Schema.Struct({
   failureClass: FailureClass,
   failureReason: FailureReason,
   network: Schema.Struct({ allowed: Count, denied: Count }),
+  nativePreflightRejections: NativePreflightRejections,
   hostCalls: HostCallCountersSchema,
   hostReplies: HostRepliesSchema,
   providerCookieBefore: Schema.Boolean,
@@ -568,6 +573,7 @@ export const isProven = (input: {
   };
   readonly failureClass: typeof FailureClass.Type;
   readonly failureReason: typeof FailureReason.Type;
+  readonly nativePreflightRejections: typeof Receipt.Type.nativePreflightRejections;
   readonly networkDenied: number;
   readonly staticScriptsNotAllowed: number;
   readonly providerCookieChanged: boolean;
@@ -591,6 +597,7 @@ export const isProven = (input: {
   input.failureClass === "NONE" &&
   input.failureReason === "NONE" &&
   input.networkDenied === 0 &&
+  input.nativePreflightRejections === 0 &&
   input.staticScriptsNotAllowed === 0 &&
   input.providerCookieChanged &&
   input.retried &&
@@ -715,6 +722,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     failureClass: FailureClass.make("NONE"),
     failureReason: FailureReason.make("NONE"),
     network: { allowed: 0, denied: 0 },
+    nativePreflightRejections: NativePreflightRejections.make("UNKNOWN"),
     hostCalls: makeHostCallCounters(),
     hostReplies: [] as Array<HostReply>,
     providerCookieBefore: false,
@@ -823,6 +831,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
   const program = Effect.scoped(
     Effect.gen(function* () {
       const runtime = yield* Browser.BrowserMock;
+      state.nativePreflightRejections = 0;
       const browser = yield* Browser.open(
         {
           transport: { profile: "chrome_152_PSK" },
@@ -886,6 +895,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
           evaluations: state.evaluations,
           failureClass: state.failureClass,
           failureReason: state.failureReason,
+          nativePreflightRejections: state.nativePreflightRejections,
           networkDenied: state.network.denied,
           staticScriptsNotAllowed: state.staticScriptsNotAllowed,
           providerCookieChanged: state.providerCookieChanged,
@@ -911,6 +921,12 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     Browser.BrowserMock.layer({
       allowedOrigins,
       allowedPathPrefixes,
+      onNetworkRejected: Effect.sync(() => {
+        if (state.nativePreflightRejections !== "UNKNOWN")
+          state.nativePreflightRejections = incrementCount(
+            state.nativePreflightRejections,
+          );
+      }),
       ...(Object.keys(allowedRequestKinds).length === 0
         ? {}
         : { allowedRequestKinds }),

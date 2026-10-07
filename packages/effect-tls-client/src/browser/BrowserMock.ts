@@ -629,6 +629,18 @@ const makeEvaluate = (
           }),
         );
 
+        const observeNetworkRejection =
+          options.onNetworkRejected === undefined
+            ? Effect.void
+            : options.onNetworkRejected.pipe(
+                Effect.timeoutOption(Duration.millis(10)),
+                Effect.ignoreCause,
+              );
+        const rejectNetwork = (id: number, error: string) =>
+          observeNetworkRejection.pipe(
+            Effect.andThen(writeInput({ type: "reply", id, ok: false, error })),
+          );
+
         const handleNetwork = (
           event: Extract<
             Schema.Schema.Type<typeof RunnerMessage>,
@@ -643,41 +655,33 @@ const makeEvaluate = (
               requestBodyBytes = event.body.length;
             }
             if (requestBodyBytes > MAX_REQUEST_BODY_BYTES) {
-              yield* writeInput({
-                type: "reply",
-                id: event.id,
-                ok: false,
-                error: "script request body exceeds the 16 KiB limit",
-              });
+              yield* rejectNetwork(
+                event.id,
+                "script request body exceeds the 16 KiB limit",
+              );
               return;
             }
             const requestBytes = lineBytes(JSON.stringify(event));
             networkRequests += 1;
             if (networkRequests > options.maxNetworkRequests) {
-              yield* writeInput({
-                type: "reply",
-                id: event.id,
-                ok: false,
-                error: `script request budget exceeds ${options.maxNetworkRequests} requests`,
-              });
+              yield* rejectNetwork(
+                event.id,
+                `script request budget exceeds ${options.maxNetworkRequests} requests`,
+              );
               return;
             }
             if (activeRequests >= MAX_CONCURRENT_REQUESTS) {
-              yield* writeInput({
-                type: "reply",
-                id: event.id,
-                ok: false,
-                error: `script request concurrency exceeds ${MAX_CONCURRENT_REQUESTS}`,
-              });
+              yield* rejectNetwork(
+                event.id,
+                `script request concurrency exceeds ${MAX_CONCURRENT_REQUESTS}`,
+              );
               return;
             }
             if (networkBytes + requestBytes > MAX_TOTAL_NETWORK_BYTES) {
-              yield* writeInput({
-                type: "reply",
-                id: event.id,
-                ok: false,
-                error: "script network byte budget exceeded",
-              });
+              yield* rejectNetwork(
+                event.id,
+                "script network byte budget exceeded",
+              );
               return;
             }
             const urlResult = yield* Effect.result(
@@ -702,12 +706,7 @@ const makeEvaluate = (
               }),
             );
             if (urlResult._tag === "Failure") {
-              yield* writeInput({
-                type: "reply",
-                id: event.id,
-                ok: false,
-                error: urlResult.failure.reason,
-              });
+              yield* rejectNetwork(event.id, urlResult.failure.reason);
               return;
             }
             const url = urlResult.success;
@@ -1033,13 +1032,10 @@ const makeEvaluate = (
               return { bytes };
             }
             if (event.cookieVersion > appliedCookieVersion) {
-              yield* writeInput({
-                type: "reply",
-                id: event.id,
-                ok: false,
-                error:
-                  "script cookie update was not committed before the request",
-              });
+              yield* rejectNetwork(
+                event.id,
+                "script cookie update was not committed before the request",
+              );
               return { bytes };
             }
             yield* handleNetwork(event);
@@ -1139,6 +1135,16 @@ const makeEvaluate = (
 
 /** Options for the process-backed browser mock. */
 export const BrowserMockOptions = Schema.Struct({
+  /** Parent-only, no-payload observer. Must be prompt, cooperative and require no services.
+   * Failures/defects are discarded; asynchronous work is limited to 10 ms.
+   * Not a guest capability or a guarantee that observation completed.
+   */
+  onNetworkRejected: Schema.optionalKey(
+    // Result/error/environment types are application-trusted, like host callbacks.
+    Schema.declare<Effect.Effect<void, unknown>>(
+      (input): input is Effect.Effect<void, unknown> => Effect.isEffect(input),
+    ),
+  ),
   executable: Schema.optionalKey(Schema.String),
   allowedOrigins: Schema.optionalKey(Schema.Array(Schema.String)),
   allowedPathPrefixes: Schema.optionalKey(AllowedPathPrefixes),

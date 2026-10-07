@@ -57,6 +57,13 @@ denials is not evidence that no request was rejected by an earlier policy
 layer. `staticScriptsNotAllowed` compares only URLs parsed from the initial
 document; it does not classify or observe dynamic script purpose.
 
+`nativePreflightRejections` is separate: a saturating parent-only count (0–256),
+or `UNKNOWN` if observer installation cannot be established. The harness sets
+zero only after acquiring its explicitly configured BrowserMock layer; its
+observer performs only a synchronous increment. This does not alter `network`,
+`hostCalls`, or `hostReplies`. The proof gate additionally requires this count
+to be known and zero; it still does not establish complete zero-denial coverage.
+
 `hostReplies` separately records only normal values actually returned by the
 trusted wrapped `request` Effect, classified as operation `fetch` or `script`.
 The installed host has no separate `scriptLoad` callback: the existing
@@ -90,7 +97,7 @@ deadline. Unexpected failures outside evaluation print `UNKNOWN` and exit 2.
 `proven` requires an enforced non-2xx response at the exact fixed initial URL,
 one hook invocation, one successful document-evaluation attempt and no failed
 evaluation, a changed provider cookie and a requested same-URL retry, zero
-wrapper-observed denials or non-allowlisted static scripts, and a final 2xx
+wrapper-observed denials, known parent-preflight rejections, or non-allowlisted static scripts, and a final 2xx
 without recognized challenges or provider markers. The final URL must also equal
 the fixed URL and the cumulative `redirectCount` must be exactly zero; unknown
 counts are `null` and cannot prove success. `finalRedirected` is true when that
@@ -889,6 +896,38 @@ every redirect **before sending**, for fetch, XHR, scripts, and reviewed frames.
 Script requests disable Go's automatic redirects and follow validated hops
 through the same scoped TlsSession, preserving Go-owned cookies/TLS/Profile.
 Navigation and raw transport policy are unchanged.
+
+### Opt-in parent network-preflight observation
+
+`BrowserMock.layer({ onNetworkRejected: Effect.sync(() => { count++; }) })`
+accepts an optional **Effect-valued property**, not a callback with arguments.
+It remains entirely in the parent; no request, URL, kind, error, reason, source,
+SDK name, cookie, or other payload is supplied. No guest IPC/result field is
+added. Omission preserves the existing behavior.
+
+It runs once only on a Schema-valid `network` event actually rejected by the
+parent before `BrowserScriptHost.request`: uncommitted cookie version, request
+body bytes, request count, concurrency, cumulative request-byte budget, or
+initial URL/origin/path/request-kind policy. Fetch and XHR share the `fetch`
+kind; static/dynamic script loads use `script`. The observer is invoked before
+the unchanged rejection reply; nothing is delegated for that event.
+
+Excluded: malformed IPC, pre-spawn validation, guest/Runner rejections (including
+Runner request budgets), `frame.load`, timers, cookie-write failures, missing
+hosts, host failures or interruption, downstream Browser policy/budget/redirect
+failures, and response-size/byte/encoding/IPC-delivery failures after delegation.
+Zero says only that this parent branch was not observed rejecting an event.
+It proves neither physical delivery nor SDK execution, acquisition, or clearance.
+
+Observers must be prompt, cooperative, require no services, and avoid network or
+blocking work. Each invocation has a 10 ms cooperative timeout; failures and
+defects are silently discarded without inspecting or logging their payloads,
+so they do not replace the request rejection. Observation may be incomplete if
+the observer fails, times out, or evaluation is interrupted. The existing
+process/handler deadlines remain unchanged and take priority. Like all Effect
+timeouts, this cannot preempt blocking synchronous code or uninterruptible
+finalizers; those are outside the supported observer contract. Use a synchronous
+in-memory increment, as the harness does, not a telemetry pipeline.
 
 ### `BrowserScriptError.hostBoundary`
 
