@@ -57,6 +57,30 @@ denials is not evidence that no request was rejected by an earlier policy
 layer. `staticScriptsNotAllowed` compares only URLs parsed from the initial
 document; it does not classify or observe dynamic script purpose.
 
+`hostReplies` separately records only normal values actually returned by the
+trusted wrapped `request` Effect, classified as operation `fetch` or `script`.
+The installed host has no separate `scriptLoad` callback: the existing
+`hostCalls.scriptLoad` remains a request-attempt subset, not a reply count.
+Each observation has only `statusClass` (`2xx`, `3xx`, `4xx`, `5xx`, `other`,
+`UNKNOWN`), `mimeClass` (`javascript`, `html`, `json`, `text`, `other`, `missing`,
+`UNKNOWN`), and `bodySize` (`empty`, `at-most-64KiB`, `at-most-1MiB`, `larger`,
+`UNKNOWN`). MIME comes exclusively from one Content-Type header; absent headers
+are `missing`, ambiguous or invalid metadata stays `UNKNOWN`. Size is the UTF-8
+size of the returned decoded string, not original wire bytes. No raw MIME,
+headers, body/source, URLs, identifiers, hashes, or cookie data enter these
+observations. Unexecuted, denied, or failed operations produce no reply entry;
+failures are neither inspected nor recovered by this observer.
+
+Storage retains the first 256 replies across evaluations and then saturates,
+matching the existing host-count ceiling; array length is a saturating observed
+reply count, not a total beyond that ceiling. Library-internal redirects and
+work not traversing this wrapper are unobserved. A string-only script-load
+boundary would leave status and MIME `UNKNOWN`; it must not be assumed to
+traverse this request wrapper. No such callback is present in the installed
+interface, and none is added. These values prove neither physical-wire delivery,
+SDK execution, native authentication, nor clearance. The full output envelope
+passes Schema encode and decode plus the existing 64 KiB cap before stdout.
+
 The schema-encoded receipt includes bounded counters, booleans, up to 16 rounded
 evaluation timings, and `failureClass` (`NONE`, `TIMEOUT`, `SCRIPT`, or `OTHER`).
 Hook and evaluation attempt/success/failure counts saturate at 256. Classification

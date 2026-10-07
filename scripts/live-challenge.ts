@@ -4,10 +4,12 @@ import * as Browser from "../packages/effect-tls-client/src/browser/index.js";
 import { parseHtmlDocument } from "../packages/effect-tls-client/src/browser/HtmlSnapshot.js";
 import { CookiesJson } from "../packages/effect-tls-client/src/internal/Protocol.js";
 import {
+  HostRepliesSchema,
   countHostCall,
   makeHostCallCounters,
   MAX_HOST_CALL_COUNT,
   restrictHost,
+  type HostReply,
   type LiveHostCallCounters,
   type LiveRule,
 } from "./live-policy.js";
@@ -206,6 +208,7 @@ export const Receipt = Schema.Struct({
   failureReason: FailureReason,
   network: Schema.Struct({ allowed: Count, denied: Count }),
   hostCalls: HostCallCountersSchema,
+  hostReplies: HostRepliesSchema,
   providerCookieBefore: Schema.Boolean,
   providerCookieAfter: Schema.Boolean,
   providerCookieChanged: Schema.Boolean,
@@ -236,6 +239,7 @@ export const encodeReceipt = (receipt: typeof Output.Type) => {
   );
   if (Buffer.byteLength(json) > 64 * 1024)
     throw new RangeError("receipt limit");
+  Schema.decodeUnknownSync(Output, { onExcessProperty: "error" })(json);
   return json;
 };
 const print = (receipt: typeof Output.Type) =>
@@ -606,6 +610,7 @@ export const restrictRuntime = (
   rules: ReadonlyArray<LiveRule>,
   network: { allowed: number; denied: number },
   hostCalls = makeHostCallCounters(),
+  hostReplies: Array<HostReply> = [],
 ): Browser.BrowserScriptRuntime => {
   const wrap = (
     evaluate: Browser.BrowserScriptRuntime["evaluate"],
@@ -615,7 +620,13 @@ export const restrictRuntime = (
         return yield* new Browser.BrowserScriptError({
           reason: "live host missing",
         });
-      const restricted = restrictHost(rules, host, context.url, hostCalls);
+      const restricted = restrictHost(
+        rules,
+        host,
+        context.url,
+        hostCalls,
+        hostReplies,
+      );
       return yield* evaluate
         .call(runtime, source, context, restricted.host)
         .pipe(
@@ -705,6 +716,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     failureReason: FailureReason.make("NONE"),
     network: { allowed: 0, denied: 0 },
     hostCalls: makeHostCallCounters(),
+    hostReplies: [] as Array<HostReply>,
     providerCookieBefore: false,
     providerCookieAfter: false,
     providerCookieChanged: false,
@@ -823,6 +835,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
             rules,
             state.network,
             state.hostCalls,
+            state.hostReplies,
           ),
           challengeHandler: handler,
           responseHandler: handler,

@@ -6,6 +6,8 @@ import {
   type BrowserScriptRuntime,
 } from "../packages/effect-tls-client/src/browser/BrowserScript.js";
 import {
+  HostRepliesSchema,
+  classifyHostReply,
   countHostCall,
   makeHostCallCounters,
   MAX_HOST_CALL_COUNT,
@@ -22,6 +24,7 @@ import {
   inlineClassicPrograms,
   incrementCount,
   readExportedCookies,
+  Receipt,
   restrictRuntime,
   staticHtmlObservations,
 } from "./live-challenge.js";
@@ -742,4 +745,347 @@ describe("conservative live proof gate", () => {
       ),
     ).toBe(true);
   });
+});
+
+describe("trusted returned host replies", () => {
+  effectIt(
+    "preserves optional runtime properties, receivers and authored arguments",
+    () =>
+      Effect.gen(function* () {
+        const source = "\r\nvar authored = 'source unchanged';\r\n";
+        const context = {
+          url: `${origin}/page`,
+          cookie: "",
+          userAgent: "fixture",
+          document: "authored document",
+        };
+        const seen: Array<unknown> = [];
+        const runtime: BrowserScriptRuntime = {
+          allowedOrigins: [origin],
+          allowedPathPrefixes: { [origin]: [prefix] },
+          allowedRequestKinds: { [origin]: ["script"] },
+          maxNetworkRequests: 16,
+          timeoutMs: 25_000,
+          evaluate(source, context, host) {
+            seen.push([this, source, context, host]);
+            return Effect.succeed({ value: "", setCookies: [] });
+          },
+          evaluateClassic(source, context, host) {
+            seen.push([this, source, context, host]);
+            return Effect.succeed({ value: "", setCookies: [] });
+          },
+          evaluateDocument(context, host) {
+            seen.push([this, context, host]);
+            return Effect.succeed({ value: "", setCookies: [] });
+          },
+        };
+        const wrapped = restrictRuntime(runtime, [{ origin }], {
+          allowed: 0,
+          denied: 0,
+        });
+        const host = fixture().host;
+        const evaluation = wrapped.evaluate(source, context, host);
+        expect(seen).toEqual([]);
+        yield* evaluation;
+        if (
+          wrapped.evaluateClassic === undefined ||
+          wrapped.evaluateDocument === undefined
+        )
+          return yield* new BrowserScriptError({
+            reason: "authored capability missing",
+          });
+        yield* wrapped.evaluateClassic(source, context, host);
+        yield* wrapped.evaluateDocument(context, host);
+        expect(seen).toHaveLength(3);
+        expect(seen).toEqual([
+          [
+            runtime,
+            source,
+            context,
+            expect.objectContaining({
+              request: expect.any(Function),
+              setCookie: expect.any(Function),
+            }),
+          ],
+          [
+            runtime,
+            source,
+            context,
+            expect.objectContaining({
+              request: expect.any(Function),
+              setCookie: expect.any(Function),
+            }),
+          ],
+          [
+            runtime,
+            context,
+            expect.objectContaining({
+              request: expect.any(Function),
+              setCookie: expect.any(Function),
+            }),
+          ],
+        ]);
+        expect(wrapped.allowedOrigins).toBe(runtime.allowedOrigins);
+        expect(wrapped.allowedPathPrefixes).toBe(runtime.allowedPathPrefixes);
+        expect(wrapped.allowedRequestKinds).toBe(runtime.allowedRequestKinds);
+        expect(wrapped.maxNetworkRequests).toBe(16);
+        expect(wrapped.timeoutMs).toBe(25_000);
+      }),
+  );
+  effectIt(
+    "observes only returned replies, lazily, with single unchanged delegation",
+    () =>
+      Effect.gen(function* () {
+        const source = "\r\nwindow.authored = 'unchanged';\r\n";
+        const response = {
+          status: 403,
+          url: `${origin}/private?query=yes`,
+          headers: [
+            ["Content-Type", "text/javascript; charset=utf-8"],
+            ["private", "secret"],
+          ] as const,
+          body: source,
+          cookie: "private=value",
+        };
+        const inputs: Array<Parameters<BrowserScriptHost["request"]>[0]> = [];
+        const receivers: Array<unknown> = [];
+        let executions = 0;
+        const host: BrowserScriptHost = {
+          request(input) {
+            inputs.push(input);
+            receivers.push(this);
+            return Effect.sync(() => {
+              executions++;
+              return response;
+            });
+          },
+          setCookie: () => Effect.succeed(""),
+        };
+        const policy = restrictHost([{ origin }], host, `${origin}/page`);
+        const input = {
+          ...request(`${origin}/asset.js`),
+          kind: "script" as const,
+          body: "authored request",
+          bodyBytes: null,
+        };
+        const pending = policy.host.request(input);
+        expect(policy.hostReplies).toEqual([]);
+        expect(inputs).toEqual([]);
+        expect(executions).toBe(0);
+        const returned = yield* pending;
+        expect(returned).toBe(response);
+        expect(returned.body).toBe(source);
+        expect(inputs).toEqual([input]);
+        expect(inputs[0]?.headers).toBe(input.headers);
+        expect(receivers).toEqual([host]);
+        expect(executions).toBe(1);
+        expect(policy.hostReplies).toEqual([
+          {
+            operation: "script",
+            statusClass: "4xx",
+            mimeClass: "javascript",
+            bodySize: "at-most-64KiB",
+          },
+        ]);
+        yield* policy.host
+          .request(request("https://denied.test/"))
+          .pipe(Effect.result);
+        expect(policy.hostReplies).toHaveLength(1);
+        expect(executions).toBe(1);
+      }),
+  );
+
+  effectIt(
+    "failed operations propagate without a reply or error inspection",
+    () =>
+      Effect.gen(function* () {
+        const error = new BrowserScriptError({
+          reason: "authored private failure",
+        });
+        let reads = 0;
+        Object.defineProperty(error, "reason", {
+          get: () => {
+            reads++;
+            return "private";
+          },
+        });
+        const policy = restrictHost(
+          [{ origin }],
+          {
+            request: () => Effect.fail(error),
+            setCookie: () => Effect.succeed(""),
+          },
+          `${origin}/page`,
+        );
+        const result = yield* policy.host
+          .request(request(`${origin}/asset.js`))
+          .pipe(Effect.result);
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result)) expect(result.failure).toBe(error);
+        expect(reads).toBe(0);
+        expect(policy.hostCalls.request).toBe(1);
+        expect(policy.hostReplies).toEqual([]);
+      }),
+  );
+
+  it("classifies only status, Content-Type and UTF-8 size; missing metadata stays unknown", () => {
+    const reply = (
+      status: number,
+      headers: ReadonlyArray<readonly [string, string]>,
+      body = "",
+    ) => classifyHostReply("fetch", { status, headers, body });
+    expect(reply(Number.NaN, [])).toEqual({
+      operation: "fetch",
+      statusClass: "UNKNOWN",
+      mimeClass: "missing",
+      bodySize: "empty",
+    });
+    for (const [status, label] of [
+      [200, "2xx"],
+      [399, "3xx"],
+      [404, "4xx"],
+      [599, "5xx"],
+      [100, "other"],
+      [600, "other"],
+      [200.5, "UNKNOWN"],
+      [Infinity, "UNKNOWN"],
+    ] as const)
+      expect(reply(status, []).statusClass).toBe(label);
+    for (const [mime, label] of [
+      ["TEXT/JAVASCRIPT; charset=utf-8", "javascript"],
+      ["application/ecmascript", "javascript"],
+      ["text/html", "html"],
+      ["application/json", "json"],
+      ["application/problem+json", "json"],
+      ["text/plain", "text"],
+      ["image/png", "other"],
+      ["", "UNKNOWN"],
+      ["not a mime", "UNKNOWN"],
+    ] as const)
+      expect(reply(200, [["Content-Type", mime]]).mimeClass).toBe(label);
+    expect(
+      reply(200, [
+        ["content-type", "text/html"],
+        ["CONTENT-TYPE", "text/html"],
+      ]).mimeClass,
+    ).toBe("UNKNOWN");
+    // Body spelling never supplies MIME evidence.
+    expect(reply(200, [], "<html>authored</html>").mimeClass).toBe("missing");
+    for (const [body, label] of [
+      ["", "empty"],
+      ["é".repeat(32768), "at-most-64KiB"],
+      ["x".repeat(65537), "at-most-1MiB"],
+      ["x".repeat(1048576), "at-most-1MiB"],
+      ["x".repeat(1048577), "larger"],
+    ] as const)
+      expect(reply(200, [], body).bodySize).toBe(label);
+  });
+
+  effectIt(
+    "saturates reply storage, shares it across runtime evaluations, and validates the full envelope",
+    () =>
+      Effect.gen(function* () {
+        const policy = fixture();
+        let delegations = 0;
+        const runtime: BrowserScriptRuntime = {
+          evaluate: (_source, _context, host) =>
+            Effect.gen(function* () {
+              if (host === undefined)
+                return yield* new BrowserScriptError({
+                  reason: "authored host absent",
+                });
+              yield* host.request(request(`${origin}${prefix}asset.js`));
+              delegations++;
+              return { value: "", setCookies: [] };
+            }),
+        };
+        const replies: Array<(typeof HostRepliesSchema.Type)[number]> = [];
+        const wrapped = restrictRuntime(
+          runtime,
+          [{ origin }],
+          { allowed: 0, denied: 0 },
+          makeHostCallCounters(),
+          replies,
+        );
+        for (let index = 0; index < MAX_HOST_CALL_COUNT + 3; index++)
+          yield* wrapped.evaluate(
+            "authored",
+            { url: `${origin}/page`, cookie: "", userAgent: "fixture" },
+            policy.host,
+          );
+        expect(delegations).toBe(MAX_HOST_CALL_COUNT + 3);
+        expect(replies).toHaveLength(MAX_HOST_CALL_COUNT);
+        expect(Schema.decodeUnknownSync(HostRepliesSchema)(replies)).toEqual(
+          replies,
+        );
+        expect(() =>
+          Schema.decodeUnknownSync(HostRepliesSchema)([...replies, replies[0]]),
+        ).toThrow();
+        const receipt = Receipt.make({
+          kind: "LIVE_CHALLENGE",
+          target: "cloudflare",
+          initialStatus: 403,
+          initialChallengeUrlMatches: true,
+          initialRecognizedChallenge: true,
+          initialMarkersPresent: true,
+          hookInvocations: 1,
+          inlinePrograms: 0,
+          evaluationTimings: [],
+          staticScripts: {
+            sameOrigin: 0,
+            datadomeTag: 0,
+            datadomeApi: 0,
+            captchaDelivery: 0,
+            cloudflare: 0,
+            other: 0,
+            unparsable: 0,
+          },
+          staticScriptsNotAllowed: 0,
+          iframes: 0,
+          evaluations: { attempts: 1, success: 0, failure: 1 },
+          failureClass: "SCRIPT",
+          failureReason: "OTHER",
+          network: { allowed: 1, denied: 0 },
+          hostCalls: makeHostCallCounters(),
+          hostReplies: replies,
+          providerCookieBefore: false,
+          providerCookieAfter: false,
+          providerCookieChanged: false,
+          retried: false,
+          finalStatus: 403,
+          redirectCount: 0,
+          finalRedirected: false,
+          finalChallengeRecognized: true,
+          finalMarkersPresent: true,
+          bodyGate: "NO_SUPPORTED_VERIFIER",
+          protectedContentVerified: false,
+          proven: false,
+        });
+        const encoded = encodeReceipt(receipt);
+        expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(64 * 1024);
+        expect(
+          Schema.decodeUnknownSync(Schema.fromJsonString(Receipt), {
+            onExcessProperty: "error",
+          })(encoded),
+        ).toEqual(receipt);
+        const extra = {
+          ...receipt,
+          hostReplies: [{ ...replies[0], raw: "private" }],
+        };
+        expect(() => encodeReceipt(extra)).toThrow();
+        expect(() =>
+          Schema.decodeUnknownSync(Receipt)({
+            ...receipt,
+            hostReplies: [
+              {
+                operation: "script",
+                statusClass: "200",
+                mimeClass: "text/javascript",
+                bodySize: "empty",
+              },
+            ],
+          }),
+        ).toThrow();
+      }),
+  );
 });
