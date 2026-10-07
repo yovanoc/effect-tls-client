@@ -64,6 +64,45 @@ observer performs only a synchronous increment. This does not alter `network`,
 `hostCalls`, or `hostReplies`. The proof gate additionally requires this count
 to be known and zero; it still does not establish complete zero-denial coverage.
 
+The initial 403 body also supplies three Schema-validated closed labels:
+`datadomeResponseType` (`captcha` for `rt: "c"`, `interstitial` for `rt: "i"`,
+`other`, `missing`), `datadomeBlockType` (`fe`, `bv`, `other`, `missing`), and
+`cloudflareChallengeType` (`managed`, `non-interactive`, `interactive`, `other`,
+`missing`). Non-target fields are always `missing`; non-403 initial responses
+also leave all three `missing`. Only inline script text from a successful strict
+complete-document snapshot is inspected (absent, empty, `text/javascript`, or
+`application/javascript` type only), in memory, without execution or source
+rewriting. The conservative parser accepts a flat literal configuration object
+at the start of a script (`var dd`, `dd`, `window.dd`, or `window._cf_chl_opt`),
+with at most 8192 characters inside the braces. Unsupported expressions, escapes,
+nesting, ambiguous syntax, duplicate configuration assignments or duplicate
+observed fields produce `other`; absent fields or unsupported HTML are `missing`.
+These labels are observations, not a solver mode or proof of clearance. Raw values,
+other configuration fields, identifiers, hashes, HTML and script text never enter
+stdout.
+
+`frameLoadRequests` separately counts Schema-valid guest `frame.load` messages
+received by the parent, before any frame/request/concurrency/byte/origin checks.
+It saturates at 256 and remains `UNKNOWN` until the configured BrowserMock layer
+is acquired. `frameOrigins` counts each requested origin class independently,
+saturating each at 256: `datadomeCaptchaDelivery` (the exact
+`captcha-delivery.com` host or a dot-delimited subdomain), `cloudflareChallenges`
+(`challenges.cloudflare.com`), `sameOrigin`, `other`, `unparsable`. Vendor host
+classes take precedence over same-origin; relative URLs resolve against the
+fixed page URL in memory, and opaque origins are `other`. Neither requested URLs
+nor their paths, queries or identifiers are published. Totals/classes describe
+attempts, not frame loads, successes, network delivery or origin grants.
+
+The optional parent-only `BrowserMockOptions.onFrameLoadRequested` interface is
+`(url: string) => Effect.Effect<void, unknown>` with no service requirements.
+The URL is private observer input only. Like `onNetworkRejected`, asynchronous
+work has a 10 ms cooperative timeout and failures/defects are ignored; synchronous
+blocking is not preempted. The harness observer only increments and classifies
+synchronously. It is never forwarded to the guest and adds no IPC fields. The
+harness still supplies no `loadFrame` or reviewer and changes no frame grants;
+all frames stay denied. Existing network/host/reply/preflight meanings, cookie
+flush, caps, deadlines and the fail-closed proof gate are unchanged.
+
 `hostReplies` separately records only normal values actually returned by the
 trusted wrapped `request` Effect, classified as operation `fetch` or `script`.
 The installed host has no separate `scriptLoad` callback: the existing

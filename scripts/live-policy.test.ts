@@ -21,6 +21,10 @@ import {
 } from "./live-policy.js";
 import {
   classifyEvaluation,
+  classifyInitialChallenge,
+  classifyFrameOrigin,
+  FrameLoadRequests,
+  FrameOriginCounts,
   didProviderCookieChange,
   encodeReceipt,
   FailureReason,
@@ -1059,6 +1063,17 @@ describe("trusted returned host replies", () => {
           failureReason: "OTHER",
           network: { allowed: 1, denied: 0 },
           nativePreflightRejections: 0,
+          frameLoadRequests: 0,
+          frameOrigins: {
+            datadomeCaptchaDelivery: 0,
+            cloudflareChallenges: 0,
+            sameOrigin: 0,
+            other: 0,
+            unparsable: 0,
+          },
+          datadomeResponseType: "missing",
+          datadomeBlockType: "missing",
+          cloudflareChallengeType: "missing",
           hostCalls: makeHostCallCounters(),
           hostReplies: replies,
           providerCookieBefore: false,
@@ -1081,6 +1096,14 @@ describe("trusted returned host replies", () => {
             onExcessProperty: "error",
           })(encoded),
         ).toEqual(receipt);
+        for (const invalid of [
+          { ...receipt, datadomeResponseType: "private" },
+          { ...receipt, datadomeBlockType: "private" },
+          { ...receipt, cloudflareChallengeType: "private" },
+          { ...receipt, frameLoadRequests: 257 },
+          { ...receipt, frameOrigins: { ...receipt.frameOrigins, other: 257 } },
+        ])
+          expect(() => Schema.decodeUnknownSync(Receipt)(invalid)).toThrow();
         const extra = {
           ...receipt,
           hostReplies: [{ ...replies[0], raw: "private" }],
@@ -1325,4 +1348,233 @@ it("keeps the parent observer opt-in and Effect-valued", () => {
     expect(() =>
       Schema.decodeUnknownSync(BrowserMockOptions)({ onNetworkRejected }),
     ).toThrow();
+});
+
+describe("initial challenge closed labels", () => {
+  const html = (source: string) =>
+    `<html><head><script>${source}</script></head><body></body></html>`;
+  for (const [rt, responseType] of [
+    ["c", "captcha"],
+    ["i", "interstitial"],
+    ["secret", "other"],
+    ["missing", "other"],
+  ] as const)
+    for (const [t, blockType] of [
+      ["fe", "fe"],
+      ["bv", "bv"],
+      ["secret", "other"],
+    ] as const)
+      it(`classifies DataDome ${responseType}/${blockType}`, () => {
+        expect(
+          classifyInitialChallenge(
+            "datadome",
+            html(`var dd={rt:'${rt}',t:'${t}',id:'private'};`),
+          ),
+        ).toEqual({
+          datadomeResponseType: responseType,
+          datadomeBlockType: blockType,
+          cloudflareChallengeType: "missing",
+        });
+      });
+  for (const cType of [
+    "managed",
+    "non-interactive",
+    "interactive",
+    "secret",
+    "missing",
+  ] as const)
+    it(`classifies Cloudflare ${cType}`, () => {
+      expect(
+        classifyInitialChallenge(
+          "cloudflare",
+          html(`window._cf_chl_opt = {cType:"${cType}"};`),
+        ),
+      ).toEqual({
+        datadomeResponseType: "missing",
+        datadomeBlockType: "missing",
+        cloudflareChallengeType:
+          cType === "secret" || cType === "missing" ? "other" : cType,
+      });
+    });
+  it("marks absent/non-target fields missing and ambiguous values other", () => {
+    expect(
+      classifyInitialChallenge("datadome", html("var dd={t:'bv'};"))
+        .datadomeResponseType,
+    ).toBe("missing");
+    for (const source of [
+      "var dd={rt:'c',rt:'c'};",
+      "var dd={rt:'c',rt:'i'};",
+      "var dd={rt:lookup()};",
+      "var dd={rt:'c'}; var dd={rt:'i'};",
+      "var dd={rt:'c' + 'i'};",
+      "var dd={rt:'\\x63'};",
+      "var dd={nested:{rt:'c'}};",
+    ])
+      expect(
+        classifyInitialChallenge("datadome", html(source)).datadomeResponseType,
+      ).toBe("other");
+    expect(
+      classifyInitialChallenge(
+        "cloudflare",
+        html("window._cf_chl_opt={cType:'managed',cType:'managed'};"),
+      ).cloudflareChallengeType,
+    ).toBe("other");
+    for (const body of [
+      "",
+      "<script>var dd={rt:'c'}</script>",
+      html("// var dd={rt:'c'};"),
+    ])
+      expect(
+        classifyInitialChallenge("datadome", body).datadomeResponseType,
+      ).not.toBe("captcha");
+    expect(
+      classifyInitialChallenge("cloudflare", html("var dd={rt:'c',t:'fe'};"))
+        .datadomeResponseType,
+    ).toBe("missing");
+  });
+});
+
+it("refuses inert, duplicate and oversized initial configuration", () => {
+  const page = (scripts: string) =>
+    `<html><head>${scripts}</head><body></body></html>`;
+  for (const body of [
+    page(`<script type="module">var dd={rt:'c'};</script>`),
+    page(`<script src="/private">var dd={rt:'c'};</script>`),
+    page(`<!-- <script>var dd={rt:'c'};</script> -->`),
+    page(`<script>var dd={rt:'c'};</script><script>dd={rt:'i'};</script>`),
+    page(`<script>var dd={rt:'c',private:'${"x".repeat(8192)}'};</script>`),
+  ])
+    expect(
+      classifyInitialChallenge("datadome", body).datadomeResponseType,
+    ).not.toBe("captcha");
+});
+
+describe("frame origin closed labels", () => {
+  for (const [url, label] of [
+    ["https://captcha-delivery.com/private", "datadomeCaptchaDelivery"],
+    ["https://geo.captcha-delivery.com/private", "datadomeCaptchaDelivery"],
+    ["https://challenges.cloudflare.com/private", "cloudflareChallenges"],
+    ["/private", "sameOrigin"],
+    ["https://notcaptcha-delivery.com/private", "other"],
+    ["https://challenges.cloudflare.com.evil.test/private", "other"],
+    ["data:text/html,private", "other"],
+    ["http://[::1", "unparsable"],
+  ] as const)
+    it(`classifies ${label} without retaining URL`, () => {
+      expect(classifyFrameOrigin(url, `${origin}/page`)).toBe(label);
+    });
+  it("validates finite frame counts", () => {
+    for (const value of [0, 256, "UNKNOWN"] as const)
+      expect(Schema.decodeUnknownSync(FrameLoadRequests)(value)).toBe(value);
+    for (const value of [-1, 0.5, 257, "0", null])
+      expect(() =>
+        Schema.decodeUnknownSync(FrameLoadRequests)(value),
+      ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(FrameOriginCounts)({ sameOrigin: 257 }),
+    ).toThrow();
+  });
+});
+
+it("keeps frame observation opt-in and parent-only", () => {
+  expect(
+    Object.hasOwn(
+      Schema.decodeSync(BrowserMockOptions)({}),
+      "onFrameLoadRequested",
+    ),
+  ).toBe(false);
+  const observer = (_url: string) => Effect.void;
+  expect(
+    Schema.decodeSync(BrowserMockOptions)({ onFrameLoadRequested: observer })
+      .onFrameLoadRequested,
+  ).toBe(observer);
+  for (const onFrameLoadRequested of [null, "observer", Effect.void])
+    expect(() =>
+      Schema.decodeUnknownSync(BrowserMockOptions)({ onFrameLoadRequested }),
+    ).toThrow();
+});
+
+describeNative("authored frame attempts stay denied", () => {
+  for (const mode of [
+    "origin-denied",
+    "reviewer-absent",
+    "failure",
+    "defect",
+    "pending",
+  ] as const)
+    effectIt(mode, () =>
+      Effect.gen(function* () {
+        let count = 0;
+        const counts = {
+          datadomeCaptchaDelivery: 0,
+          cloudflareChallenges: 0,
+          sameOrigin: 0,
+          other: 0,
+          unparsable: 0,
+        };
+        const runtime = yield* Effect.service(BrowserMock).pipe(
+          Effect.provide(
+            BrowserMock.layer({
+              ...(mode === "origin-denied" ? {} : { allowedOrigins: [origin] }),
+              onFrameLoadRequested: (url) =>
+                Effect.sync(() => {
+                  count = incrementCount(count);
+                  const label = classifyFrameOrigin(url, `${origin}/page`);
+                  counts[label] = incrementCount(counts[label]);
+                }).pipe(
+                  Effect.andThen(
+                    mode === "failure"
+                      ? Effect.fail(
+                          new BrowserScriptError({ reason: "private" }),
+                        )
+                      : mode === "defect"
+                        ? Effect.die("private")
+                        : mode === "pending"
+                          ? Effect.never
+                          : Effect.void,
+                  ),
+                ),
+            }).pipe(Layer.provide(NodeServices.layer)),
+          ),
+        );
+        const source = `var frame = document.createElement('iframe'); frame.src='/private'; frame.onerror = function() { document.cookie='denied=yes'; }; document.body.appendChild(frame); if ('onFrameLoadRequested' in window) throw new Error('observer leaked');`;
+        const writes: string[] = [];
+        const network = { allowed: 0, denied: 0 };
+        const hostCalls = makeHostCallCounters();
+        const wrapped = restrictRuntime(
+          runtime,
+          [{ origin }],
+          network,
+          hostCalls,
+        );
+        const result = yield* runBoundedScript(
+          wrapped,
+          "",
+          {
+            url: `${origin}/page`,
+            cookie: "",
+            userAgent: "fixture",
+            document: `<html><head></head><body><script>${source}</script></body></html>`,
+          },
+          {
+            request: () =>
+              Effect.fail(
+                new BrowserScriptError({ reason: "must not delegate" }),
+              ),
+            setCookie: (value) =>
+              Effect.sync(() => {
+                writes.push(value);
+                return "";
+              }),
+          },
+          "document",
+        ).pipe(Effect.result);
+        expect(Result.isSuccess(result)).toBe(true);
+        expect(count).toBe(1);
+        expect(counts.sameOrigin).toBe(1);
+        expect(writes).toEqual(["denied=yes"]);
+        expect(network).toEqual({ allowed: 0, denied: 0 });
+        expect(hostCalls.request).toBe(0);
+      }),
+    );
 });

@@ -834,6 +834,14 @@ const makeEvaluate = (
               });
             }
             if (event.type === "frame.load") {
+              if (options.onFrameLoadRequested !== undefined)
+                yield* Effect.suspend(
+                  () =>
+                    options.onFrameLoadRequested?.(event.url) ?? Effect.void,
+                ).pipe(
+                  Effect.timeoutOption(Duration.millis(10)),
+                  Effect.ignoreCause,
+                );
               const perform = Effect.gen(function* () {
                 if (++frameCount > 4)
                   return yield* new BrowserScriptError({
@@ -1143,6 +1151,16 @@ export const BrowserMockOptions = Schema.Struct({
     // Result/error/environment types are application-trusted, like host callbacks.
     Schema.declare<Effect.Effect<void, unknown>>(
       (input): input is Effect.Effect<void, unknown> => Effect.isEffect(input),
+    ),
+  ),
+  /** Parent-only attempt observer, before budgets/policy. The URL is private input,
+   * never a guest capability. Must be prompt, cooperative and require no services.
+   * Failures/defects are discarded; asynchronous work is limited to 10 ms.
+   */
+  onFrameLoadRequested: Schema.optionalKey(
+    Schema.declare<(url: string) => Effect.Effect<void, unknown>>(
+      (input): input is (url: string) => Effect.Effect<void, unknown> =>
+        typeof input === "function",
     ),
   ),
   executable: Schema.optionalKey(Schema.String),

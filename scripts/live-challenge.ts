@@ -25,6 +25,154 @@ export const NativePreflightRejections = Schema.Union([
   HostCallCount,
   Schema.Literal("UNKNOWN"),
 ]);
+export const FrameLoadRequests = NativePreflightRejections;
+export const FrameOriginCounts = Schema.Struct({
+  datadomeCaptchaDelivery: HostCallCount,
+  cloudflareChallenges: HostCallCount,
+  sameOrigin: HostCallCount,
+  other: HostCallCount,
+  unparsable: HostCallCount,
+});
+const InitialChallenge = Schema.Struct({
+  datadomeResponseType: Schema.Literals([
+    "captcha",
+    "interstitial",
+    "other",
+    "missing",
+  ]),
+  datadomeBlockType: Schema.Literals(["fe", "bv", "other", "missing"]),
+  cloudflareChallengeType: Schema.Literals([
+    "managed",
+    "non-interactive",
+    "interactive",
+    "other",
+    "missing",
+  ]),
+});
+
+/** Only a flat literal at the start of an inline script is understood. Never evaluate JS. */
+export const classifyInitialChallenge = (
+  target: Target,
+  body: string,
+): typeof InitialChallenge.Type => {
+  const missing: typeof InitialChallenge.Type = {
+    datadomeResponseType: "missing",
+    datadomeBlockType: "missing",
+    cloudflareChallengeType: "missing",
+  };
+  const parsed = parseHtmlDocument(body);
+  if (parsed._tag !== "Success") return missing;
+  const scripts = parsed.snapshot.nodes.filter(
+    (node) =>
+      node.tag === "script" &&
+      !node.attributes.some(
+        ([name, value]) =>
+          name === "src" ||
+          (name === "type" &&
+            !["", "text/javascript", "application/javascript"].includes(
+              value.trim().toLowerCase(),
+            )),
+      ),
+  );
+  const assignment =
+    target === "datadome"
+      ? /(?:\bwindow\.dd|\b(?:var\s+)?dd)\s*=/g
+      : /\bwindow\._cf_chl_opt\s*=/g;
+  const candidates = scripts.flatMap((node) =>
+    [...node.textContent.matchAll(assignment)].map(
+      (match: Readonly<RegExpExecArray>) => ({
+        source: node.textContent,
+        match,
+      }),
+    ),
+  );
+  if (candidates.length === 0) return missing;
+  const candidate = candidates.at(0);
+  const other: typeof InitialChallenge.Type =
+    target === "datadome"
+      ? {
+          ...missing,
+          datadomeResponseType: "other",
+          datadomeBlockType: "other",
+        }
+      : { ...missing, cloudflareChallengeType: "other" };
+  if (
+    candidates.length !== 1 ||
+    candidate === undefined ||
+    candidate.source.slice(0, candidate.match.index).trim() !== ""
+  )
+    return other;
+  const tail = candidate.source.slice(
+    candidate.match.index + candidate.match[0].length,
+  );
+  const object = /^\s*\{([^{}]{0,8192})\}\s*(?:;|$)/.exec(tail);
+  if (object === null) return other;
+  const contents = object.at(1) ?? "";
+  const fields = new Map<string, Array<string | undefined>>();
+  // No escapes, comments, expressions, nested objects or computed keys. Unsupported syntax is other.
+  const field =
+    /\s*(?:([A-Za-z_$][\w$]*)|'([^'\\]*)'|"([^"\\]*)")\s*:\s*(?:'([^'\\]*)'|"([^"\\]*)"|(?:-?\d+(?:\.\d+)?|true|false|null))\s*(,|$)/gy;
+  while (field.lastIndex < contents.length) {
+    const offset = field.lastIndex;
+    if (contents.slice(offset).trim() === "") break;
+    const part = field.exec(contents);
+    if (part === null) return other;
+    const key = part.at(1) ?? part.at(2) ?? part.at(3) ?? "";
+    fields.set(key, [...(fields.get(key) ?? []), part.at(4) ?? part.at(5)]);
+  }
+  const label = <Label extends string>(
+    key: string,
+    labels: ReadonlyArray<readonly [string, Label]>,
+  ): Label | "missing" | "other" => {
+    const values = fields.get(key);
+    if (values === undefined) return "missing";
+    if (values.length !== 1) return "other";
+    return labels.find(([raw]) => raw === values[0])?.[1] ?? "other";
+  };
+  if (target === "datadome")
+    return InitialChallenge.make({
+      ...missing,
+      datadomeResponseType: label("rt", [
+        ["c", "captcha"],
+        ["i", "interstitial"],
+      ]),
+      datadomeBlockType: label("t", [
+        ["fe", "fe"],
+        ["bv", "bv"],
+      ]),
+    });
+  return InitialChallenge.make({
+    ...missing,
+    cloudflareChallengeType: label("cType", [
+      ["managed", "managed"],
+      ["non-interactive", "non-interactive"],
+      ["interactive", "interactive"],
+    ]),
+  });
+};
+
+/** Resolve only in memory; neither URL nor path leaves this classifier. Not an origin grant. */
+export const classifyFrameOrigin = (
+  input: string,
+  pageUrl: string,
+): keyof typeof FrameOriginCounts.Type => {
+  try {
+    const page = new URL(pageUrl);
+    const url = new URL(input, page);
+    const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+    if (
+      hostname === "captcha-delivery.com" ||
+      hostname.endsWith(".captcha-delivery.com")
+    )
+      return "datadomeCaptchaDelivery";
+    if (hostname === "challenges.cloudflare.com") return "cloudflareChallenges";
+    return url.origin !== "null" && url.origin === page.origin
+      ? "sameOrigin"
+      : "other";
+  } catch {
+    return "unparsable";
+  }
+};
 export const HostCallCountersSchema = Schema.Struct({
   request: HostCallCount,
   scriptLoad: HostCallCount,
@@ -187,6 +335,7 @@ export const Receipt = Schema.Struct({
   initialChallengeUrlMatches: Schema.Boolean,
   initialRecognizedChallenge: Schema.Boolean,
   initialMarkersPresent: Schema.Boolean,
+  ...InitialChallenge.fields,
   hookInvocations: HostCallCount,
   inlinePrograms: Count,
   evaluationTimings: Schema.Array(
@@ -212,6 +361,8 @@ export const Receipt = Schema.Struct({
   failureReason: FailureReason,
   network: Schema.Struct({ allowed: Count, denied: Count }),
   nativePreflightRejections: NativePreflightRejections,
+  frameLoadRequests: FrameLoadRequests,
+  frameOrigins: FrameOriginCounts,
   hostCalls: HostCallCountersSchema,
   hostReplies: HostRepliesSchema,
   providerCookieBefore: Schema.Boolean,
@@ -704,6 +855,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     initialChallengeUrlMatches: false,
     initialRecognizedChallenge: false,
     initialMarkersPresent: false,
+    ...classifyInitialChallenge(target, ""),
     hookInvocations: 0,
     inlinePrograms: 0,
     evaluationTimings: [] as Array<{ ms: number; reachedBound: boolean }>,
@@ -723,6 +875,14 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     failureReason: FailureReason.make("NONE"),
     network: { allowed: 0, denied: 0 },
     nativePreflightRejections: NativePreflightRejections.make("UNKNOWN"),
+    frameLoadRequests: FrameLoadRequests.make("UNKNOWN"),
+    frameOrigins: {
+      datadomeCaptchaDelivery: 0,
+      cloudflareChallenges: 0,
+      sameOrigin: 0,
+      other: 0,
+      unparsable: 0,
+    },
     hostCalls: makeHostCallCounters(),
     hostReplies: [] as Array<HostReply>,
     providerCookieBefore: false,
@@ -779,6 +939,8 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
       state.initialRecognizedChallenge =
         Browser.recognizeChallenge(context.response) !== undefined;
       initialBody = context.body;
+      if (context.response.status === 403)
+        Object.assign(state, classifyInitialChallenge(target, context.body));
       state.initialMarkersPresent = hasKnownChallengeMarkers(
         target,
         context.response.headers,
@@ -832,6 +994,7 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     Effect.gen(function* () {
       const runtime = yield* Browser.BrowserMock;
       state.nativePreflightRejections = 0;
+      state.frameLoadRequests = 0;
       const browser = yield* Browser.open(
         {
           transport: { profile: "chrome_152_PSK" },
@@ -921,6 +1084,16 @@ export const measure = Effect.fnUntraced(function* (target: Target) {
     Browser.BrowserMock.layer({
       allowedOrigins,
       allowedPathPrefixes,
+      onFrameLoadRequested: (url) =>
+        Effect.sync(() => {
+          if (state.frameLoadRequests !== "UNKNOWN") {
+            state.frameLoadRequests = incrementCount(state.frameLoadRequests);
+            const originClass = classifyFrameOrigin(url, pageUrl);
+            state.frameOrigins[originClass] = incrementCount(
+              state.frameOrigins[originClass],
+            );
+          }
+        }),
       onNetworkRejected: Effect.sync(() => {
         if (state.nativePreflightRejections !== "UNKNOWN")
           state.nativePreflightRejections = incrementCount(
