@@ -70,6 +70,7 @@ const makeSession = (
   webSocket: () => Effect.die("unused"),
   cookies: () => Effect.die("unused"),
   setCookies: () => Effect.die("unused"),
+  scriptCookies: () => Effect.die("unused"),
   exportCookies: Effect.die("unused"),
   importCookies: () => Effect.die("unused"),
   bandwidth: Effect.succeed({ read: 0, written: 0 }),

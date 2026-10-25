@@ -178,6 +178,19 @@ type CookiesImportMeta struct {
 	Cookies   []CookieMeta `json:"cookies"`
 }
 
+// CookiesScriptMeta reads script-visible cookies and optionally applies raw
+// document.cookie writes while holding the Jar lock.
+type CookiesScriptMeta struct {
+	SessionID  string   `json:"sessionId"`
+	URL        string   `json:"url"`
+	SetCookies []string `json:"setCookies,omitempty"`
+}
+
+// CookiesScriptResultMeta is the script-visible Cookie header.
+type CookiesScriptResultMeta struct {
+	Cookie string `json:"cookie"`
+}
+
 // CookiesResultMeta is the result of a cookies.get/export operation.
 type CookiesResultMeta struct {
 	Cookies []CookieMeta `json:"cookies"`
@@ -206,6 +219,7 @@ type RequestMeta struct {
 	ContentLength   *int64             `json:"contentLength,omitempty"`
 	TimeoutMs       *int64             `json:"timeoutMs,omitempty"`
 	FollowRedirects *bool              `json:"followRedirects,omitempty"`
+	OmitCredentials bool               `json:"omitCredentials,omitempty"`
 	HostOverride    string             `json:"hostOverride,omitempty"`
 	Cookies         []CookieMeta       `json:"cookies,omitempty"`
 }

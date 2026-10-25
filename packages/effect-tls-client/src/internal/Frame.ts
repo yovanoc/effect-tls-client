@@ -16,6 +16,7 @@ export const FrameKind = {
   cookiesImport: 0x16,
   bandwidthGet: 0x17,
   bandwidthReset: 0x18,
+  cookiesScript: 0x19,
   request: 0x20,
   bodyChunk: 0x21,
   bodyEnd: 0x22,

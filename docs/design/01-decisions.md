@@ -29,6 +29,7 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 ## D4 — Public nouns: `TlsClient` Service, `TlsSession` scoped value, Bridge internal
 
 **Decision:**
+
 - `TlsClient` (Service, one per Bridge): `session(config): Effect<TlsSession, _, Scope>`, sessionless `request`, bandwidth ops.
 - `TlsSession` (scoped value, not a Service by default): `request`, `cookies`/`addCookies`, `setProxy`, `webSocket`, `id`. Released → `destroySession`.
 - Helpers: `TlsSession.layer(config)`, `TlsHttpClient.layer(config)`, `TlsHttpClient.fromSession(session)`.
@@ -66,17 +67,18 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 ## D9 — Errors: small typed set, classified in Go
 
 **Decision:** Bridge maps Go errors (`errors.As` on net/tls/proxy/context errors) to a closed `kind` on the `error` frame. JS decodes into `Schema.TaggedError` classes:
+
 - `BridgeExited{exitCode, signal, stderrTail}`, `BridgeVersionMismatch`, `BridgeProtocolError`, `BridgeSpawnError`
 - `TlsRequestError{ kind: InvalidConfig|InvalidUrl|Dns|Connect|Tls|Proxy|Timeout|Cancelled|Http|Body|Pinning|Unknown, message, cause? }` + `isTransient` predicate for `Effect.retry`
 - `SessionNotFound{sessionId}`, `SessionConfigError{message}`
 - `TlsWebSocketError{ kind: Handshake|Read|Write|Closed{code,reason} }` → mapped onto `SocketError` reasons
-`HttpClientError.TransportError{cause: TlsRequestError}` wraps for the HttpClient projection.
+  `HttpClientError.TransportError{cause: TlsRequestError}` wraps for the HttpClient projection.
 
 **Why:** typed errors exist only on the Go side; one request-error class with a closed union gives exhaustive `Match` without a class-per-error zoo. Rejected: single string error (regex classification); impit-style 30-class hierarchy.
 
 ## D10 — Cookies: Go jar is the single source of truth, exchanged as `Cookies.Cookies`
 
-**Decision:** `TlsSession.cookies(url)` / `setCookies(url, Cookies.Cookies)` read/write the Go jar using Effect's `Cookies` type. `TlsResponse.cookies` = that response's `Set-Cookie` headers only (matches Effect responses). `exportCookies`/`importCookies` (Schema JSON) for cross-process persistence. No JS jar, no `withCookiesRef`. User-supplied `Cookie` headers pass through unchanged and replace automatic Jar injection for that request; response `Set-Cookie` handling remains enabled. Explicit headers are documented as discouraged.
+**Decision:** `TlsSession.cookies(url)` / `setCookies(url, Cookies.Cookies)` read/write the Go jar using Effect's `Cookies` type. `TlsResponse.cookies` = that response's `Set-Cookie` headers only (matches Effect responses). `exportCookies`/`importCookies` (Schema JSON) for cross-process persistence. The browser layer additionally uses an additive Go-owned script-cookie operation for URL-filtered reads and protected raw writes; it never mirrors the Jar in JS. No JS jar, no `withCookiesRef`. User-supplied `Cookie` headers pass through unchanged and replace automatic Jar injection for that request; response `Set-Cookie` handling remains enabled. Explicit headers are documented as discouraged.
 
 **Why:** requests, in-Go redirects and WS handshakes must share one jar; two jars fighting is a known DataDome failure mode. Rejected: mirrored JS jar (tough-cookie); JS-only jar without domain/path semantics.
 
@@ -101,9 +103,10 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 ## D14 — Challenge handling: hook in the core, handlers as importable optional subpaths
 
 **Decision:** `ChallengeHandler` service: `(response, ctx) => Effect<Option<Resolution>>` (Resolution = cookies/headers to plant + retry, or a final response). Navigation consults it before treating a response as terminal. Handlers compose in order (first `Some` wins), e.g. `[datadome, capsolver]` = own logic first, paid fallback second. All handlers live in the repo as **optional subpaths**, never in the core entrypoint:
+
 - `effect-tls-client/challenges/datadome`, `/verisoul`, … — vendor-JS handlers, marked `@experimental`, **excluded from semver** (may break on any vendor deploy), tested against recorded fixtures only.
 - `effect-tls-client/challenges/capsolver` (and similar) — API-backed handlers: a Layer configured via `Config` (`Redacted` API key), calling the solver through whatever `HttpClient` is provided.
-`examples/` contains wiring only, no solver logic.
+  `examples/` contains wiring only, no solver logic.
 
 **Why:** importable beats copy-paste; the generic positioning is preserved by keeping handlers out of the core module and out of semver, not by hiding the code.
 
@@ -122,12 +125,14 @@ Running record from the architecture grilling. Facts backing these are in `00-re
 ## D17 — Repo layout and release pipeline
 
 **Decision:** Single repo, Bun workspace + **Turborepo 2.11** task graph (native Go workspace support via `go.work`, experimental future flag). Layout:
+
 ```text
 packages/effect-tls-client/      TS library (entrypoints: ., ./browser, ./challenges/*)
 packages/bridge-<platform>/      5 stub npm packages (package.json with os/cpu; binary dropped in by CI build task)
 bridge/                          Go module (go.work member): frame loop, dispatcher, store, websocket, codegen dump
 examples/
 ```
+
 Turbo tasks: `bridge#build/test/vet` (Go), `bridge-*#build` dependsOn `bridge#build` (cross-compile per target), `effect-tls-client#codegen` dependsOn `bridge#build` (Profile.Known / CustomProfile schema), `effect-tls-client#build/test/check` dependsOn codegen; CI fails on stale generated files. Release: changesets + `changesets/action` on `main`, `fixed: [["effect-tls-client", "@effect-tls-client/*"]]`, OIDC provenance, publishes all six packages together. Go pin bumps via Renovate on `bridge/go.mod` → codegen PR check.
 
 **Why:** effect-cdp's proven flow + one Go matrix job; turbo gives cross-language `dependsOn`, affectedness and remote caching for the Go builds. Rejected: esbuild-style `npm/` stub dir + custom version-sync script; tag-driven release.
@@ -152,3 +157,45 @@ the public fingerprint echo remains disabled unless explicitly opted in by
 and platform-specific process behavior must be exercised where the binary runs.
 An external service is useful as a fingerprint regression signal but must never
 make ordinary CI, local development, or package installation network-dependent.
+
+## D20 — Bounded document prologue
+
+**Decision:** The experimental document snapshot accepts `<!doctype html>` or the
+exact `SYSTEM "about:legacy-compat"` form (case-insensitive keywords and matching
+single or double quotes). A doctype may be omitted only before an explicit first
+`<html>` start tag after leading HTML whitespace and simple comments. Parsing still
+requires explicit html/head/body roots and exposes no DocumentType or quirks API.
+
+**Why:** Permit the narrow prologue variations needed without HTML repair or
+expanding the bounded document model.
+
+## D21 — Explicit root document-script lifecycle subset
+
+**Decision:** Only explicit document-script execution starts the root at loading.
+After blocking/inline classics, set interactive and synchronously dispatch
+readystatechange; execute ordered defer; queue DOMContentLoaded at document,
+bubbling only to window; await static async and dynamic script/reviewed-frame
+load delays; queue an authoritative guest-counter check atomically with complete,
+readystatechange, and window load (legacy document target). WAIT uses a captured
+guest-native load-idle Promise and retries the same checked task. No host callback,
+executor, or new public/privileged binding enters guest code.
+
+**Why:** Authored readiness listeners need an explicit completion path, not the
+previous static complete convention. WHATWG [stop parsing](https://html.spec.whatwg.org/multipage/parsing.html#the-end)
+orders readiness, defer, DOMContentLoaded, and load; [script preparation](https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element)
+identifies executable external load delays. Node's [afterEvaluate rules](https://nodejs.org/docs/latest-v25.x/api/vm.html#timeout-interactions-with-asynchronous-tasks-and-promises)
+require deadline-clamped owner-realm re-entry for queued tasks and Promise work.
+Checking only before queueing completion would race newly appended resources.
+
+**Limits:** Whole strict readonly snapshot, not streaming parse; sequential defer
+fetches; per-target capture order, not a capture path; document-to-window
+DOMContentLoaded propagation only; synthetic untrusted events; no currentScript,
+rendering, CSS/image/font delays, pageshow, performance entries, SDK or clearance
+claims. Resources started by complete/readystatechange or load listeners are
+post-completion natural work and do not postpone or repeat load. Timers,
+fetch/XHR and FileReader do not delay load. Existing post-success idle/deadline
+reserve and cookie flush remain; unresolved pre-completion delays and unbounded
+listeners/jobs fail instead of returning retention success. Static resource
+failures complete later scripts/lifecycle before the existing fixed failure.
+Classic/async snapshots and reviewed children stay complete with no automatic
+lifecycle. No origin/frame grants, transport, Go Jar, quota, or RPC changes.
